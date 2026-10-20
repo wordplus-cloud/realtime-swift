@@ -1,0 +1,1 @@
+../../Plugins/WordPlusUI/Embedded.swift

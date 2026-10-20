@@ -1,0 +1,3 @@
+# The release's own files, kept out of its zips.
+/.github export-ignore
+/.gitattributes export-ignore

@@ -1,0 +1,106 @@
+{
+    "about": "Conformance vectors for WordPlus Cloud realtime server packages (scripts/vectors.php). Every package must reproduce each value.",
+    "secret": "test-secret-0123456789abcdef0123456789abcdef0123456789abcdef",
+    "local_key": "a3f1c2d4e5b697887766554433221100ffeeddccbbaa99887766554433221100",
+    "site": "s1500000007",
+    "derived": {
+        "channels": "7f193d28fa0b2d84223d2466b2eef456a61ccf57b4fd6a9e6909f89fdd4decb7",
+        "calls": "e84322dcce916573bfca0d79a65790c5ae4f97b5edf0099ea85823a3851640d8",
+        "publish": "afb8e348c1000c6cf12dc88c0013ecb83e07749643b17e68c5c1a21192e14174",
+        "webhook": "ae77d509a11c07260827bc35f6d2b7a424892375e40ba418d79639e34e24fdf1"
+    },
+    "keys": [
+        {
+            "label": "d:20371",
+            "entry": "d:20371:98e19c664a2c8c2c70ffa3dd0e928ccf8822b9ec7981a232c8edcfd127ac445b"
+        },
+        {
+            "label": "u:42:1",
+            "entry": "u:42:1:27ffada4581a33604aa7e02ae08e3d47f2c5e33641dd7c141ae0735797e88a55"
+        },
+        {
+            "label": "u:user_2abc:3",
+            "entry": "u:user_2abc:3:9de7227a4bb50af31f1c9ec4c1e5abbbd8a4377ad2a15ae5033542d97867f24e"
+        },
+        {
+            "label": "u:k7f3q:ben:1",
+            "entry": "u:k7f3q:ben:1:d978609a5cae8305aa98b4c21634f48545adbd2c2e9bdf2b75de738c95a5fa17"
+        },
+        {
+            "label": "ch:order:42:1",
+            "entry": "ch:order:42:1:07ea2c09a5dee33fc9be24772e51f2de995becce6aab93783da89e8ddd820db5"
+        },
+        {
+            "label": "ch:chat:34:42:2",
+            "entry": "ch:chat:34:42:2:37c7ef86c6f9db3b1c6e8c10276f4328789cfcc4afafcc0f706d0426e8dca0ea"
+        },
+        {
+            "label": "note:7",
+            "entry": "note:7:dd8fa4698a473bdd49438f6a9745245607e09addca86ab0ef12be9a0b0af39b7"
+        }
+    ],
+    "profile_hash_key": "23352e7b35487eca51e2ecd0e36db0d8aeb1fa1eb024928829215bf5c890d823",
+    "call_key": {
+        "id": "abcDEF123_-xyz",
+        "caller": 42,
+        "callee": 34,
+        "key": "3a6c58d91751b1ab18d5b92d09f2fc6172e8ad8d5e19564f83c3840a95bef964"
+    },
+    "media": [
+        {
+            "what": "call|support-42|abcDEF123_-xyz|42|34",
+            "key": "8SBwfc3bfC2ekksVrIon1HoA0iABTvbaSd_2FX2ZfyM"
+        },
+        {
+            "what": "room|board-7",
+            "key": "loj1NbRCBbnZEjWr0BsROhJIoDs5ccRTXQ_prfrNX_A"
+        }
+    ],
+    "proofs": [
+        {
+            "what": "member|support-42|abcDEF123_-xyz|42|34|42",
+            "proof": "x090SEYNd3MkERRO2iFHxH7wFJp35La_afVk-9xJIr0"
+        },
+        {
+            "what": "rung|support-42|abcDEF123_-xyz|42|34|56",
+            "proof": "l1fBtl9hCOX6vjpqbg0yYO-I1mOMdo8VMXjYRgoFiRY"
+        }
+    ],
+    "emit": {
+        "timestamp": "1791638400",
+        "method": "POST",
+        "path": "/wordplus/realtime/emit",
+        "body": "{\"rooms\":[\"orders\"],\"event\":\"updated\",\"data\":{\"status\":\"paid\"}}",
+        "signature": "c9e85268b674d4f459a187149ff69f8e3b37db13e481a2de051174e852effab3"
+    },
+    "webhook": {
+        "timestamp": "1791638400",
+        "path": "/api/realtime/webhook",
+        "body": "{\"events\":[{\"at\":1791638400000,\"type\":\"room.occupied\",\"room\":\"order:42\",\"id\":\"0b6f1c9e-8f5d-4c38-9d2b-6a1e2f3c4d5e\"}]}",
+        "signature": "7471cbdc121b23bfe8bb75b94442c65413c1f338089ae53baf3e6e5e9eee27d5"
+    },
+    "jwt": {
+        "input": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzMTUwMDAwMDAwNyIsImF1ZCI6IndvcmRwbHVzLXJlYWx0aW1lIiwiaWF0IjoxNzkxNjM4NDAwLCJleHAiOjE3OTE2NjAwMDAsInIiOnsib3JkZXI6NDIiOnsiaCI6WzIwLDMwXX19LCJzdWIiOiI0MiJ9",
+        "signature": "iw4nMuz8iAJHXCge11sZ8sF75W02c5jaZc6lwxym6cQ"
+    },
+    "sealed": [
+        {
+            "label": "ch:order:42:1",
+            "plain": "{\"status\":\"paid\"}",
+            "nonce_hex": "010101010101010101010101010101010101010101010101",
+            "sealed": "ch:order:42:1:1.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBv5DrJzjwIWS1vFQDR7h_W90m8FHeBkw4L58yQUUc0MRG"
+        },
+        {
+            "label": "d:20371",
+            "plain": "Ann Lee",
+            "nonce_hex": "020202020202020202020202020202020202020202020202",
+            "sealed": "d:20371:1.AgICAgICAgICAgICAgICAgICAgICAgICdRZaMqU6guwA7nuk_7TsYaN7CoYHwG0"
+        },
+        {
+            "label": "u:42:1",
+            "plain": "",
+            "nonce_hex": "030303030303030303030303030303030303030303030303",
+            "sealed": "u:42:1:1.AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDW-5XAbpO78AOtT48vcsItQ"
+        }
+    ]
+}

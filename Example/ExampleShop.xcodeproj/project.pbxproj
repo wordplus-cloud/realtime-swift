@@ -1,0 +1,399 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		5A1E00000000000000000101 /* WordPlusRealtime in Frameworks */ = {isa = PBXBuildFile; productRef = 5A1E00000000000000000901 /* WordPlusRealtime */; };
+		5A1E00000000000000000102 /* WordPlusRealtimeCalls in Frameworks */ = {isa = PBXBuildFile; productRef = 5A1E00000000000000000902 /* WordPlusRealtimeCalls */; };
+		5A1E00000000000000000103 /* WordPlusRealtimeUI in Frameworks */ = {isa = PBXBuildFile; productRef = 5A1E00000000000000000903 /* WordPlusRealtimeUI */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		5A1E00000000000000000201 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 5A1E00000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 5A1E00000000000000000011;
+			remoteInfo = ExampleShop;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		5A1E00000000000000000301 /* ExampleShop.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ExampleShop.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		5A1E00000000000000000302 /* ExampleShopUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ExampleShopUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		5A1E00000000000000000303 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		5A1E00000000000000000401 /* ExampleShop */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = ExampleShop;
+			sourceTree = "<group>";
+		};
+		5A1E00000000000000000402 /* ExampleShopUITests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = ExampleShopUITests;
+			sourceTree = "<group>";
+		};
+/* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		5A1E00000000000000000501 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				5A1E00000000000000000101 /* WordPlusRealtime in Frameworks */,
+				5A1E00000000000000000102 /* WordPlusRealtimeCalls in Frameworks */,
+				5A1E00000000000000000103 /* WordPlusRealtimeUI in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		5A1E00000000000000000502 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		5A1E00000000000000000601 = {
+			isa = PBXGroup;
+			children = (
+				5A1E00000000000000000303 /* Info.plist */,
+				5A1E00000000000000000401 /* ExampleShop */,
+				5A1E00000000000000000402 /* ExampleShopUITests */,
+				5A1E00000000000000000602 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		5A1E00000000000000000602 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				5A1E00000000000000000301 /* ExampleShop.app */,
+				5A1E00000000000000000302 /* ExampleShopUITests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		5A1E00000000000000000011 /* ExampleShop */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 5A1E00000000000000000802 /* Build configuration list for PBXNativeTarget "ExampleShop" */;
+			buildPhases = (
+				5A1E00000000000000000701 /* Sources */,
+				5A1E00000000000000000501 /* Frameworks */,
+				5A1E00000000000000000703 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				5A1E00000000000000000401 /* ExampleShop */,
+			);
+			name = ExampleShop;
+			packageProductDependencies = (
+				5A1E00000000000000000901 /* WordPlusRealtime */,
+				5A1E00000000000000000902 /* WordPlusRealtimeCalls */,
+				5A1E00000000000000000903 /* WordPlusRealtimeUI */,
+			);
+			productName = ExampleShop;
+			productReference = 5A1E00000000000000000301 /* ExampleShop.app */;
+			productType = "com.apple.product-type.application";
+		};
+		5A1E00000000000000000012 /* ExampleShopUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 5A1E00000000000000000803 /* Build configuration list for PBXNativeTarget "ExampleShopUITests" */;
+			buildPhases = (
+				5A1E00000000000000000702 /* Sources */,
+				5A1E00000000000000000502 /* Frameworks */,
+				5A1E00000000000000000704 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				5A1E00000000000000000202 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				5A1E00000000000000000402 /* ExampleShopUITests */,
+			);
+			name = ExampleShopUITests;
+			productName = ExampleShopUITests;
+			productReference = 5A1E00000000000000000302 /* ExampleShopUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		5A1E00000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2600;
+				LastUpgradeCheck = 2600;
+				TargetAttributes = {
+					5A1E00000000000000000011 = {
+						CreatedOnToolsVersion = 26.0;
+					};
+					5A1E00000000000000000012 = {
+						CreatedOnToolsVersion = 26.0;
+						TestTargetID = 5A1E00000000000000000011;
+					};
+				};
+			};
+			buildConfigurationList = 5A1E00000000000000000801 /* Build configuration list for PBXProject "ExampleShop" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 5A1E00000000000000000601;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				5A1E00000000000000000A01 /* XCLocalSwiftPackageReference ".." */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 5A1E00000000000000000602 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				5A1E00000000000000000011 /* ExampleShop */,
+				5A1E00000000000000000012 /* ExampleShopUITests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		5A1E00000000000000000703 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		5A1E00000000000000000704 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		5A1E00000000000000000701 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		5A1E00000000000000000702 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		5A1E00000000000000000202 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 5A1E00000000000000000011 /* ExampleShop */;
+			targetProxy = 5A1E00000000000000000201 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		5A1E00000000000000000811 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		5A1E00000000000000000812 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		5A1E00000000000000000821 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = ExampleShop/ExampleShop.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "API demo";
+				INFOPLIST_KEY_NSCameraUsageDescription = "Your camera is shown to the person you call.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Your microphone is heard by the person you call.";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "The API demo reaches the shop server on your Mac.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = UIInterfaceOrientationPortrait;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = cloud.wordplus.ExampleShop;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		5A1E00000000000000000822 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = ExampleShop/ExampleShop.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "API demo";
+				INFOPLIST_KEY_NSCameraUsageDescription = "Your camera is shown to the person you call.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Your microphone is heard by the person you call.";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "The API demo reaches the shop server on your Mac.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = UIInterfaceOrientationPortrait;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = cloud.wordplus.ExampleShop;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		5A1E00000000000000000831 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = cloud.wordplus.ExampleShopUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = ExampleShop;
+			};
+			name = Debug;
+		};
+		5A1E00000000000000000832 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = cloud.wordplus.ExampleShopUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = ExampleShop;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		5A1E00000000000000000801 /* Build configuration list for PBXProject "ExampleShop" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				5A1E00000000000000000811 /* Debug */,
+				5A1E00000000000000000812 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		5A1E00000000000000000802 /* Build configuration list for PBXNativeTarget "ExampleShop" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				5A1E00000000000000000821 /* Debug */,
+				5A1E00000000000000000822 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		5A1E00000000000000000803 /* Build configuration list for PBXNativeTarget "ExampleShopUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				5A1E00000000000000000831 /* Debug */,
+				5A1E00000000000000000832 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		5A1E00000000000000000A01 /* XCLocalSwiftPackageReference ".." */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ..;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		5A1E00000000000000000901 /* WordPlusRealtime */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = WordPlusRealtime;
+		};
+		5A1E00000000000000000902 /* WordPlusRealtimeCalls */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = WordPlusRealtimeCalls;
+		};
+		5A1E00000000000000000903 /* WordPlusRealtimeUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = WordPlusRealtimeUI;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = 5A1E00000000000000000001 /* Project object */;
+}

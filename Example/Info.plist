@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The shop's server and the local realtime server run on the Mac over plain HTTP (realtime-js's test/native/serve.mjs). A shipped app talks HTTPS only and needs none of this. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<!-- Calls as the phone knows them (SystemCalls): `voip` for the VoIP push that rings the app closed, `audio` for a call
+	     that goes on with the app in the background. -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+		<string>voip</string>
+	</array>
+</dict>
+</plist>

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Push Notifications: the VoIP push a call rings the app closed with (SystemCalls). Development for a build from
+	     Xcode. An App Store or TestFlight build is signed for production, and the SDK reads which from the build. -->
+	<key>aps-environment</key>
+	<string>development</string>
+</dict>
+</plist>

@@ -1,0 +1,2116 @@
+diff --git a/Sources/LiveKit/Core/RegionManager.swift b/Sources/LiveKit/Core/RegionManager.swift
+index e0d94a831..c97b06dbf 100644
+--- a/Sources/LiveKit/Core/RegionManager.swift
++++ b/Sources/LiveKit/Core/RegionManager.swift
+@@ -23,6 +23,11 @@ actor RegionManager: Loggable {
+         var lastRequested: Date?
+         var all: [RegionInfo] = []
+         var remaining: [RegionInfo] = []
++        /// WordPlus Mesh: the list came over the signal connection, which a node sends again whenever the mesh's
++        /// nodes change, so it isn't fetched.
++        var signal = false
++        /// WordPlus Mesh: nodes that said they are busy, left out of the servers tried next.
++        var skippedNodes = Set<String>()
+     }
+ 
+     static let cacheInterval: TimeInterval = 30
+@@ -46,10 +51,64 @@ actor RegionManager: Loggable {
+         if onlyIfExhausted {
+             guard state.remaining.isEmpty else { return }
+         }
++        state.skippedNodes.removeAll()
+         guard !state.all.isEmpty else { return }
+         state.remaining = state.all
+     }
+ 
++    // MARK: - WordPlus Mesh
++
++    /// The region list a node sent over the signal connection, taken as it comes and never fetched while it does.
++    func setSignalRegions(_ regions: [RegionInfo]) {
++        let failed = Set(state.all).subtracting(state.remaining)
++        log("[Region] Region list from the server (\(regions.count))", .debug)
++        state.all = regions
++        state.remaining = regions.filter { !failed.contains($0) }
++        state.lastRequested = Date()
++        state.signal = true
++    }
++
++    /// Whether a node sends this server's list over the signal connection.
++    func hasSignalRegions() -> Bool {
++        state.signal
++    }
++
++    /// A node that said it is busy, left out of the servers tried next until the attempts are reset.
++    func skipNode(_ node: String) {
++        state.skippedNodes.insert(node)
++    }
++
++    /// The region this client is nearest, the list's first.
++    func homeRegion() -> String? {
++        state.all.first?.regionId
++    }
++
++    /// A node's own entry in the list, by its id.
++    func nodeEntry(_ node: String) -> RegionInfo? {
++        state.all.first { $0.node == node }
++    }
++
++    /// The list, fetched if there is none yet; nothing changes if it can't be.
++    func loadRegions(token: String) async {
++        guard state.all.isEmpty else { return }
++        try? await requestSettingsIfNeeded(token: token)
++    }
++
++    /// The best server not tried yet, leaving out a node (one that said it is busy). `skipUrl` (1.0.2) leaves out the
++    /// entry at that server's address, the one that just failed; `preferNode` (1.0.2) gives that node's entry first
++    /// while it is left, the node a session is on. Nil when there is none.
++    func next(token: String, skipNode node: String?, skipUrl: URL? = nil, preferNode: String? = nil) async -> RegionInfo? {
++        if let node { state.skippedNodes.insert(node) }
++        try? await requestSettingsIfNeeded(token: token)
++        let left = state.remaining.filter { region in
++            (region.node == nil || !state.skippedNodes.contains(region.node!)) &&
++                !(skipUrl.map { Mesh.sameServer(region.url, $0) } ?? false)
++        }
++        let found = (preferNode.flatMap { node in left.first { $0.node == node } }) ?? left.first
++        if let found { state.remaining.removeAll { $0 == found } }
++        return found
++    }
++
+     func resetAll() {
+         state = State()
+     }
+@@ -60,6 +119,7 @@ actor RegionManager: Loggable {
+ 
+     func shouldRequestSettings() -> Bool {
+         guard providedUrl.isCloud else { return false }
++        guard !state.signal else { return false }
+         guard let lastRequested = state.lastRequested else { return true }
+         return Date().timeIntervalSince(lastRequested) > Self.cacheInterval
+     }
+@@ -81,6 +141,8 @@ actor RegionManager: Loggable {
+ 
+     func updateFromServerReportedRegions(_ regions: Livekit_RegionSettings) {
+         guard providedUrl.isCloud else { return }
++        // WordPlus Mesh: a leave's list has no node ids, which the list a node sends over the signal connection has.
++        guard !state.signal else { return }
+ 
+         let allRegions = regions.regions.compactMap { $0.toLKType() }
+         guard !allRegions.isEmpty else { return }
+@@ -139,7 +201,14 @@ actor RegionManager: Loggable {
+ 
+         guard shouldRequestSettings() else { return }
+         let task = startSettingsFetchIfNeeded(token: token)
+-        _ = try await task.value
++        do {
++            _ = try await task.value
++        } catch {
++            // WordPlus Mesh: the refresh goes through the shared name, which after a crash may still lead to the
++            // dead node: the last list stands rather than none.
++            guard providedUrl.isMeshServer, !state.all.isEmpty, !(error is CancellationError) else { throw error }
++            log("[Region] Region list unreachable, using the last one", .info)
++        }
+     }
+ 
+     private func applyFetchedRegions(_ allRegions: [RegionInfo]) {
+@@ -161,6 +230,8 @@ actor RegionManager: Loggable {
+         var request = URLRequest(url: providedUrl.regionSettingsUrl(),
+                                  cachePolicy: .reloadIgnoringLocalAndRemoteCacheData)
+         request.addValue("Bearer \(token)", forHTTPHeaderField: "authorization")
++        // WordPlus Mesh: a fetch that never answers counts as unreachable after a while, not after a minute.
++        if providedUrl.isMeshServer { request.timeoutInterval = Mesh.requestTimeout }
+ 
+         let (data, response) = try await URLSession.shared.data(for: request)
+         guard let httpResponse = response as? HTTPURLResponse else {
+@@ -188,6 +259,9 @@ actor RegionManager: Loggable {
+     }
+ 
+     private nonisolated static func parseRegionSettings(data: Data) throws -> [RegionInfo] {
++        // WordPlus Mesh: a mesh's entries carry `node`, an unknown field to the protobuf parse below.
++        if let regions = Mesh.regions(json: data) { return regions }
++
+         do {
+             let regionSettings = try Livekit_RegionSettings(jsonUTF8Data: data)
+             let allRegions = regionSettings.regions.compactMap { $0.toLKType() }
+diff --git a/Sources/LiveKit/Core/Room+Engine.swift b/Sources/LiveKit/Core/Room+Engine.swift
+index 63b553c32..f8288bee4 100644
+--- a/Sources/LiveKit/Core/Room+Engine.swift
++++ b/Sources/LiveKit/Core/Room+Engine.swift
+@@ -342,8 +342,11 @@ extension Room {
+         @Sendable func quickReconnectSequence() async throws {
+             log("[Connect] Starting .quick reconnect sequence...")
+ 
++            // WordPlus Mesh: where the last failed resume moved it (`moveResumeToNextServer`), else where it was.
++            let resumeUrl = _state.read { $0.connectedUrl } ?? url
++
+             let singlePC = await !signalClient.useV0SignalPath
+-            let connectResponse = try await signalClient.connect(url,
++            let connectResponse = try await signalClient.connect(resumeUrl,
+                                                                  token,
+                                                                  connectOptions: _state.connectOptions,
+                                                                  reconnectMode: _state.isReconnectingWithMode,
+@@ -470,6 +473,13 @@ extension Room {
+                     }
+                 } catch {
+                     self.log("[Connect] Reconnect mode: \(mode) failed with error: \(error)", .error)
++
++                    // WordPlus Mesh: a resume that failed tries the next server next, rather than the same address
++                    // until it gives up, which DNS could keep leading to a node that is gone.
++                    if case .quick = mode, !(error is CancellationError) {
++                        await self.moveResumeToNextServer()
++                    }
++
+                     // Re-throw
+                     throw error
+                 }
+diff --git a/Sources/LiveKit/Core/Room+Region.swift b/Sources/LiveKit/Core/Room+Region.swift
+index 6adb057d4..7b10c0433 100644
+--- a/Sources/LiveKit/Core/Room+Region.swift
++++ b/Sources/LiveKit/Core/Room+Region.swift
+@@ -124,6 +124,10 @@ extension Room {
+         initialRegion: RegionInfo?,
+         token: String,
+     ) async throws -> URL {
++        if regionManager.providedUrl.isMeshServer {
++            return try await connectWithMeshWalk(regionManager: regionManager, initialUrl: initialUrl, token: token)
++        }
++
+         var nextUrl = initialUrl
+         var nextRegion = initialRegion
+ 
+@@ -162,4 +166,162 @@ extension Room {
+             }
+         }
+     }
++
++    /// WordPlus Mesh: a join on a mesh keeps trying until `ConnectOptions.meshJoinBudget`, as @wordplus/rtc-client's:
++    /// - a node `busy` (past its entry rate or its CPU) is left out and the list's next server tried at once, its home
++    ///   region's other nodes first; with every server busy, the join goes back to the home region's node that frees
++    ///   first and waits there (`mesh_wait=1`), which keeps it a slot of its own;
++    /// - a `slot` held for it, or a `full` cluster (a slot held), is come back to by that node's own name when its
++    ///   Retry-After says;
++    /// - a server that can't be reached is left for the list's next, and once every one has failed the join starts
++    ///   over from the best after 1 to 3 s.
++    /// A refusal of the token (401, 403) or a cancel ends it at once. `ConnectOptions.onMeshWait` hears each wait.
++    func connectWithMeshWalk(regionManager: RegionManager, initialUrl: URL, token: String) async throws -> URL {
++        let options = _state.connectOptions
++        let deadline = Date().addingTimeInterval(options.meshJoinBudget)
++        var busy: [(url: URL, region: String?, freeAt: Date)] = []
++        var nextUrl = initialUrl
++
++        while true {
++            do {
++                try await fullConnectSequence(nextUrl, token)
++                return nextUrl
++            } catch {
++                if error is CancellationError { throw error }
++
++                if let liveKitError = error as? LiveKitError, liveKitError.type == .validation || liveKitError.type == .cancelled {
++                    throw liveKitError
++                }
++
++                try Task.checkCancellation()
++                try checkStillJoining()
++
++                await cleanUp(isFullReconnect: true)
++
++                let tried = nextUrl
++                let refusal = (error as? LiveKitError)?.meshRefusal
++
++                if refusal?.kind == "busy", !tried.isMeshWait, Date() < deadline {
++                    if let node = refusal?.node { await regionManager.skipNode(node) }
++
++                    let next = await regionManager.next(token: token, skipNode: nil)
++                    let entry: RegionInfo? = if let node = refusal?.node { await regionManager.nodeEntry(node) } else { nil }
++                    let home = await regionManager.homeRegion()
++
++                    busy.append((url: entry?.url ?? tried, region: entry?.regionId ?? home, freeAt: Date().addingTimeInterval(refusal?.retryAfter ?? 1)))
++
++                    if let next {
++                        log("[Mesh] Server busy, trying \(next.url)", .info)
++                        nextUrl = next.url
++                        continue
++                    }
++
++                    guard let waitOn = Mesh.waitOn(busy, home: home) else { throw error }
++
++                    log("[Mesh] Every server busy, waiting for a slot on \(waitOn.url)", .info)
++                    options.onMeshWait?(MeshWait(until: waitOn.freeAt, reason: .busy))
++                    nextUrl = waitOn.url.withMeshWait()
++                    continue
++                }
++
++                // Another server, unless the mesh said none has room.
++                if refusal == nil, error.isRetryableForRegionFailover, let next = await regionManager.next(token: token, skipNode: nil) {
++                    log("[Mesh] Connect to \(tried) failed, trying \(next.url)", .info)
++                    nextUrl = next.url
++                    continue
++                }
++
++                guard let retryIn = Mesh.joinRetry(error, deadline: deadline) else { throw error }
++
++                let reason = refusal?.kind.flatMap { MeshWaitReason(rawValue: $0) } ?? .unreachable
++
++                log("[Mesh] Connect failed (\(error)), trying again in \(String(format: "%.1f", retryIn)) s", .info)
++                options.onMeshWait?(MeshWait(until: Date().addingTimeInterval(retryIn), reason: reason))
++
++                try await Task.sleep(nanoseconds: UInt64(retryIn * 1_000_000_000))
++                try checkStillJoining()
++
++                if refusal?.kind == "slot" || refusal?.kind == "full" {
++                    await regionManager.loadRegions(token: token)
++
++                    let entry: RegionInfo? = if let node = refusal?.node { await regionManager.nodeEntry(node) } else { nil }
++
++                    nextUrl = (entry?.url ?? tried).withMeshWait()
++                } else {
++                    nextUrl = initialUrl
++                }
++
++                await regionManager.resetAttempts()
++                busy.removeAll()
++            }
++        }
++    }
++
++    /// WordPlus Mesh: the walk goes on only while the room is joining. `disconnect()` doesn't cancel a join that is
++    /// under way, so a walk the app had left kept trying for the rest of its budget, minutes of it on a full mesh,
++    /// and joined a room nobody was in any more.
++    private func checkStillJoining() throws {
++        guard case .connecting = _state.connectionState else {
++            throw LiveKitError(.cancelled, message: "Left while joining")
++        }
++    }
++
++    /// WordPlus Mesh: the region list fetched once a join is in, if its node hasn't sent it over the signal
++    /// connection within `Mesh.regionsWait`: an older node, which doesn't. A failover then has a list to go on.
++    func fetchMeshRegionsLate(providedUrl: URL, token: String) {
++        guard providedUrl.isMeshServer else { return }
++
++        Task { [weak self] in
++            try? await Task.sleep(nanoseconds: UInt64(Mesh.regionsWait * 1_000_000_000))
++
++            guard let self, case .connected = self._state.connectionState,
++                  let regionManager = await self.regionManager(for: providedUrl),
++                  !(await regionManager.hasSignalRegions()) else { return }
++
++            self.log("[Region] No region list from the server, fetching it", .debug)
++            await regionManager.loadRegions(token: token)
++        }
++    }
++
++    /// WordPlus Mesh: the next resume goes to another server of the region list, only when its own server has
++    /// stopped answering while that one answers (1.0.2, rtc-client 1.0.5, `Mesh.resumeMoves`): a client whose own
++    /// network is down stays where it is. The mesh takes over a session it doesn't hold from the client's sync state,
++    /// so the others see a freeze, not a leave, if it lands within the mesh's hold of the lost node's participants
++    /// (15 s).
++    ///
++    /// Since 1.0.2 (rtc-client 1.0.12) the candidates are tried in turn, at most `Mesh.resumeMoveTries`, the node the
++    /// session is on first and never the address that just failed. A drain moves a session by a resume that reaches
++    /// the new node through the draining one, and the new node's answer names it as the client's node: 1.0.1 left
++    /// exactly that node out ("the node this client was on") and took the dead node's own entry for the next server,
++    /// so a phone whose address was a node removed after its drain spent a resume on the dead node and then landed on
++    /// whichever node came next, not the one holding its session (a burst node's removal, 2026-10-20).
++    func moveResumeToNextServer() async {
++        guard let providedUrl = _state.providedUrl, providedUrl.isMeshServer,
++              let token = _state.token,
++              let regionManager = await regionManager(for: providedUrl) else { return }
++
++        let failed = _state.read { $0.connectedUrl } ?? providedUrl
++        let session = serverNodeId
++        let ownProbe = Task { await Mesh.serverAnswers(failed) }
++        var own: Bool?
++
++        for _ in 0 ..< Mesh.resumeMoveTries {
++            guard let next = await regionManager.next(token: token, skipNode: nil, skipUrl: failed, preferNode: session) else { break }
++            async let other = Mesh.serverAnswers(next.url)
++            let ownNow = await ownProbe.value
++            own = ownNow
++            if ownNow { break }
++            if await Mesh.resumeMoves(ownAnswers: ownNow, nextAnswers: other) {
++                log("[Mesh] Resuming on another server next: \(next.url), its own no longer answers", .warning)
++                _state.mutate { $0.connectedUrl = next.url }
++                return
++            }
++        }
++
++        // the list's servers stay untried: the next failed resume asks again
++        await regionManager.resetAttempts()
++        let answers = if let own { own } else { await ownProbe.value }
++        log(answers ? "[Mesh] Resuming on the same server: it still answers"
++            : "[Mesh] Resuming on the same server: no server answers, this connection is down", .warning)
++    }
+ }
+diff --git a/Sources/LiveKit/Core/Room+SignalClientDelegate.swift b/Sources/LiveKit/Core/Room+SignalClientDelegate.swift
+index 55e3d0168..c99475b2a 100644
+--- a/Sources/LiveKit/Core/Room+SignalClientDelegate.swift
++++ b/Sources/LiveKit/Core/Room+SignalClientDelegate.swift
+@@ -114,6 +114,8 @@ extension Room: SignalClientDelegate {
+             _state.mutate {
+                 $0.apply(roomInfo: joinResponse.room)
+                 $0.serverInfo = joinResponse.serverInfo
++                // WordPlus Mesh (1.0.3): the node's codec policy, in a field LiveKit's JoinResponse hasn't got
++                $0.meshCodecPolicy = Mesh.codecPolicy(inJoinResponseUnknownFields: joinResponse.unknownFields.data)
+ 
+                 localParticipant.set(info: joinResponse.participant, connectionState: $0.connectionState)
+                 localParticipant.set(enabledPublishCodecs: joinResponse.enabledPublishCodecs)
+@@ -124,6 +126,10 @@ extension Room: SignalClientDelegate {
+                     }
+                 }
+             }
++        } else if case let .reconnect(response) = connectResponse, response.hasServerInfo {
++            // WordPlus Mesh: a resume may land on another node (`moveResumeToNextServer`), which is the one to leave
++            // out of the next failover.
++            _state.mutate { $0.serverInfo = response.serverInfo }
+         }
+     }
+ 
+@@ -267,6 +273,7 @@ extension Room: SignalClientDelegate {
+ 
+                 if info.state == .disconnected {
+                     // when it's disconnected, send updates
++                    $0.remoteParticipants[infoIdentity]?.set(disconnectReason: info.disconnectReason.rawValue)
+                     disconnectedParticipantIdentities.append(infoIdentity)
+                 } else {
+                     let isNewParticipant = $0.remoteParticipants[infoIdentity] == nil
+@@ -396,6 +403,22 @@ extension Room: SignalClientDelegate {
+         }
+     }
+ 
++    func signalClient(_: SignalClient, didReceiveMeshRegions regions: [RegionInfo]) async {
++        guard let providedUrl = _state.providedUrl, let regionManager = await regionManager(for: providedUrl) else { return }
++
++        await regionManager.setSignalRegions(regions)
++    }
++
++    /// WordPlus Mesh (1.0.3, rtc-client 1.0.7): the node says whether anyone hears one of this participant's audio
++    /// tracks (any codec enabled, or none), which it says only to a client whose join named `audio-pause` (WordPlus
++    /// Mesh 1.0.32): a node pauses a video nobody watches through dynacast, and nothing did that for a microphone.
++    func signalClient(_: SignalClient, didUpdateSubscribedAudioCodecs codecs: [Livekit_SubscribedAudioCodec], forTrackSid trackSid: String) async {
++        guard let publication = localParticipant.trackPublications[Track.Sid(from: trackSid)] as? LocalTrackPublication,
++              let track = publication.track as? LocalAudioTrack else { return }
++
++        track._setMeshHeard(codecs.contains { $0.enabled })
++    }
++
+     func signalClient(_: SignalClient, didReceiveMediaSectionsRequirement requirement: Livekit_MediaSectionsRequirement) async {
+         guard case let .publisherOnly(publisher) = _state.transport else { return }
+ 
+diff --git a/Sources/LiveKit/Core/Room.swift b/Sources/LiveKit/Core/Room.swift
+index 6585c38ee..f49eaed1f 100644
+--- a/Sources/LiveKit/Core/Room.swift
++++ b/Sources/LiveKit/Core/Room.swift
+@@ -57,6 +57,11 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
+     /// Region code the client is currently connected to.
+     public var serverNodeId: String? { _state.serverInfo?.nodeID.nilIfEmpty }
+ 
++    /// WordPlus Mesh (1.0.3, rtc-client 1.0.8's `Room.meshCodecPolicy`): the codec policy a mesh node sends with its
++    /// join response (WordPlus Mesh 1.0.33's `mesh.codec_policy`), lists of codec names and a backup's name only, for
++    /// the product's codec rule to take as a preference. Nil from a node that sends none, and from any other server.
++    public var meshCodecPolicy: MeshCodecPolicy? { _state.meshCodecPolicy }
++
+     public var remoteParticipants: [Participant.Identity: RemoteParticipant] { _state.remoteParticipants }
+ 
+     public var activeSpeakers: [Participant] { _state.activeSpeakers }
+@@ -168,6 +173,9 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
+ 
+         var serverInfo: Livekit_ServerInfo?
+ 
++        /// WordPlus Mesh (1.0.3): the codec policy the node sent with its join response.
++        var meshCodecPolicy: MeshCodecPolicy?
++
+         // Engine
+         var providedUrl: URL?
+         var connectedUrl: URL?
+@@ -244,6 +252,9 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
+ 
+     let _regionManager = StateSync<RegionManager?>(nil)
+ 
++    /// WordPlus Mesh (1.0.3): the published videos' encoders, told to a mesh node while connected.
++    let _meshEncoders = MeshEncoderReporter()
++
+     // MARK: Objective-C Support
+ 
+     override public convenience init() {
+@@ -325,6 +336,16 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
+                 log("connectionState: \(oldState.connectionState) -> \(newState.connectionState), reconnectMode: \(String(describing: newState.isReconnectingWithMode))")
+             }
+ 
++            // WordPlus Mesh (1.0.3): encoder reports while connected to a mesh, all again after any reconnect (a quick
++            // one leaves the connection state as it is and changes only the reconnect mode)
++            let isIn = newState.connectionState == .connected && newState.isReconnectingWithMode == nil
++            let wasIn = oldState.connectionState == .connected && oldState.isReconnectingWithMode == nil
++            if isIn, !wasIn, newState.providedUrl?.isMeshServer == true {
++                _meshEncoders.start(self)
++            } else if newState.connectionState == .disconnected, oldState.connectionState != .disconnected {
++                _meshEncoders.stop()
++            }
++
+             engine(self, didMutateState: newState, oldState: oldState)
+ 
+             // execution control
+@@ -426,7 +447,9 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
+                 if let preparedRegion {
+                     nextUrl = preparedRegion.url
+                     nextRegion = preparedRegion
+-                } else if await regionManager.shouldRequestSettings() {
++                } else if !providedUrl.isMeshServer, await regionManager.shouldRequestSettings() {
++                    // WordPlus Mesh: not on a mesh, whose node sends its list over the signal connection once the
++                    // client is in (`fetchMeshRegionsLate` for one that doesn't).
+                     await regionManager.prepareSettingsFetch(token: token)
+                 }
+             }
+@@ -480,6 +503,8 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
+                 $0.connectionState = .connected
+             }
+ 
++            fetchMeshRegionsLate(providedUrl: providedUrl, token: token)
++
+             connectSpan?.end()
+ 
+             // Publish mic if mic task was created
+diff --git a/Sources/LiveKit/Core/SignalClient.swift b/Sources/LiveKit/Core/SignalClient.swift
+index 96bb82437..61593445c 100644
+--- a/Sources/LiveKit/Core/SignalClient.swift
++++ b/Sources/LiveKit/Core/SignalClient.swift
+@@ -157,9 +157,16 @@ actor SignalClient: Loggable {
+         _state.mutate { $0.connectionState = (isReconnect ? .reconnecting : .connecting) }
+ 
+         do {
++            // WordPlus Mesh: a resume waits for its server the few round trips this connection takes
++            // (`Mesh.resumeWait`, 5 s at least), then the next attempt may go to another
++            // (`Room.moveResumeToNextServer`).
+             let socket = try await WebSocket(url: url,
+                                              token: token,
+-                                             connectOptions: connectOptions)
++                                             connectOptions: connectOptions,
++                                             timeout: isReconnect && url.isMeshServer
++                                                 ? Mesh.resumeWait(rttMs: _state.read { $0.rtt },
++                                                                   cap: connectOptions?.socketConnectTimeoutInterval ?? .defaultSocketConnect)
++                                                 : nil)
+             connectSpan?.record("ws_open")
+ 
+             let messageLoopTask = socket.subscribe(self) { observer, message in
+@@ -214,10 +221,12 @@ actor SignalClient: Loggable {
+                     error.localizedDescription
+                 }
+ 
+-                // Preserve validation request failure details while keeping the original connection error.
++                // Preserve validation request failure details while keeping the original connection error, and a
++                // mesh node's refusal with them (WordPlus Mesh: the join walks or waits by it).
+                 throw LiveKitError(.network,
+                                    message: "Validation request failed: \(validationMessage)",
+-                                   internalError: connectionError)
++                                   internalError: connectionError,
++                                   meshRefusal: (error as? LiveKitError)?.meshRefusal)
+             }
+         }
+     }
+@@ -280,6 +289,14 @@ private extension SignalClient {
+     }
+ 
+     func onWebSocketMessage(_ message: URLSessionWebSocketTask.Message) async {
++        // WordPlus Mesh: a node sends its region list once the client is in, again whenever the mesh's nodes
++        // change, and every 2 minutes, in a field upstream's protocol hasn't got.
++        if case let .data(data) = message, let regions = Mesh.regions(inSignalMessage: data) {
++            log("[Region] region list from the server: \(regions.count)", .debug)
++            _delegate.notifyDetached { await $0.signalClient(self, didReceiveMeshRegions: regions) }
++            return
++        }
++
+         let response: Livekit_SignalResponse? = switch message {
+         case let .data(data): try? Livekit_SignalResponse(serializedBytes: data)
+         case let .string(string): try? Livekit_SignalResponse(jsonString: string)
+@@ -400,6 +417,11 @@ private extension SignalClient {
+         case let .mediaSectionsRequirement(requirement):
+             _delegate.notifyDetached { await $0.signalClient(self, didReceiveMediaSectionsRequirement: requirement) }
+ 
++        // WordPlus Mesh (1.0.3): whether anyone hears a local audio track (LocalAudioTrack._setMeshHeard)
++        case let .subscribedAudioCodecUpdate(update):
++            _delegate.notifyDetached { await $0.signalClient(self, didUpdateSubscribedAudioCodecs: update.subscribedAudioCodecs,
++                                                             forTrackSid: update.trackSid) }
++
+         default:
+             log("Unhandled signal message: \(message)", .warning)
+         }
+@@ -418,6 +440,20 @@ extension SignalClient {
+ // MARK: - Send methods
+ 
+ extension SignalClient {
++    /// WordPlus Mesh (1.0.3, rtc-client 1.0.10's `sendMeshEncoders`): the published videos' encoders, as JSON in a
++    /// request with no message of LiveKit's (`MeshEncoders.field`). Sent only while connected, never queued: the next
++    /// reading tells it again. Whether it went.
++    func sendMeshEncoders(_ json: Data) async -> Bool {
++        guard connectionState == .connected, let socket = _state.socket else { return false }
++        do {
++            try await socket.send(data: Mesh.lengthDelimited(MeshEncoders.field, json))
++            return true
++        } catch {
++            log("Could not send the encoders: \(error)", .debug)
++            return false
++        }
++    }
++
+     func send(offer: LKRTCSessionDescription, offerId: UInt32) async throws {
+         let r = Livekit_SignalRequest.with {
+             $0.offer = offer.toPBType(offerId: offerId)
+diff --git a/Sources/LiveKit/Errors.swift b/Sources/LiveKit/Errors.swift
+index dacf9d058..aab437700 100644
+--- a/Sources/LiveKit/Errors.swift
++++ b/Sources/LiveKit/Errors.swift
+@@ -141,6 +141,8 @@ public class LiveKitError: NSError, @unchecked Sendable, Loggable {
+     public let type: LiveKitErrorType
+     public let message: String?
+     public let internalError: Error?
++    /// WordPlus Mesh: a mesh node's refusal of the join (HTTP 429), carried through whatever wraps it.
++    @nonobjc public let meshRefusal: MeshRefusal?
+ 
+     @available(*, deprecated, renamed: "internalError")
+     public var underlyingError: Error? { internalError }
+@@ -151,7 +153,8 @@ public class LiveKitError: NSError, @unchecked Sendable, Loggable {
+ 
+     public init(_ type: LiveKitErrorType,
+                 message: String? = nil,
+-                internalError: Error? = nil)
++                internalError: Error? = nil,
++                meshRefusal: MeshRefusal? = nil)
+     {
+         func _computeDescription() -> String {
+             var suffix = ""
+@@ -166,6 +169,7 @@ public class LiveKitError: NSError, @unchecked Sendable, Loggable {
+         self.type = type
+         self.message = message
+         self.internalError = internalError
++        self.meshRefusal = meshRefusal ?? (internalError as? LiveKitError)?.meshRefusal
+ 
+         var userInfo: [String: Any] = [NSLocalizedDescriptionKey: _computeDescription()]
+         if let internalError {
+diff --git a/Sources/LiveKit/Extensions/URL.swift b/Sources/LiveKit/Extensions/URL.swift
+index e9f10e9bc..393541569 100644
+--- a/Sources/LiveKit/Extensions/URL.swift
++++ b/Sources/LiveKit/Extensions/URL.swift
+@@ -29,10 +29,32 @@ extension URL {
+         scheme == "https" || scheme == "wss"
+     }
+ 
+-    /// Checks whether the URL is a LiveKit Cloud URL.
++    /// Checks whether the URL is a LiveKit Cloud URL, or one of a WordPlus Mesh's: a server with others to fail over
++    /// to, which answers `/settings/regions`.
+     var isCloud: Bool {
+         guard let host else { return false }
+-        return host.hasSuffix(".livekit.cloud") || host.hasSuffix(".livekit.run")
++        return host.hasSuffix(".livekit.cloud") || host.hasSuffix(".livekit.run") || isMeshServer
++    }
++
++    /// WordPlus Mesh: a server under a mesh's domain (`MeshDomains`), `rtc.wordplus.cloud` and the names under it.
++    var isMeshServer: Bool {
++        guard let host = host?.lowercased() else { return false }
++        return MeshDomains.contains(host: host)
++    }
++
++    /// WordPlus Mesh: the server's URL with `mesh_wait=1`, which a join and its validation carry to a node that keeps
++    /// the join a slot of its own while it waits there.
++    func withMeshWait() -> URL {
++        guard var components = URLComponents(url: self, resolvingAgainstBaseURL: false) else { return self }
++        var items = (components.queryItems ?? []).filter { $0.name != "mesh_wait" }
++        items.append(URLQueryItem(name: "mesh_wait", value: "1"))
++        components.queryItems = items
++        return components.url ?? self
++    }
++
++    /// WordPlus Mesh: whether this is a server the join said it will wait on (`withMeshWait`).
++    var isMeshWait: Bool {
++        URLComponents(url: self, resolvingAgainstBaseURL: false)?.queryItems?.contains { $0.name == "mesh_wait" && $0.value == "1" } ?? false
+     }
+ 
+     func cloudConfigUrl() -> URL {
+diff --git a/Sources/LiveKit/Mesh/MeshEncoders.swift b/Sources/LiveKit/Mesh/MeshEncoders.swift
+new file mode 100644
+index 000000000..52f611044
+--- /dev/null
++++ b/Sources/LiveKit/Mesh/MeshEncoders.swift
+@@ -0,0 +1,346 @@
++/*
++ * Copyright 2026 The WordPlus RTC client authors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import Foundation
++
++internal import LiveKitWebRTC
++
++// WordPlus Mesh (1.0.3, as rtc-client 1.0.10 and 1.0.11's room/meshEncoders.ts): which encoder each published video
++// runs on, hardware or software, and how each layer encodes, told to the node for its live view (2026-10-18; and
++// 2026-10-19, after a call where many people sent few frames a second), so a call's people show how each one
++// publishes. Only the device knows it, in its senders' stats:
++// `encoderImplementation` ("SimulcastEncoderAdapter (VideoToolbox, VideoToolbox, VideoToolbox)", one encoder a layer
++// from the smallest up) and `powerEfficientEncoder`, each layer's frames, height and what holds it back, and its
++// totals of encode time, key frames made and key frames asked for, from which a reading takes what changed since the
++// last. Read every `reportEvery` while connected, sent when it changed and again after a reconnect, in a signal
++// request with no message of LiveKit's and the JSON in `field`: a node before 1.0.35 handles it as nothing. Only to
++// a mesh's servers.
++
++enum MeshEncoders {
++    static let reportEvery: TimeInterval = 10
++
++    /// The signal request field the report goes in (WordPlus Mesh's `MeshEncodersFieldNumber`).
++    static let field: UInt64 = 1001
++
++    /// One stats object as libwebrtc gives it: its id, its type and its members.
++    struct Stat {
++        let id: String
++        let type: String
++        let values: [String: Any]
++    }
++
++    struct Layer: Codable, Equatable {
++        var rid: String
++        var encoder: String?
++        var hw: Bool?
++        /// while it encodes: its frames a second, its height, and what holds it back ("cpu", "bandwidth", "other")
++        var fps: Int?
++        var height: Int?
++        var limit: String?
++        /// since the last reading: ms of encoding a frame, key frames made, key frames asked for (PLI, FIR)
++        var encodeMs: Double?
++        var keyFrames: Int?
++        var plis: Int?
++    }
++
++    struct CodecReport: Codable, Equatable {
++        var codec: String
++        var encoder: String
++        var layers: [Layer]
++        /// the frames a second its source gives the encoder (media-source stats)
++        var captured: Int?
++    }
++
++    /// The mode a capture was opened at: its size and the frames a second asked of the device.
++    struct Mode: Codable, Equatable {
++        var width: Int
++        var height: Int
++        var fps: Int?
++    }
++
++    struct TrackReport: Codable, Equatable {
++        var sid: String
++        var codecs: [CodecReport]
++        var mode: Mode?
++    }
++
++    /// A layer's running totals in its stats, from which `sinceLast` takes what changed between two readings.
++    struct Totals: Equatable {
++        var encodeTime: Double?
++        var frames: Double?
++        var keyFrames: Double?
++        var plis: Double?
++    }
++
++    struct Outbound {
++        var rid: String
++        var height: Int
++        var encoder: String?
++        var powerEfficient: Bool?
++        var active: Bool
++        var fps: Double?
++        var limit: String?
++        var captured: Double?
++        var mime: String
++        var encodeMs: Double?
++        var keyFrames: Int?
++        var plis: Int?
++    }
++
++    private static let software = try! NSRegularExpression(pattern: "^(libvpx|openh264|libaom|svt|ffmpeg|libx26|dav1d|rav1e|fake)",
++                                                           options: [.caseInsensitive])
++
++    /// Whether an encoder named so runs in hardware: nil when the device named none.
++    static func encoderHardware(_ name: String?, powerEfficient: Bool?) -> Bool? {
++        guard let name, !name.isEmpty else { return powerEfficient }
++        let trimmed = name.trimmingCharacters(in: .whitespaces)
++        return software.firstMatch(in: trimmed, range: NSRange(trimmed.startIndex..., in: trimmed)) == nil
++    }
++
++    /// The encoders a SimulcastEncoderAdapter names, in its streams' order; the name itself for any other.
++    static func adapterEncoders(_ name: String) -> [String] {
++        let trimmed = name.trimmingCharacters(in: .whitespaces)
++        let prefix = "SimulcastEncoderAdapter"
++        guard trimmed.hasPrefix(prefix) else { return [trimmed] }
++        let rest = trimmed.dropFirst(prefix.count).trimmingCharacters(in: .whitespaces)
++        guard rest.hasPrefix("("), rest.hasSuffix(")") else { return [trimmed] }
++        return rest.dropFirst().dropLast().split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
++    }
++
++    /// What a layer did between two readings of its totals: the time it took to encode a frame, in ms, and the key
++    /// frames it made and was asked for. Nothing from a first reading, nor from a total the device doesn't keep or
++    /// that went back (a sender started over).
++    static func sinceLast(_ prev: Totals?, _ now: Totals) -> (encodeMs: Double?, keyFrames: Int?, plis: Int?) {
++        guard let prev else { return (nil, nil, nil) }
++        func delta(_ a: Double?, _ b: Double?) -> Double? {
++            guard let a, let b, b >= a else { return nil }
++            return b - a
++        }
++        var encodeMs: Double?
++        if let frames = delta(prev.frames, now.frames), frames > 0, let time = delta(prev.encodeTime, now.encodeTime) {
++            encodeMs = ((time / frames) * 10000).rounded() / 10
++        }
++        return (encodeMs, delta(prev.keyFrames, now.keyFrames).map { Int($0) }, delta(prev.plis, now.plis).map { Int($0) })
++    }
++
++    private static let ridOrder = ["q", "h", "f"]
++
++    /// Whether a layer encodes now: the adapter names the encoders of those alone, and a layer the server paused
++    /// (dynacast) can still read active for a moment after it stopped, so its frames decide where it says them.
++    private static func sending(_ o: Outbound) -> Bool {
++        o.active && (o.fps == nil || o.fps! > 0)
++    }
++
++    /// One sender's layers, each with its own encoder where the adapter's list matches the layers that encode, or the
++    /// one encoder every one of them runs on; a device that names none still gets its layers' frames and size told,
++    /// its encoder "".
++    static func layers(of outbound: [Outbound]) -> (encoder: String, layers: [Layer])? {
++        guard !outbound.isEmpty else { return nil }
++        let named = outbound.first { $0.encoder?.isEmpty == false }
++        func order(_ o: Outbound) -> Int {
++            ridOrder.firstIndex(of: o.rid) ?? ridOrder.count + o.height
++        }
++        let sorted = outbound.enumerated().sorted { a, b in
++            let (x, y) = (order(a.element), order(b.element))
++            return x != y ? x < y : (a.element.height != b.element.height ? a.element.height < b.element.height : a.offset < b.offset)
++        }.map(\.element)
++        let list = named?.encoder.map(adapterEncoders) ?? []
++        let activeIndices = sorted.indices.filter { sending(sorted[$0]) }
++        let one = !list.isEmpty && Set(list).count == 1
++
++        let layers = sorted.indices.map { i -> Layer in
++            let o = sorted[i]
++            var encoder: String?
++            if one {
++                encoder = list[0]
++            } else if !list.isEmpty, list.count == activeIndices.count, let at = activeIndices.firstIndex(of: i) {
++                encoder = list[at]
++            } else if !list.isEmpty, list.count == sorted.count {
++                encoder = list[i]
++            }
++            var layer = Layer(rid: o.rid)
++            if let encoder {
++                layer.encoder = String(encoder.prefix(80))
++                layer.hw = encoderHardware(encoder, powerEfficient: list.count == 1 ? o.powerEfficient : nil)
++            }
++            // what it encodes now, what holds it back, and how it encodes since the last reading
++            if sending(o), let fps = o.fps {
++                layer.fps = Int(fps.rounded())
++                if o.height > 0 { layer.height = o.height }
++                if let limit = o.limit, limit != "none" { layer.limit = limit }
++                layer.encodeMs = o.encodeMs
++                layer.keyFrames = o.keyFrames
++                layer.plis = o.plis
++            }
++            return layer
++        }
++        return (String((named?.encoder ?? "").prefix(200)), layers)
++    }
++
++    /// A sender's video layers from its stats, with what changed since `before` (its layers' totals at the last
++    /// reading, by rid), and its totals now.
++    static func outbound(of stats: [Stat], before: [String: Totals]?) -> (outbound: [Outbound], totals: [String: Totals]) {
++        let byId = Dictionary(stats.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
++        func num(_ v: Any?) -> Double? { (v as? NSNumber)?.doubleValue }
++        func str(_ v: Any?) -> String? { v as? String }
++        var out: [Outbound] = []
++        var totals: [String: Totals] = [:]
++        for s in stats where s.type == "outbound-rtp" && str(s.values["kind"]) == "video" {
++            let codec = str(s.values["codecId"]).flatMap { byId[$0] }
++            let source = str(s.values["mediaSourceId"]).flatMap { byId[$0] }
++            let rid = str(s.values["rid"]) ?? ""
++            let pli = num(s.values["pliCount"])
++            let fir = num(s.values["firCount"])
++            let now = Totals(encodeTime: num(s.values["totalEncodeTime"]),
++                             frames: num(s.values["framesEncoded"]),
++                             keyFrames: num(s.values["keyFramesEncoded"]),
++                             plis: pli != nil || fir != nil ? (pli ?? 0) + (fir ?? 0) : nil)
++            totals[rid] = now
++            let since = sinceLast(before?[rid], now)
++            out.append(Outbound(rid: rid,
++                                height: Int(num(s.values["frameHeight"]) ?? 0),
++                                encoder: str(s.values["encoderImplementation"]),
++                                powerEfficient: (s.values["powerEfficientEncoder"] as? NSNumber)?.boolValue,
++                                active: (s.values["active"] as? NSNumber)?.boolValue ?? true,
++                                fps: num(s.values["framesPerSecond"]),
++                                limit: str(s.values["qualityLimitationReason"]),
++                                captured: num(source?.values["framesPerSecond"]),
++                                mime: str(codec?.values["mimeType"]) ?? "",
++                                encodeMs: since.encodeMs,
++                                keyFrames: since.keyFrames,
++                                plis: since.plis))
++        }
++        return (out, totals)
++    }
++
++    /// One sender's report, its codec's name given (a backup's) or read from its stats; nil when it has no video layers.
++    static func codecReport(_ outbound: [Outbound], named: String?) -> CodecReport? {
++        guard let read = layers(of: outbound) else { return nil }
++        let mime = outbound.first { !$0.mime.isEmpty }?.mime ?? ""
++        let codec = (named ?? (mime.lowercased().hasPrefix("video/") ? String(mime.dropFirst(6)) : mime)).lowercased()
++        let captured = outbound.compactMap(\.captured).max()
++        return CodecReport(codec: codec, encoder: read.encoder, layers: read.layers, captured: captured.map { Int($0.rounded()) })
++    }
++
++    /// The report as a node reads it: `{"tracks":[...]}`, its keys sorted so two readings that say the same compare
++    /// equal.
++    static func json(_ tracks: [TrackReport]) -> Data? {
++        struct Body: Encodable { let tracks: [TrackReport] }
++        let encoder = JSONEncoder()
++        encoder.outputFormatting = [.sortedKeys]
++        return try? encoder.encode(Body(tracks: tracks))
++    }
++
++    static func stats(_ report: LKRTCStatisticsReport) -> [Stat] {
++        report.statistics.values.map { Stat(id: $0.id, type: $0.type, values: $0.values) }
++    }
++}
++
++/// WordPlus Mesh (1.0.3): reads the room's published videos' encoders every `MeshEncoders.reportEvery` while it is
++/// connected to a mesh's server, and 3 s after a video is published, and sends the report when it changed; all of it
++/// again after a reconnect, to a node that may hold no session of it yet.
++final class MeshEncoderReporter: @unchecked Sendable, Loggable {
++    private struct State {
++        var task: Task<Void, Never>?
++        var sent: Data?
++        var totals: [ObjectIdentifier: [String: MeshEncoders.Totals]] = [:]
++    }
++
++    private let _state = StateSync(State())
++
++    /// Connected to a mesh, or connected again after a reconnect: everything is told again at the next reading.
++    func start(_ room: Room) {
++        _state.mutate {
++            $0.sent = nil
++            guard $0.task == nil else { return }
++            $0.task = Task { [weak self, weak room] in
++                while !Task.isCancelled {
++                    try? await Task.sleep(nanoseconds: UInt64(MeshEncoders.reportEvery * 1_000_000_000))
++                    guard let self, let room, !Task.isCancelled else { return }
++                    await self.report(room)
++                }
++            }
++        }
++    }
++
++    func stop() {
++        _state.mutate {
++            $0.task?.cancel()
++            $0.task = nil
++            $0.sent = nil
++            $0.totals = [:]
++        }
++    }
++
++    /// A new video's encoders are told within a few seconds, once they run, not at the next reading.
++    func reportSoon(_ room: Room) {
++        guard _state.read({ $0.task != nil }) else { return }
++        Task { [weak self, weak room] in
++            try? await Task.sleep(nanoseconds: 3_000_000_000)
++            guard let self, let room else { return }
++            await self.report(room)
++        }
++    }
++
++    func report(_ room: Room) async {
++        let (connected, providedUrl) = room._state.read { ($0.connectionState == .connected && $0.isReconnectingWithMode == nil, $0.providedUrl) }
++        guard connected, providedUrl?.isMeshServer == true else { return }
++
++        var tracks: [MeshEncoders.TrackReport] = []
++        for publication in room.localParticipant.localVideoTracks {
++            guard let track = publication.track as? LocalVideoTrack else { continue }
++            let (transport, sender, simulcast) = track._state.read { ($0.transport, $0.rtpSender, $0.rtpSenderForCodec) }
++            guard let transport else { continue }
++
++            var senders: [(LKRTCRtpSender, String?)] = []
++            if let sender { senders.append((sender, nil)) }
++            senders += simulcast.map { ($0.value, $0.key.name) }
++
++            var codecs: [MeshEncoders.CodecReport] = []
++            for (sender, named) in senders {
++                let stats = await MeshEncoders.stats(transport.statistics(for: sender))
++                let key = ObjectIdentifier(sender)
++                let read = MeshEncoders.outbound(of: stats, before: _state.read { $0.totals[key] })
++                _state.mutate { $0.totals[key] = read.totals }
++                if let report = MeshEncoders.codecReport(read.outbound, named: named) {
++                    codecs.append(report)
++                }
++            }
++            guard !codecs.isEmpty else { continue }
++            tracks.append(MeshEncoders.TrackReport(sid: publication.sid.stringValue, codecs: codecs, mode: Self.mode(of: track)))
++        }
++
++        guard let json = MeshEncoders.json(tracks) else { return }
++        let sent = _state.read { $0.sent }
++        if json == sent || (tracks.isEmpty && sent == nil) { return }
++        if await room.signalClient.sendMeshEncoders(json) {
++            _state.mutate { $0.sent = json }
++        }
++    }
++
++    /// The mode the capture was opened at: the size it captures and the frames a second asked of it, where its
++    /// capturer says (a camera, or frames an app hands it).
++    static func mode(of track: LocalVideoTrack) -> MeshEncoders.Mode? {
++        guard let dimensions = track.capturer.dimensions else { return nil }
++        var fps: Int?
++        if let camera = track.capturer as? CameraCapturer {
++            fps = camera.options.fps
++        } else if let buffer = track.capturer as? BufferCapturer {
++            fps = buffer.options.fps
++        }
++        return MeshEncoders.Mode(width: Int(dimensions.width), height: Int(dimensions.height), fps: fps)
++    }
++}
+diff --git a/Sources/LiveKit/Mesh/WordPlusMesh.swift b/Sources/LiveKit/Mesh/WordPlusMesh.swift
+new file mode 100644
+index 000000000..e883fde14
+--- /dev/null
++++ b/Sources/LiveKit/Mesh/WordPlusMesh.swift
+@@ -0,0 +1,377 @@
++/*
++ * Copyright 2026 The WordPlus RTC client authors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import Foundation
++
++// WordPlus Mesh: what this client does differently on a mesh's servers, as @wordplus/rtc-client does in a browser
++// (the mesh's clients/js). The protocol is upstream's own; a mesh node answers `/settings/regions` as LiveKit Cloud
++// does, refuses a join it can't place now with HTTP 429, and sends its region list over the signal connection.
++
++/// The domains a mesh serves: `rtc.wordplus.cloud` and the names under it, and any a product adds.
++public enum MeshDomains {
++    private static let lock = NSLock()
++    nonisolated(unsafe) private static var domains: Set<String> = ["rtc.wordplus.cloud"]
++
++    /// Adds domains served by a mesh, beside the built-in ones.
++    public static func add(_ list: String...) {
++        lock.lock()
++        defer { lock.unlock() }
++        for domain in list {
++            let clean = domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
++            if !clean.isEmpty { domains.insert(clean) }
++        }
++    }
++
++    static func contains(host: String) -> Bool {
++        lock.lock()
++        defer { lock.unlock() }
++        return domains.contains { host == $0 || host.hasSuffix("." + $0) }
++    }
++}
++
++/// Why a join on a mesh started to wait: every server tried was `busy` and a slot is held on one, a node holds a
++/// `slot` for it, the cluster is `full` (and a slot is held), or no server of the list could be reached at all.
++public enum MeshWaitReason: String, Sendable {
++    case busy
++    case slot
++    case full
++    case unreachable
++}
++
++/// A join on a mesh waiting, until when, and why (`ConnectOptions.onMeshWait`).
++public struct MeshWait: Sendable {
++    public let until: Date
++    public let reason: MeshWaitReason
++}
++
++/// The product placing a call (1.0.3, rtc-client 1.0.6's `meshApp`), which a mesh node is told on each join of the
++/// room (`rtc_app`) for its live view: `MeshApp(name: "better-messages", version: "3.1.4")`.
++public struct MeshApp: Sendable, Hashable {
++    public let name: String
++    public let version: String?
++
++    public init(name: String, version: String? = nil) {
++        self.name = name
++        self.version = version
++    }
++}
++
++/// A mesh node's codec policy (1.0.3, rtc-client 1.0.8's `MeshCodecPolicy`), `Room.meshCodecPolicy`: each list the
++/// codecs it would have a camera or a screen go out in, first choice first (`h265:hw` only from hardware), and what goes
++/// behind a camera. A preference: the product takes the first its device sends.
++public struct MeshCodecPolicy: Sendable, Hashable {
++    public let camera: [String]?
++    public let screen: [String]?
++    public let backup: String?
++
++    public init(camera: [String]? = nil, screen: [String]? = nil, backup: String? = nil) {
++        self.camera = camera
++        self.screen = screen
++        self.backup = backup
++    }
++}
++
++/// A mesh node's refusal of a join, from its 429 (`X-Mesh-Refused`, `X-Mesh-Node`, `Retry-After`).
++public struct MeshRefusal: Sendable {
++    /// `busy`, `slot` or `full`; nil from a server that names none.
++    public let kind: String?
++    /// The refusing node's id, as the region list names it.
++    public let node: String?
++    /// How long until the node takes the join, when it said.
++    public let retryAfter: TimeInterval?
++
++    init(kind: String?, node: String?, retryAfter: TimeInterval?) {
++        self.kind = ["busy", "slot", "full"].contains(kind ?? "") ? kind : nil
++        self.node = node?.isEmpty == false ? node : nil
++        self.retryAfter = retryAfter
++    }
++
++    /// A Retry-After header: seconds, or an HTTP date.
++    static func retryAfter(_ header: String?, now: Date = Date()) -> TimeInterval? {
++        guard let header = header?.trimmingCharacters(in: .whitespaces), !header.isEmpty else { return nil }
++        if let seconds = Double(header), seconds >= 0 { return seconds }
++        let formatter = DateFormatter()
++        formatter.locale = Locale(identifier: "en_US_POSIX")
++        formatter.timeZone = TimeZone(identifier: "GMT")
++        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
++        guard let date = formatter.date(from: header) else { return nil }
++        return max(0, date.timeIntervalSince(now))
++    }
++}
++
++enum Mesh {
++    /// How long a join keeps trying before it reports its last error, unless the product says otherwise.
++    static let joinBudget: TimeInterval = 30
++
++    /// How long a resume waits for its server before moving on, at least: a live node answers within about a second,
++    /// even across continents, and a dead one would otherwise hold the attempt past the mesh's hold of its
++    /// participants.
++    static let resumeTimeout: TimeInterval = 5
++
++    /// How long a resume waits for its server (1.0.2, rtc-client 1.0.5's resumeWaitMs): four of the round trips the
++    /// connection last measured, at least `resumeTimeout` and at most the socket's own timeout. A connection whose
++    /// round trip had grown to seconds, a phone behind a full queue, took 5 s for a server that is gone and moved on
++    /// from one that was up (a large audio chat, 2026-10-17: 2 to 28 s).
++    static func resumeWait(rttMs: Int64, cap: TimeInterval) -> TimeInterval {
++        min(cap, max(resumeTimeout, 4 * Double(max(rttMs, 0)) / 1000))
++    }
++
++    /// How long a probe of whether a server answers may take (1.0.2).
++    static let serverProbeTimeout: TimeInterval = 3
++
++    /// How many servers a failed resume probes before it stays where it is (1.0.2, rtc-client 1.0.12).
++    static let resumeMoveTries = 3
++
++    /// Whether a server answers an HTTP request within the timeout (1.0.2, rtc-client 1.0.5): its signal URL's origin
++    /// over HTTP(S). A server that is up answers any request, whatever its status; one that is gone, or out of this
++    /// client's reach, doesn't.
++    static func serverAnswers(_ url: URL, timeout: TimeInterval = serverProbeTimeout) async -> Bool {
++        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false), components.host != nil else { return false }
++        components.scheme = components.scheme?.replacingOccurrences(of: "ws", with: "http")
++        components.path = "/"
++        components.query = nil
++        components.fragment = nil
++        guard let origin = components.url else { return false }
++        var request = URLRequest(url: origin, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: timeout)
++        request.httpMethod = "GET"
++        do {
++            _ = try await probeSession.data(for: request)
++            return true
++        } catch {
++            return false
++        }
++    }
++
++    private static let probeSession: URLSession = {
++        let configuration = URLSessionConfiguration.ephemeral
++        configuration.waitsForConnectivity = false
++        return URLSession(configuration: configuration)
++    }()
++
++    /// Whether a failed resume goes to another server of the region list (1.0.2, rtc-client 1.0.5): only when its own
++    /// server has stopped answering and that one answers. When its own still answers, the server is up and the resume
++    /// failed on the way. When neither answers, it is this client's network that is down, and every server would fail
++    /// alike: walking the list then took a phone in a call on France's node to Limburg and on to Canada during its own
++    /// outage, and kept it there for the rest of the call (a large audio chat, 2026-10-17).
++    static func resumeMoves(ownAnswers: Bool, nextAnswers: Bool) -> Bool {
++        !ownAnswers && nextAnswers
++    }
++
++    /// Whether two signal URLs name the same server, by host and port (1.0.2, rtc-client 1.0.12).
++    static func sameServer(_ a: URL, _ b: URL) -> Bool {
++        a.host?.lowercased() == b.host?.lowercased() && a.port == b.port
++    }
++
++    /// How long the region list's fetch, or the validation after a failed join, may take before it counts as
++    /// unreachable: stock has no timeout on either, and each held a lock the next attempt waited on.
++    static let requestTimeout: TimeInterval = 3
++
++    /// How long after a join a node has to send its region list before it is fetched instead.
++    static let regionsWait: TimeInterval = 3
++
++    /// The mesh's wait when every node is full, if its 429 names none.
++    static let fullRetry: TimeInterval = 5
++
++    /// The signal response field a node sends its region list in: one LiveKit's protocol hasn't got, so any other
++    /// client skips it.
++    static let regionsField: UInt64 = 100
++
++    /// How long to wait before trying a failed join again, or nil when it isn't one to try again or the deadline
++    /// comes first: a full mesh after its Retry-After, within a second after it (or 5 s, give or take half); a
++    /// server that couldn't be reached after 1 to 3 s.
++    static func joinRetry(_ error: Error, deadline: Date, now: Date = Date()) -> TimeInterval? {
++        let delay: TimeInterval
++        if let refusal = (error as? LiveKitError)?.meshRefusal {
++            delay = refusal.retryAfter.map { $0 + Double.random(in: 0 ..< 1) } ?? fullRetry * Double.random(in: 0.5 ..< 1.5)
++        } else if error.isRetryableForRegionFailover {
++            delay = 1 + Double.random(in: 0 ..< 2)
++        } else {
++            return nil
++        }
++        return now.addingTimeInterval(delay) < deadline ? delay : nil
++    }
++
++    /// The WordPlus RTC client for Swift's own version, which a mesh node is told on each join (`rtc_client`) beside
++    /// upstream's, which the client reports as its SDK's and servers gate protocol features on. build.sh refuses a
++    /// patch whose version here isn't the one its revisions list.
++    static let clientVersion = "1.0.4"
++
++    /// What this client can do beyond upstream's, which a mesh node is told on each join (`mesh_caps`, 1.0.3, as
++    /// rtc-client 1.0.7 and 1.0.8): it stops sending an audio track nobody hears when its node says so
++    /// (`LocalAudioTrack.setMeshHeard`), and its room hands the node's codec policy to the product
++    /// (`Room.meshCodecPolicy`).
++    static let caps = "audio-pause,codec-policy"
++
++    /// What a join to a mesh's server says beside upstream's parameters (upstream already names the network's type,
++    /// `network`):
++    /// - `mesh_client`: it walks and waits, so a busy node may refuse it;
++    /// - `mesh_hwdec`: the codecs it decodes in hardware;
++    /// - `mesh_wait`: it waits on this node (from the URL the walk gave it);
++    /// - `rtc_client`, `mesh_caps`, `rtc_app`, `device_type` (1.0.3, rtc-client 1.0.6 to 1.0.8): its own version, what
++    ///   it can do, the room's product and the device kind, for the node's live view;
++    /// - `mesh_hwenc` (1.0.3, rtc-client 1.0.8): the codecs it encodes in hardware.
++    /// Nothing for any other server.
++    static func queryItems(for url: URL, connectOptions: ConnectOptions) -> [URLQueryItem] {
++        guard url.isMeshServer else { return [] }
++        var items = [URLQueryItem(name: "mesh_client", value: "1")]
++        if !connectOptions.meshHardwareDecoders.isEmpty {
++            items.append(URLQueryItem(name: "mesh_hwdec", value: connectOptions.meshHardwareDecoders.joined(separator: ",")))
++        }
++        if !connectOptions.meshHardwareEncoders.isEmpty {
++            items.append(URLQueryItem(name: "mesh_hwenc", value: connectOptions.meshHardwareEncoders.joined(separator: ",")))
++        }
++        items.append(URLQueryItem(name: "rtc_client", value: clientVersion))
++        items.append(URLQueryItem(name: "mesh_caps", value: caps))
++        if let app = appParam(connectOptions.meshApp) {
++            items.append(URLQueryItem(name: "rtc_app", value: app))
++        }
++        if let device = deviceType() {
++            items.append(URLQueryItem(name: "device_type", value: device))
++        }
++        if url.isMeshWait {
++            items.append(URLQueryItem(name: "mesh_wait", value: "1"))
++        }
++        return items
++    }
++
++    /// A room's product as a join names it (`rtc_app`, rtc-client 1.0.6's meshAppParam), "better-messages/3.1.4":
++    /// letters, digits and . _ - only, 40 of each; none without a name.
++    static func appParam(_ app: MeshApp?) -> String? {
++        func clean(_ s: String?) -> String {
++            String((s ?? "").unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) && $0.isASCII || "._-".unicodeScalars.contains($0) }
++                .prefix(40).map(Character.init))
++        }
++        let name = clean(app?.name)
++        return name.isEmpty ? nil : "\(name)/\(clean(app?.version))"
++    }
++
++    /// The device kind a join names (`device_type`, rtc-client 1.0.6): an iPhone a phone, an iPad a tablet, a Mac, or
++    /// an iPhone or iPad app running on one, a desktop; none for anything else.
++    static func deviceType() -> String? {
++        #if os(macOS)
++        return "desktop"
++        #else
++        if ProcessInfo.processInfo.isMacCatalystApp { return "desktop" }
++        if #available(iOS 14.0, tvOS 14.0, *), ProcessInfo.processInfo.isiOSAppOnMac { return "desktop" }
++        return deviceType(model: Utils.modelIdentifier(), simulatorModel: ProcessInfo.processInfo.environment["SIMULATOR_MODEL_IDENTIFIER"])
++        #endif
++    }
++
++    /// The device kind of a model identifier, "iPhone17,1" or "iPad16,3", a simulator's by the model it simulates.
++    static func deviceType(model: String?, simulatorModel: String?) -> String? {
++        let name = (model?.hasPrefix("iOSSimulator") == true ? simulatorModel : model) ?? ""
++        if name.hasPrefix("iPhone") || name.hasPrefix("iPod") { return "phone" }
++        if name.hasPrefix("iPad") { return "tablet" }
++        return nil
++    }
++
++    /// The join response field a node sends its codec policy in (1.0.3, WordPlus Mesh 1.0.33's `mesh.codec_policy`):
++    /// one LiveKit's JoinResponse hasn't got, so any other client skips it.
++    static let codecPolicyField: UInt64 = 1001
++
++    /// The codec policy a join response's unknown fields carry (`codecPolicyField`), if any: only lists of names (eight,
++    /// 16 characters each) and a name are kept, so whatever else a server sends can't reach a product's codec choice.
++    static func codecPolicy(inJoinResponseUnknownFields data: Data) -> MeshCodecPolicy? {
++        guard let raw = lengthDelimitedField(codecPolicyField, in: data),
++              let object = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] else { return nil }
++        func names(_ value: Any?) -> [String]? {
++            guard let list = value as? [Any] else { return nil }
++            return Array(list.compactMap { $0 as? String }.filter { $0.count <= 16 }.prefix(8))
++        }
++        let backup = (object["backup"] as? String).flatMap { $0.count <= 16 ? $0 : nil }
++        return MeshCodecPolicy(camera: names(object["camera"]), screen: names(object["screen"]), backup: backup)
++    }
++
++    /// The first length-delimited field `no` of a protobuf message's bytes, or nil when it has none or can't be read.
++    static func lengthDelimitedField(_ no: UInt64, in data: Data) -> Data? {
++        var at = data.startIndex
++
++        func varint() -> UInt64? {
++            var value: UInt64 = 0
++            var shift: UInt64 = 0
++            while at < data.endIndex, shift < 64 {
++                let byte = data[at]
++                at = data.index(after: at)
++                value |= UInt64(byte & 0x7F) << shift
++                if byte & 0x80 == 0 { return value }
++                shift += 7
++            }
++            return nil
++        }
++
++        while at < data.endIndex {
++            guard let tag = varint() else { return nil }
++            let field = tag >> 3
++            switch tag & 0x7 {
++            case 0:
++                guard varint() != nil else { return nil }
++            case 1:
++                at = data.index(at, offsetBy: 8, limitedBy: data.endIndex) ?? data.endIndex
++            case 2:
++                guard let length = varint(), let end = data.index(at, offsetBy: Int(length), limitedBy: data.endIndex) else { return nil }
++                if field == no { return Data(data[at ..< end]) }
++                at = end
++            case 5:
++                at = data.index(at, offsetBy: 4, limitedBy: data.endIndex) ?? data.endIndex
++            default:
++                return nil
++            }
++        }
++        return nil
++    }
++
++    /// A length-delimited field's bytes as a message carries it: its tag, its length, then the data (1.0.3's encoder
++    /// reports go so, in a request with no message of LiveKit's).
++    static func lengthDelimited(_ no: UInt64, _ data: Data) -> Data {
++        func varint(_ value: UInt64) -> Data {
++            var out = Data()
++            var n = value
++            while n >= 0x80 {
++                out.append(UInt8(n & 0x7F) | 0x80)
++                n >>= 7
++            }
++            out.append(UInt8(n))
++            return out
++        }
++        return varint(no << 3 | 2) + varint(UInt64(data.count)) + data
++    }
++
++    /// The busy server to wait on: the home region's that frees first, another region's only if it had none.
++    static func waitOn(_ busy: [(url: URL, region: String?, freeAt: Date)], home: String?) -> (url: URL, region: String?, freeAt: Date)? {
++        let near = busy.filter { home != nil && $0.region == home }
++        return (near.isEmpty ? busy : near).min { $0.freeAt < $1.freeAt }
++    }
++
++    /// The region list a node sent in a signal response (`regionsField`), or nil when the message is another.
++    static func regions(inSignalMessage data: Data) -> [RegionInfo]? {
++        lengthDelimitedField(regionsField, in: data).flatMap { regions(json: $0) }
++    }
++
++    /// A region list as `/settings/regions` answers it, each entry with the node it leads to: a mesh's carry `node`,
++    /// which a stock client's parse refuses as an unknown field.
++    static func regions(json data: Data) -> [RegionInfo]? {
++        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
++              let list = object["regions"] as? [[String: Any]] else { return nil }
++
++        let regions: [RegionInfo] = list.compactMap { entry in
++            guard let region = entry["region"] as? String, let url = entry["url"] as? String else { return nil }
++            let distance: Int64 = if let text = entry["distance"] as? String { Int64(text) ?? 0 } else { (entry["distance"] as? NSNumber)?.int64Value ?? 0 }
++            return RegionInfo(region: region, url: url, distance: distance, node: entry["node"] as? String)
++        }
++
++        return regions.isEmpty ? nil : regions
++    }
++}
+diff --git a/Sources/LiveKit/Participant/LocalParticipant.swift b/Sources/LiveKit/Participant/LocalParticipant.swift
+index dea4600fe..5a08678c7 100644
+--- a/Sources/LiveKit/Participant/LocalParticipant.swift
++++ b/Sources/LiveKit/Participant/LocalParticipant.swift
+@@ -764,6 +764,11 @@ extension LocalParticipant {
+                 $0.room?(room, participant: self, didPublishTrack: publication)
+             }
+ 
++            // WordPlus Mesh (1.0.3): a new video's encoders are told once they run, not at the next reading
++            if track is LocalVideoTrack {
++                room._meshEncoders.reportSoon(room)
++            }
++
+             log("[publish] success \(publication)", .info)
+ 
+             return publication
+diff --git a/Sources/LiveKit/Participant/Participant.swift b/Sources/LiveKit/Participant/Participant.swift
+index 38b8b64c7..54727f700 100644
+--- a/Sources/LiveKit/Participant/Participant.swift
++++ b/Sources/LiveKit/Participant/Participant.swift
+@@ -98,6 +98,17 @@ public class Participant: NSObject, @unchecked Sendable, ObservableObject, Logga
+ 
+     struct InternalState: Equatable, Hashable {
+         var enabledPublishVideoCodecs: [VideoCodec] = []
++        var disconnectReason: Int?
++    }
++
++    /// WordPlus Mesh: why the server says this participant left, the protocol's `DisconnectReason` by number
++    /// (`CLIENT_INITIATED` 1, `DUPLICATE_IDENTITY` 2, `SERVER_SHUTDOWN` 3, `MIGRATION` 8, `SIGNAL_CLOSE` 9, ...), set
++    /// before ``RoomDelegate/room(_:participantDidDisconnect:)``; nil while it's in the room, or when the server said
++    /// nothing. A call screen keeps the tile of one coming back (a reconnect, a move) and drops one that hung up.
++    @nonobjc public var disconnectReason: Int? { _internalState.disconnectReason }
++
++    func set(disconnectReason: Int) {
++        _internalState.mutate { $0.disconnectReason = disconnectReason }
+     }
+ 
+     let _state: StateSync<State>
+diff --git a/Sources/LiveKit/Protocols/SignalClientDelegate.swift b/Sources/LiveKit/Protocols/SignalClientDelegate.swift
+index 9d66d0fb1..5f0442e59 100644
+--- a/Sources/LiveKit/Protocols/SignalClientDelegate.swift
++++ b/Sources/LiveKit/Protocols/SignalClientDelegate.swift
+@@ -38,4 +38,8 @@ protocol SignalClientDelegate: AnyObject, Sendable {
+     func signalClient(_ signalClient: SignalClient, didReceiveLeave action: Livekit_LeaveRequest.Action, reason: Livekit_DisconnectReason, regions: Livekit_RegionSettings?) async
+     func signalClient(_ signalClient: SignalClient, didSubscribeTrack trackSid: Track.Sid) async
+     func signalClient(_ signalClient: SignalClient, didReceiveMediaSectionsRequirement requirement: Livekit_MediaSectionsRequirement) async
++    /// WordPlus Mesh: the region list a node sent over this connection (`Mesh.regionsField`).
++    func signalClient(_ signalClient: SignalClient, didReceiveMeshRegions regions: [RegionInfo]) async
++    /// WordPlus Mesh (1.0.3): whether anyone hears a local audio track, as its node says.
++    func signalClient(_ signalClient: SignalClient, didUpdateSubscribedAudioCodecs codecs: [Livekit_SubscribedAudioCodec], forTrackSid sid: String) async
+ }
+diff --git a/Sources/LiveKit/Support/Network/HTTP.swift b/Sources/LiveKit/Support/Network/HTTP.swift
+index d0c108494..e60d69344 100644
+--- a/Sources/LiveKit/Support/Network/HTTP.swift
++++ b/Sources/LiveKit/Support/Network/HTTP.swift
+@@ -24,9 +24,10 @@ class HTTP: NSObject {
+                                                    delegateQueue: operationQueue)
+ 
+     static func requestValidation(from url: URL, token: String) async throws {
++        // WordPlus Mesh: a dead server must not hold the join that asks it why it failed.
+         var request = URLRequest(url: url,
+                                  cachePolicy: .reloadIgnoringLocalAndRemoteCacheData,
+-                                 timeoutInterval: .defaultHTTPConnect)
++                                 timeoutInterval: url.isMeshServer ? Mesh.requestTimeout : .defaultHTTPConnect)
+         // Attach token to header
+         request.addValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+ 
+@@ -50,6 +51,16 @@ class HTTP: NSObject {
+ 
+             let details = "HTTP \(statusCode): \(body)"
+ 
++            // WordPlus Mesh: a node that can't place the join now says so, what kind of refusal it is, which node
++            // and when to come back.
++            if statusCode == 429 {
++                throw LiveKitError(.network,
++                                   message: "Server full: \(details)",
++                                   meshRefusal: MeshRefusal(kind: httpResponse.value(forHTTPHeaderField: "X-Mesh-Refused"),
++                                                            node: httpResponse.value(forHTTPHeaderField: "X-Mesh-Node"),
++                                                            retryAfter: MeshRefusal.retryAfter(httpResponse.value(forHTTPHeaderField: "Retry-After"))))
++            }
++
+             // Treat request/token/permissions issues as validation errors.
+             // 404 is reported separately so the v1 → v0 RTC path fallback can
+             // distinguish "endpoint doesn't exist" from other client errors.
+diff --git a/Sources/LiveKit/Support/Network/WebSocket.swift b/Sources/LiveKit/Support/Network/WebSocket.swift
+index e4c4f951b..306ddc8fa 100644
+--- a/Sources/LiveKit/Support/Network/WebSocket.swift
++++ b/Sources/LiveKit/Support/Network/WebSocket.swift
+@@ -37,10 +37,12 @@ actor WebSocket: Loggable, AsyncSequence {
+         return config
+     }
+ 
+-    init(url: URL, token: String, connectOptions: ConnectOptions?) async throws {
++    /// `timeout`, when shorter: a resume on a mesh, which waits at most `Mesh.resumeTimeout` for its server.
++    init(url: URL, token: String, connectOptions: ConnectOptions?, timeout: TimeInterval? = nil) async throws {
++        let connectTimeout = connectOptions?.socketConnectTimeoutInterval ?? .defaultSocketConnect
+         var request = URLRequest(url: url,
+                                  cachePolicy: .useProtocolCachePolicy,
+-                                 timeoutInterval: connectOptions?.socketConnectTimeoutInterval ?? .defaultSocketConnect)
++                                 timeoutInterval: Swift.min(connectTimeout, timeout ?? connectTimeout))
+         request.addValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+ 
+         #if targetEnvironment(simulator)
+diff --git a/Sources/LiveKit/Support/Utils.swift b/Sources/LiveKit/Support/Utils.swift
+index 8f875c5f7..31c297025 100644
+--- a/Sources/LiveKit/Support/Utils.swift
++++ b/Sources/LiveKit/Support/Utils.swift
+@@ -199,7 +199,8 @@ class Utils: Loggable {
+         queryItems.append(URLQueryItem(name: "auto_subscribe", value: connectOptions.autoSubscribe ? "1" : "0"))
+         queryItems.append(URLQueryItem(name: "adaptive_stream", value: adaptiveStream ? "1" : "0"))
+ 
+-        builder.queryItems = queryItems
++        // WordPlus Mesh: the mesh's own, which upstream's would otherwise replace with its.
++        builder.queryItems = queryItems + Mesh.queryItems(for: url, connectOptions: connectOptions)
+ 
+         guard let result = builder.url else {
+             throw LiveKitError(.failedToParseUrl)
+@@ -241,7 +242,7 @@ class Utils: Loggable {
+                                                   participantSid: participantSid,
+                                                   adaptiveStream: adaptiveStream)
+ 
+-        builder.queryItems = [URLQueryItem(name: "join_request", value: encoded)]
++        builder.queryItems = [URLQueryItem(name: "join_request", value: encoded)] + Mesh.queryItems(for: url, connectOptions: connectOptions)
+ 
+         guard let result = builder.url else {
+             throw LiveKitError(.failedToParseUrl)
+diff --git a/Sources/LiveKit/Track/Local/LocalAudioTrack.swift b/Sources/LiveKit/Track/Local/LocalAudioTrack.swift
+index 87461336d..608271187 100644
+--- a/Sources/LiveKit/Track/Local/LocalAudioTrack.swift
++++ b/Sources/LiveKit/Track/Local/LocalAudioTrack.swift
+@@ -131,6 +131,22 @@ public class LocalAudioTrack: Track, LocalTrackProtocol, AudioTrackProtocol, @un
+     override func stopCapture() async throws {
+         cleanUpFrameWatcher()
+     }
++
++    /// WordPlus Mesh (1.0.3, rtc-client 1.0.7's `setMeshHeard`): stops sending this track while nobody hears it, as
++    /// its mesh node says (`SubscribedAudioCodecUpdate`, its codec disabled), and sends it again when someone does. The
++    /// sender's encodings are made inactive: the microphone is kept and the track isn't muted, so the app, the system's
++    /// indicator and the others' view of it stay as they are. Upstream pauses only video nobody watches; a speaker
++    /// alone in a room sent his microphone for as long as he stayed.
++    func _setMeshHeard(_ heard: Bool) {
++        guard let sender = _state.read({ $0.rtpSender }) else { return }
++        let parameters = sender.parameters
++        guard !parameters.encodings.isEmpty, parameters.encodings.contains(where: { $0.isActive != heard }) else { return }
++        for encoding in parameters.encodings {
++            encoding.isActive = heard
++        }
++        sender.parameters = parameters
++        log(heard ? "[Mesh] Someone hears the track again: sending it" : "[Mesh] Nobody hears the track: not sending it", .info)
++    }
+ }
+ 
+ public extension LocalAudioTrack {
+diff --git a/Sources/LiveKit/Types/Options/ConnectOptions.swift b/Sources/LiveKit/Types/Options/ConnectOptions.swift
+index 020b9daa3..64e54758c 100644
+--- a/Sources/LiveKit/Types/Options/ConnectOptions.swift
++++ b/Sources/LiveKit/Types/Options/ConnectOptions.swift
+@@ -80,6 +80,29 @@ public final class ConnectOptions: NSObject, Sendable {
+     /// with no 15 KB size limit). Generally, it's not recommended to change this.
+     public let clientProtocol: ClientProtocol
+ 
++    /// WordPlus Mesh: how long a join on a mesh keeps trying, walking busy nodes and waiting on a held slot, before it
++    /// reports its last error. A product with a waiting screen passes minutes, since a full mesh adds a server in a
++    /// few. Defaults to 30 seconds.
++    public let meshJoinBudget: TimeInterval
++
++    /// WordPlus Mesh: the video codecs this device decodes in hardware (`h264`, `h265`, `vp8`, `vp9`, `av1`), named on
++    /// a join to a mesh (`mesh_hwdec`), so the node gives it a track in one of them before any other the track has.
++    /// Empty says nothing, and the node keeps the track's own order.
++    public let meshHardwareDecoders: [String]
++
++    /// WordPlus Mesh (1.0.3): the video codecs this device encodes in hardware, named on a join to a mesh
++    /// (`mesh_hwenc`), as `meshHardwareDecoders` those it decodes: what a codec policy could have it send. Empty says
++    /// nothing.
++    public let meshHardwareEncoders: [String]
++
++    /// WordPlus Mesh (1.0.3): the product placing the call, named on each join to a mesh (`rtc_app`) for its live
++    /// view. A room's, as each room is joined with its own options.
++    public let meshApp: MeshApp?
++
++    /// WordPlus Mesh: called each time a join on a mesh starts to wait, with until when and why: `busy`, `slot` or
++    /// `full` while the mesh holds a place for it, `unreachable` while no server of the list answers.
++    @nonobjc public let onMeshWait: (@Sendable (MeshWait) -> Void)?
++
+     override public init() {
+         autoSubscribe = true
+         reconnectAttempts = 10
+@@ -94,22 +117,70 @@ public final class ConnectOptions: NSObject, Sendable {
+         enableMicrophone = false
+         protocolVersion = .v16
+         clientProtocol = .v1
++        meshJoinBudget = Mesh.joinBudget
++        meshHardwareDecoders = []
++        meshHardwareEncoders = []
++        meshApp = nil
++        onMeshWait = nil
++    }
++
++    public convenience init(autoSubscribe: Bool = true,
++                            reconnectAttempts: Int = 10,
++                            reconnectAttemptDelay: TimeInterval = .defaultReconnectDelay,
++                            reconnectMaxDelay: TimeInterval = .defaultReconnectMaxDelay,
++                            socketConnectTimeoutInterval: TimeInterval = .defaultSocketConnect,
++                            primaryTransportConnectTimeout: TimeInterval = .defaultTransportState,
++                            publisherTransportConnectTimeout: TimeInterval = .defaultTransportState,
++                            iceServers: [IceServer] = [],
++                            iceTransportPolicy: IceTransportPolicy = .all,
++                            isDscpEnabled: Bool = false,
++                            enableMicrophone: Bool = false,
++                            protocolVersion: ProtocolVersion = .v16,
++                            clientProtocol: ClientProtocol = .v1)
++    {
++        self.init(autoSubscribe: autoSubscribe,
++                  reconnectAttempts: reconnectAttempts,
++                  reconnectAttemptDelay: reconnectAttemptDelay,
++                  reconnectMaxDelay: reconnectMaxDelay,
++                  socketConnectTimeoutInterval: socketConnectTimeoutInterval,
++                  primaryTransportConnectTimeout: primaryTransportConnectTimeout,
++                  publisherTransportConnectTimeout: publisherTransportConnectTimeout,
++                  iceServers: iceServers,
++                  iceTransportPolicy: iceTransportPolicy,
++                  isDscpEnabled: isDscpEnabled,
++                  enableMicrophone: enableMicrophone,
++                  protocolVersion: protocolVersion,
++                  clientProtocol: clientProtocol,
++                  meshJoinBudget: Mesh.joinBudget,
++                  meshHardwareDecoders: [],
++                  onMeshWait: nil)
+     }
+ 
+-    public init(autoSubscribe: Bool = true,
+-                reconnectAttempts: Int = 10,
+-                reconnectAttemptDelay: TimeInterval = .defaultReconnectDelay,
+-                reconnectMaxDelay: TimeInterval = .defaultReconnectMaxDelay,
+-                socketConnectTimeoutInterval: TimeInterval = .defaultSocketConnect,
+-                primaryTransportConnectTimeout: TimeInterval = .defaultTransportState,
+-                publisherTransportConnectTimeout: TimeInterval = .defaultTransportState,
+-                iceServers: [IceServer] = [],
+-                iceTransportPolicy: IceTransportPolicy = .all,
+-                isDscpEnabled: Bool = false,
+-                enableMicrophone: Bool = false,
+-                protocolVersion: ProtocolVersion = .v16,
+-                clientProtocol: ClientProtocol = .v1)
++    /// WordPlus Mesh: the same with the mesh's own options, which a join on a mesh's servers acts on.
++    @nonobjc public init(autoSubscribe: Bool = true,
++                         reconnectAttempts: Int = 10,
++                         reconnectAttemptDelay: TimeInterval = .defaultReconnectDelay,
++                         reconnectMaxDelay: TimeInterval = .defaultReconnectMaxDelay,
++                         socketConnectTimeoutInterval: TimeInterval = .defaultSocketConnect,
++                         primaryTransportConnectTimeout: TimeInterval = .defaultTransportState,
++                         publisherTransportConnectTimeout: TimeInterval = .defaultTransportState,
++                         iceServers: [IceServer] = [],
++                         iceTransportPolicy: IceTransportPolicy = .all,
++                         isDscpEnabled: Bool = false,
++                         enableMicrophone: Bool = false,
++                         protocolVersion: ProtocolVersion = .v16,
++                         clientProtocol: ClientProtocol = .v1,
++                         meshJoinBudget: TimeInterval,
++                         meshHardwareDecoders: [String],
++                         onMeshWait: (@Sendable (MeshWait) -> Void)?,
++                         meshHardwareEncoders: [String] = [],
++                         meshApp: MeshApp? = nil)
+     {
++        self.meshJoinBudget = meshJoinBudget
++        self.meshHardwareDecoders = meshHardwareDecoders
++        self.meshHardwareEncoders = meshHardwareEncoders
++        self.meshApp = meshApp
++        self.onMeshWait = onMeshWait
+         self.autoSubscribe = autoSubscribe
+         self.reconnectAttempts = reconnectAttempts
+         self.reconnectAttemptDelay = reconnectAttemptDelay
+@@ -141,7 +212,12 @@ public final class ConnectOptions: NSObject, Sendable {
+             isDscpEnabled == other.isDscpEnabled &&
+             enableMicrophone == other.enableMicrophone &&
+             protocolVersion == other.protocolVersion &&
+-            clientProtocol == other.clientProtocol
++            clientProtocol == other.clientProtocol &&
++            meshJoinBudget == other.meshJoinBudget &&
++            meshHardwareDecoders == other.meshHardwareDecoders &&
++            meshHardwareEncoders == other.meshHardwareEncoders &&
++            meshApp == other.meshApp &&
++            (onMeshWait == nil) == (other.onMeshWait == nil)
+     }
+ 
+     override public var hash: Int {
+diff --git a/Sources/LiveKit/Types/RegionInfo.swift b/Sources/LiveKit/Types/RegionInfo.swift
+index b2bb011a4..738cdfcee 100644
+--- a/Sources/LiveKit/Types/RegionInfo.swift
++++ b/Sources/LiveKit/Types/RegionInfo.swift
+@@ -21,31 +21,37 @@ public class RegionInfo: NSObject, @unchecked Sendable {
+     let regionId: String
+     let url: URL
+     let distance: Int64
++    /// WordPlus Mesh: the node this entry leads to, which a mesh's list names and a region of several nodes repeats
++    /// its region for.
++    let node: String?
+ 
+-    init?(region: String, url: String, distance: Int64) {
++    init?(region: String, url: String, distance: Int64, node: String? = nil) {
+         guard let url = URL(string: url) else { return nil }
+         regionId = region
+         self.url = url
+         self.distance = distance
++        self.node = node?.isEmpty == false ? node : nil
+     }
+ 
+     // MARK: - Equal
+ 
++    // A mesh's region of several nodes lists each under the same region, so an entry is its region and its node.
+     override public func isEqual(_ object: Any?) -> Bool {
+         guard let other = object as? Self else { return false }
+-        return regionId == other.regionId
++        return regionId == other.regionId && node == other.node && url == other.url
+     }
+ 
+     override public var hash: Int {
+         var hasher = Hasher()
+         hasher.combine(regionId)
++        hasher.combine(node)
+         return hasher.finalize()
+     }
+ 
+     //
+ 
+     override public var description: String {
+-        "RegionInfo(id: \(regionId), url: \(url), distance: \(distance))"
++        "RegionInfo(id: \(regionId), url: \(url), distance: \(distance)\(node.map { ", node: \($0)" } ?? ""))"
+     }
+ }
+ 
+diff --git a/Tests/LiveKitCoreTests/WordPlusMeshEncodersTests.swift b/Tests/LiveKitCoreTests/WordPlusMeshEncodersTests.swift
+new file mode 100644
+index 000000000..c622035cd
+--- /dev/null
++++ b/Tests/LiveKitCoreTests/WordPlusMeshEncodersTests.swift
+@@ -0,0 +1,150 @@
++/*
++ * Copyright 2026 The WordPlus RTC client authors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import Foundation
++@testable import LiveKit
++import Testing
++
++/// WordPlus Mesh (1.0.3): the encoder reports, as @wordplus/rtc-client's own tests have them (room/meshEncoders.test.ts).
++extension WordPlusMeshTests {
++    private func layer(_ rid: String, _ height: Int, _ encoder: String? = nil, fps: Double? = nil, limit: String? = nil,
++                       encodeMs: Double? = nil, keyFrames: Int? = nil, plis: Int? = nil) -> MeshEncoders.Outbound
++    {
++        MeshEncoders.Outbound(rid: rid, height: height, encoder: encoder, powerEfficient: nil, active: true, fps: fps, limit: limit,
++                              captured: nil, mime: "video/H264", encodeMs: encodeMs, keyFrames: keyFrames, plis: plis)
++    }
++
++    private func l(_ rid: String, _ encoder: String? = nil, hw: Bool? = nil, fps: Int? = nil, height: Int? = nil, limit: String? = nil,
++                   encodeMs: Double? = nil, keyFrames: Int? = nil, plis: Int? = nil) -> MeshEncoders.Layer
++    {
++        MeshEncoders.Layer(rid: rid, encoder: encoder, hw: hw, fps: fps, height: height, limit: limit,
++                           encodeMs: encodeMs, keyFrames: keyFrames, plis: plis)
++    }
++
++    @Test func encodersOfAnAdapter() {
++        let name = "SimulcastEncoderAdapter (OpenH264, VideoToolbox, VideoToolbox)"
++        #expect(MeshEncoders.adapterEncoders(name) == ["OpenH264", "VideoToolbox", "VideoToolbox"])
++        let read = MeshEncoders.layers(of: [layer("f", 1080, name), layer("q", 270, name), layer("h", 540, name)])
++        #expect(read?.layers == [l("q", "OpenH264", hw: false), l("h", "VideoToolbox", hw: true), l("f", "VideoToolbox", hw: true)],
++                "one encoder a layer, the smallest first")
++    }
++
++    @Test func encodersOverTheLayersThatEncode() {
++        // a camera whose 540p the server paused (dynacast): the adapter names the encoders of q and f alone
++        let name = "SimulcastEncoderAdapter (OpenH264, VideoToolbox)"
++        let read = MeshEncoders.layers(of: [layer("q", 270, name, fps: 30), layer("h", 540, name, fps: 0),
++                                            layer("f", 1080, name, fps: 29.6, limit: "none")])
++        #expect(read?.layers == [l("q", "OpenH264", hw: false, fps: 30, height: 270), l("h"),
++                                 l("f", "VideoToolbox", hw: true, fps: 30, height: 1080)])
++    }
++
++    @Test func whatHoldsALayerBack() {
++        let name = "SimulcastEncoderAdapter (libvpx, libvpx)"
++        let read = MeshEncoders.layers(of: [layer("q", 720, name, fps: 15, limit: "none"), layer("h", 1080, name, fps: 8, limit: "cpu")])
++        #expect(read?.layers[1] == l("h", "libvpx", hw: false, fps: 8, height: 1080, limit: "cpu"))
++    }
++
++    @Test func oneEncoderForEveryLayer() {
++        let name = "SimulcastEncoderAdapter (libvpx, libvpx)"
++        let read = MeshEncoders.layers(of: [layer("q", 180, name), layer("h", 360, name), layer("f", 720, name)])
++        #expect(read?.layers == [l("q", "libvpx", hw: false), l("h", "libvpx", hw: false), l("f", "libvpx", hw: false)])
++
++        #expect(MeshEncoders.layers(of: [layer("q", 270, "MediaFoundationVideoEncodeAccelerator (AMDh264Encoder)")])?.layers ==
++            [l("q", "MediaFoundationVideoEncodeAccelerator (AMDh264Encoder)", hw: true)])
++        #expect(MeshEncoders.encoderHardware("libvpx", powerEfficient: nil) == false)
++        #expect(MeshEncoders.encoderHardware("OpenH264", powerEfficient: nil) == false)
++        #expect(MeshEncoders.encoderHardware("libaom", powerEfficient: nil) == false)
++        #expect(MeshEncoders.encoderHardware("VideoToolbox", powerEfficient: nil) == true)
++        #expect(MeshEncoders.encoderHardware(nil, powerEfficient: true) == true)
++        #expect(MeshEncoders.encoderHardware(nil, powerEfficient: nil) == nil)
++    }
++
++    @Test func layersOfAnUnnamedEncoder() {
++        let read = MeshEncoders.layers(of: [layer("q", 180, fps: 15), layer("h", 360, fps: 15)])
++        #expect(read?.encoder == "")
++        #expect(read?.layers == [l("q", fps: 15, height: 180), l("h", fps: 15, height: 360)])
++        #expect(MeshEncoders.layers(of: []) == nil)
++    }
++
++    @Test func sinceTheLastReading() {
++        let first = MeshEncoders.sinceLast(nil, .init(encodeTime: 1, frames: 30, keyFrames: 1, plis: 0))
++        #expect(first.encodeMs == nil && first.keyFrames == nil && first.plis == nil)
++        // 10 s at 7 frames a second, 52 ms a frame, 6 key frames for 9 requests: a slow encoder in a storm of key frames
++        let storm = MeshEncoders.sinceLast(.init(encodeTime: 10, frames: 1000, keyFrames: 20, plis: 30),
++                                           .init(encodeTime: 13.64, frames: 1070, keyFrames: 26, plis: 39))
++        #expect(storm.encodeMs == 52 && storm.keyFrames == 6 && storm.plis == 9)
++        // a total the device doesn't keep, or one that went back (a sender started over), says nothing
++        let back = MeshEncoders.sinceLast(.init(frames: 100, keyFrames: 5), .init(frames: 40, keyFrames: 6))
++        #expect(back.encodeMs == nil && back.keyFrames == 1 && back.plis == nil)
++        let idle = MeshEncoders.sinceLast(.init(encodeTime: 2, frames: 10), .init(encodeTime: 2, frames: 10))
++        #expect(idle.encodeMs == nil, "no frame encoded: no time a frame")
++    }
++
++    @Test func readingsOnALayerThatEncodes() {
++        let name = "SimulcastEncoderAdapter (OpenH264, MediaFoundationVideoEncodeAccelerator (AMDh264Encoder))"
++        let read = MeshEncoders.layers(of: [layer("q", 180, name, fps: 3, encodeMs: 4.1, keyFrames: 0, plis: 0),
++                                            layer("h", 360, name, fps: 3, encodeMs: 61.5, keyFrames: 6, plis: 9),
++                                            layer("f", 720, name, fps: 0, keyFrames: 0, plis: 0)])
++        #expect(read?.layers[1] == l("h", "MediaFoundationVideoEncodeAccelerator (AMDh264Encoder)", hw: true, fps: 3, height: 360,
++                                     encodeMs: 61.5, keyFrames: 6, plis: 9))
++        #expect(read?.layers[2] == l("f"))
++    }
++
++    /// A sender's stats as libwebrtc gives them on an iPhone: three layers in VideoToolbox, the codec and the source.
++    @Test func layersFromStats() throws {
++        func outbound(_ rid: String, _ height: Int, frames: Double, time: Double) -> MeshEncoders.Stat {
++            .init(id: "OT_\(rid)", type: "outbound-rtp", values: [
++                "kind": "video", "rid": rid, "frameHeight": NSNumber(value: height), "framesPerSecond": NSNumber(value: 30.0),
++                "encoderImplementation": "SimulcastEncoderAdapter (VideoToolbox, VideoToolbox, VideoToolbox)",
++                "active": NSNumber(value: true), "qualityLimitationReason": "none", "codecId": "CO_1", "mediaSourceId": "SV_1",
++                "totalEncodeTime": NSNumber(value: time), "framesEncoded": NSNumber(value: frames),
++                "keyFramesEncoded": NSNumber(value: 2.0), "pliCount": NSNumber(value: 1.0), "firCount": NSNumber(value: 0.0),
++            ])
++        }
++        let codec = MeshEncoders.Stat(id: "CO_1", type: "codec", values: ["mimeType": "video/H264"])
++        let source = MeshEncoders.Stat(id: "SV_1", type: "media-source", values: ["kind": "video", "framesPerSecond": NSNumber(value: 29.97)])
++        let audio = MeshEncoders.Stat(id: "OT_a", type: "outbound-rtp", values: ["kind": "audio"])
++
++        let first = MeshEncoders.outbound(of: [outbound("q", 180, frames: 300, time: 0.6), outbound("h", 360, frames: 300, time: 1.2),
++                                               outbound("f", 720, frames: 300, time: 3), codec, source, audio], before: nil)
++        #expect(first.outbound.count == 3, "video layers only")
++        #expect(first.totals["f"] == .init(encodeTime: 3, frames: 300, keyFrames: 2, plis: 1))
++
++        let second = MeshEncoders.outbound(of: [outbound("q", 180, frames: 600, time: 1.2), outbound("h", 360, frames: 600, time: 2.4),
++                                                outbound("f", 720, frames: 600, time: 6), codec, source], before: first.totals)
++        let report = try #require(MeshEncoders.codecReport(second.outbound, named: nil))
++        #expect(report.codec == "h264")
++        #expect(report.captured == 30)
++        #expect(report.layers.last == l("f", "VideoToolbox", hw: true, fps: 30, height: 720, limit: nil, encodeMs: 10, keyFrames: 0, plis: 0))
++        #expect(try #require(MeshEncoders.codecReport(second.outbound, named: "vp8")).codec == "vp8", "a backup's codec by its name")
++    }
++
++    /// The report where a node reads it: a request with no message, the JSON in its field 1001, keys sorted.
++    @Test func reportInASignalRequest() throws {
++        let tracks = [MeshEncoders.TrackReport(sid: "TR_a", codecs: [.init(codec: "h264", encoder: "VideoToolbox",
++                                                                           layers: [l("q", "VideoToolbox", hw: true)], captured: 30)],
++                                               mode: .init(width: 1280, height: 720, fps: 30))]
++        let json = try #require(MeshEncoders.json(tracks))
++        #expect(String(decoding: json, as: UTF8.self) ==
++            #"{"tracks":[{"codecs":[{"captured":30,"codec":"h264","encoder":"VideoToolbox","layers":[{"encoder":"VideoToolbox","hw":true,"rid":"q"}]}],"mode":{"fps":30,"height":720,"width":1280},"sid":"TR_a"}]}"#)
++
++        let request = try Livekit_SignalRequest(serializedBytes: Mesh.lengthDelimited(MeshEncoders.field, json))
++        #expect(request.message == nil, "no message of LiveKit's")
++        #expect(Mesh.lengthDelimitedField(MeshEncoders.field, in: request.unknownFields.data) == json)
++        #expect(Mesh.lengthDelimited(MeshEncoders.field, Data(count: 300)).prefix(4) == Data([0xCA, 0x3E, 0xAC, 0x02]),
++                "the tag of field 1001, then a long one's length in two bytes")
++    }
++}
+diff --git a/Tests/LiveKitCoreTests/WordPlusMeshTests.swift b/Tests/LiveKitCoreTests/WordPlusMeshTests.swift
+new file mode 100644
+index 000000000..4eb7f3ddc
+--- /dev/null
++++ b/Tests/LiveKitCoreTests/WordPlusMeshTests.swift
+@@ -0,0 +1,264 @@
++/*
++ * Copyright 2026 The WordPlus RTC client authors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import Foundation
++@testable import LiveKit
++import Testing
++
++/// WordPlus Mesh: what this client does differently on a mesh's servers, as @wordplus/rtc-client's own tests have it.
++@Suite struct WordPlusMeshTests {
++    private func url(_ string: String) throws -> URL {
++        try #require(URL(string: string))
++    }
++
++    private let meshList = """
++    {"regions":[
++      {"region":"DE1","url":"wss://n-a.de.rtc.wordplus.cloud","distance":"0","node":"ND_a"},
++      {"region":"DE1","url":"wss://n-b.de.rtc.wordplus.cloud","distance":"0","node":"ND_b"},
++      {"region":"BHS","url":"wss://n-c.bhs.rtc.wordplus.cloud","distance":"5900000","node":"ND_c"}
++    ]}
++    """
++
++    @Test func meshDomains() throws {
++        #expect(try url("wss://rtc.wordplus.cloud").isMeshServer)
++        #expect(try url("wss://n-abc123.de.rtc.wordplus.cloud").isMeshServer)
++        #expect(try url("wss://rtc.wordplus.cloud").isCloud, "a mesh's servers fail over as LiveKit Cloud's do")
++        #expect(try !url("wss://notrtc.wordplus.cloud").isMeshServer)
++        #expect(try !url("wss://video-cloud.better-messages.com").isMeshServer)
++        #expect(try !url("wss://video-cloud.better-messages.com").isCloud)
++
++        #expect(try !url("ws://mesh.test.example").isMeshServer)
++        MeshDomains.add("test.example")
++        #expect(try url("ws://mesh.test.example").isMeshServer, "a product adds its own mesh's domain")
++    }
++
++    @Test func meshWaitFlag() throws {
++        let waiting = try url("wss://n-a.de.rtc.wordplus.cloud").withMeshWait()
++        #expect(waiting.isMeshWait)
++        #expect(waiting.withMeshWait().absoluteString == waiting.absoluteString, "said once")
++        #expect(try !url("wss://n-a.de.rtc.wordplus.cloud").isMeshWait)
++    }
++
++    @Test func joinParameters() throws {
++        let options = ConnectOptions(meshJoinBudget: 30, meshHardwareDecoders: ["h264", "h265"], onMeshWait: nil)
++
++        let mesh = try Utils.buildUrl(url("wss://n-a.de.rtc.wordplus.cloud").withMeshWait(), connectOptions: options, adaptiveStream: false)
++        let items = try #require(URLComponents(url: mesh, resolvingAgainstBaseURL: false)?.queryItems)
++
++        #expect(items.contains(URLQueryItem(name: "mesh_client", value: "1")), "a mesh is told this client walks and waits")
++        #expect(items.contains(URLQueryItem(name: "mesh_hwdec", value: "h264,h265")))
++        #expect(items.contains(URLQueryItem(name: "mesh_wait", value: "1")), "the wait the walk chose is carried")
++        #expect(items.contains { $0.name == "sdk" }, "upstream's own are kept")
++
++        let stock = try Utils.buildUrl(url("wss://video-cloud.better-messages.com"), connectOptions: options, adaptiveStream: false)
++        #expect(!(URLComponents(url: stock, resolvingAgainstBaseURL: false)?.queryItems ?? []).contains { $0.name.hasPrefix("mesh_") },
++                "any other server is asked nothing")
++    }
++
++    /// 1.0.3 (rtc-client 1.0.6 to 1.0.8): the client's own version, what it can do, the room's product, the device and
++    /// the codecs it encodes in hardware, to a mesh only.
++    @Test func joinNamesTheClient() throws {
++        let options = ConnectOptions(meshJoinBudget: 30, meshHardwareDecoders: [], onMeshWait: nil,
++                                     meshHardwareEncoders: ["h264"], meshApp: MeshApp(name: "better-messages", version: "3.1.4"))
++
++        let mesh = try Utils.buildUrl(url("wss://n-a.de.rtc.wordplus.cloud"), connectOptions: options, adaptiveStream: false)
++        let items = try #require(URLComponents(url: mesh, resolvingAgainstBaseURL: false)?.queryItems)
++        #expect(items.contains(URLQueryItem(name: "rtc_client", value: Mesh.clientVersion)))
++        #expect(items.contains(URLQueryItem(name: "mesh_caps", value: "audio-pause,codec-policy")))
++        #expect(items.contains(URLQueryItem(name: "rtc_app", value: "better-messages/3.1.4")))
++        #expect(items.contains(URLQueryItem(name: "mesh_hwenc", value: "h264")))
++        #expect(items.contains(URLQueryItem(name: "device_type", value: "desktop")), "these tests run on a Mac")
++        #expect(!items.contains { $0.name == "mesh_hwdec" }, "nothing said when the app knows none")
++
++        let stock = try Utils.buildUrl(url("wss://video-cloud.better-messages.com"), connectOptions: options, adaptiveStream: false)
++        let stockItems = URLComponents(url: stock, resolvingAgainstBaseURL: false)?.queryItems ?? []
++        #expect(!stockItems.contains { ["rtc_client", "rtc_app", "device_type", "mesh_caps", "mesh_hwenc"].contains($0.name) })
++
++        #expect(Mesh.appParam(nil) == nil)
++        #expect(Mesh.appParam(MeshApp(name: "Easy Stream<script>", version: "1.0 beta")) == "EasyStreamscript/1.0beta")
++        #expect(Mesh.appParam(MeshApp(name: "wordplus-sdk")) == "wordplus-sdk/")
++
++        #expect(Mesh.deviceType(model: "iPhone17,1", simulatorModel: nil) == "phone")
++        #expect(Mesh.deviceType(model: "iPad16,3", simulatorModel: nil) == "tablet")
++        #expect(Mesh.deviceType(model: "iOSSimulator,arm64", simulatorModel: "iPhone17,3") == "phone")
++        #expect(Mesh.deviceType(model: "AppleTV14,1", simulatorModel: nil) == nil)
++    }
++
++    /// 1.0.3 (rtc-client 1.0.8): the codec policy a node sends in its join response's field 1001, names only.
++    @Test func codecPolicy() throws {
++        var join = Livekit_JoinResponse()
++        join.serverInfo.nodeID = "ND_a"
++        let json = #"{"camera":["h264:hw","vp8"],"screen":["vp9",7,"a-codec-name-far-too-long"],"backup":"vp8","note":"x"}"#
++        let bytes = try join.serializedData() + Mesh.lengthDelimited(Mesh.codecPolicyField, Data(json.utf8))
++        let decoded = try Livekit_JoinResponse(serializedBytes: bytes)
++
++        let policy = try #require(Mesh.codecPolicy(inJoinResponseUnknownFields: decoded.unknownFields.data))
++        #expect(policy.camera == ["h264:hw", "vp8"])
++        #expect(policy.screen == ["vp9"], "only names, 16 characters at most")
++        #expect(policy.backup == "vp8")
++        #expect(decoded.serverInfo.nodeID == "ND_a", "LiveKit's own fields read as before")
++
++        #expect(Mesh.codecPolicy(inJoinResponseUnknownFields: Data()) == nil, "a node that sends none")
++        #expect(Mesh.codecPolicy(inJoinResponseUnknownFields: Mesh.lengthDelimited(Mesh.codecPolicyField, Data("not json".utf8))) == nil)
++    }
++
++    @Test func regionListWithNodes() throws {
++        let regions = try #require(Mesh.regions(json: Data(meshList.utf8)))
++
++        #expect(regions.count == 3)
++        #expect(regions[0].node == "ND_a")
++        #expect(regions[2].distance == 5_900_000)
++        #expect(regions[0] != regions[1], "two nodes of one region are two entries")
++    }
++
++    @Test func regionListOverTheSignalConnection() throws {
++        let json = Data(meshList.utf8)
++        var message = Data([0xA2, 0x06]) // field 100, length-delimited
++        var length = json.count
++        while length >= 0x80 {
++            message.append(UInt8(length & 0x7F) | 0x80)
++            length >>= 7
++        }
++        message.append(UInt8(length))
++        message.append(json)
++
++        let regions = try #require(Mesh.regions(inSignalMessage: message))
++        #expect(regions.map(\.node) == ["ND_a", "ND_b", "ND_c"])
++
++        let pong = try Livekit_SignalResponse.with { $0.pongResp = .with { $0.lastPingTimestamp = 42 } }.serializedData()
++        #expect(Mesh.regions(inSignalMessage: pong) == nil, "any other response is upstream's to read")
++    }
++
++    @Test func refusalHeaders() {
++        #expect(MeshRefusal.retryAfter("3") == 3)
++        #expect(MeshRefusal.retryAfter(nil) == nil)
++        #expect(MeshRefusal.retryAfter("soon") == nil)
++
++        let refusal = MeshRefusal(kind: "slot", node: "ND_b", retryAfter: 2)
++        #expect(refusal.kind == "slot")
++        #expect(MeshRefusal(kind: "other", node: "", retryAfter: nil).kind == nil, "a kind it doesn't know is none")
++
++        let wrapped = LiveKitError(.network, message: "Validation request failed", internalError: LiveKitError(.network, meshRefusal: refusal))
++        #expect(wrapped.meshRefusal?.node == "ND_b", "a refusal survives the error that wraps it")
++    }
++
++    @Test func joinRetries() {
++        let now = Date()
++        let far = now.addingTimeInterval(60)
++
++        let full = LiveKitError(.network, meshRefusal: MeshRefusal(kind: "full", node: "ND_a", retryAfter: 2))
++        let fullIn = Mesh.joinRetry(full, deadline: far, now: now)
++        #expect(fullIn != nil && fullIn! >= 2 && fullIn! < 3, "a full mesh after its Retry-After, within a second")
++
++        let unreachable = LiveKitError(.network)
++        let unreachableIn = Mesh.joinRetry(unreachable, deadline: far, now: now)
++        #expect(unreachableIn != nil && unreachableIn! >= 1 && unreachableIn! < 3)
++
++        #expect(Mesh.joinRetry(LiveKitError(.validation), deadline: far, now: now) == nil, "a refused token isn't tried again")
++        #expect(Mesh.joinRetry(full, deadline: now.addingTimeInterval(1), now: now) == nil, "not past the deadline")
++    }
++
++    @Test func waitOnTheHomeRegionFirst() throws {
++        let now = Date()
++        let busy: [(url: URL, region: String?, freeAt: Date)] = try [
++            (url("wss://n-c.bhs.rtc.wordplus.cloud"), "BHS", now.addingTimeInterval(1)),
++            (url("wss://n-a.de.rtc.wordplus.cloud"), "DE1", now.addingTimeInterval(3)),
++            (url("wss://n-b.de.rtc.wordplus.cloud"), "DE1", now.addingTimeInterval(2)),
++        ]
++
++        #expect(Mesh.waitOn(busy, home: "DE1")?.url.host == "n-b.de.rtc.wordplus.cloud", "the home region's that frees first")
++        #expect(Mesh.waitOn(busy, home: "SGP")?.url.host == "n-c.bhs.rtc.wordplus.cloud", "any region's when home has none")
++    }
++
++    @Test func nextServer() async throws {
++        let regions = try #require(Mesh.regions(json: Data(meshList.utf8)))
++        let manager = try RegionManager(providedUrl: url("wss://rtc.wordplus.cloud"))
++
++        await manager.setSignalRegions(regions)
++        #expect(await manager.hasSignalRegions())
++        #expect(await !manager.shouldRequestSettings(), "a list the node sends isn't fetched")
++
++        let first = await manager.next(token: "t", skipNode: "ND_a")
++        #expect(first?.node == "ND_b", "the node this client was on is left out")
++
++        await manager.skipNode("ND_c")
++        #expect(await manager.next(token: "t", skipNode: nil) == nil, "busy and tried nodes are left out")
++
++        await manager.resetAttempts()
++        #expect(await manager.next(token: "t", skipNode: nil)?.node == "ND_a", "every node again after a reset")
++
++        #expect(await manager.homeRegion() == "DE1")
++        #expect(await manager.nodeEntry("ND_c")?.url.host == "n-c.bhs.rtc.wordplus.cloud")
++
++        await manager.updateFromServerReportedRegions(.with { $0.regions = [.with { $0.region = "X"; $0.url = "wss://x.rtc.wordplus.cloud" }] })
++        #expect(await manager.nodeEntry("ND_c") != nil, "a leave's list, without nodes, doesn't replace the node's")
++    }
++
++    /// 1.0.2 (rtc-client 1.0.12): a burst node's removal, 2026-10-20. The phone joined through the burst node's own
++    /// name, a drain moved its session to Limburg, and the burst node went; the list the burst node sent still starts
++    /// with itself.
++    @Test func nextServerAfterDrainMove() async throws {
++        let list = """
++        {"regions":[
++          {"region":"DE1","url":"wss://n-burst.de.rtc.wordplus.cloud","distance":"0","node":"ND_burst"},
++          {"region":"GRA11","url":"wss://n-fr.gra.rtc.wordplus.cloud","distance":"500000","node":"ND_fr"},
++          {"region":"DE1","url":"wss://n-lim.de.rtc.wordplus.cloud","distance":"0","node":"ND_lim"}
++        ]}
++        """
++        let regions = try #require(Mesh.regions(json: Data(list.utf8)))
++        let manager = try RegionManager(providedUrl: url("wss://n-burst.de.rtc.wordplus.cloud"))
++        await manager.setSignalRegions(regions)
++
++        // 1.0.1 left out the session's node and so gave the dead burst node's own entry
++        #expect(await manager.next(token: "t", skipNode: "ND_lim")?.node == "ND_burst")
++        await manager.resetAttempts()
++
++        let failed = try url("wss://n-burst.de.rtc.wordplus.cloud")
++        #expect(await manager.next(token: "t", skipNode: nil, skipUrl: failed, preferNode: "ND_lim")?.node == "ND_lim",
++                "the session's node first, though it comes last in the list")
++        #expect(await manager.next(token: "t", skipNode: nil, skipUrl: failed, preferNode: "ND_lim")?.node == "ND_fr",
++                "tried once: the list goes on, still without the address that failed")
++        #expect(await manager.next(token: "t", skipNode: nil, skipUrl: failed, preferNode: "ND_lim") == nil)
++
++        #expect(try Mesh.sameServer(url("wss://n-burst.de.rtc.wordplus.cloud/rtc?x=1"), url("wss://n-burst.de.rtc.wordplus.cloud")),
++                "matched by the server alone, whatever path the signal URL carries")
++        #expect(try !Mesh.sameServer(url("wss://n-lim.de.rtc.wordplus.cloud"), url("wss://n-burst.de.rtc.wordplus.cloud")))
++    }
++
++    /// 1.0.2 (rtc-client 1.0.5): a failed resume moves only off a server that has gone, to one that answers.
++    @Test func resumeMoves() {
++        #expect(Mesh.resumeMoves(ownAnswers: false, nextAnswers: true))
++        #expect(!Mesh.resumeMoves(ownAnswers: true, nextAnswers: true), "its own server is up: the resume failed on the way")
++        #expect(!Mesh.resumeMoves(ownAnswers: false, nextAnswers: false), "nothing answers: this client's network is down")
++    }
++
++    /// 1.0.2 (rtc-client 1.0.5): a resume waits four round trips, 5 s at least, at most the socket's timeout.
++    @Test func resumeWait() {
++        #expect(Mesh.resumeWait(rttMs: 0, cap: 10) == 5)
++        #expect(Mesh.resumeWait(rttMs: 200, cap: 10) == 5)
++        #expect(Mesh.resumeWait(rttMs: 2000, cap: 10) == 8)
++        #expect(Mesh.resumeWait(rttMs: 28000, cap: 10) == 10)
++        #expect(Mesh.resumeWait(rttMs: -1, cap: 10) == 5)
++    }
++
++    /// 1.0.2: a server that is up answers the probe whatever its status; an address nothing listens on doesn't.
++    @Test func serverAnswers() async throws {
++        let closed = try url("ws://127.0.0.1:9")
++        let unknown = try url("wss://does-not-exist.invalid")
++        #expect(await !Mesh.serverAnswers(closed, timeout: 1), "nothing listens on the discard port")
++        #expect(await !Mesh.serverAnswers(unknown, timeout: 1))
++    }
++}

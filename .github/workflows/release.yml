@@ -1,0 +1,26 @@
+# The release of the Swift package (WordPlusRealtime, WordPlusRealtimeCalls, WordPlusRealtimeUI): a tag vX.Y.Z, pushed by
+# WordPlus's publish script with the release's files, is what Swift Package Manager installs (`from: "1.0.0"`, the tag's
+# v left aside). This checks that the package builds for iOS at the tag, then makes the GitHub release.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: It builds for iOS
+        run: xcodebuild build -scheme WordPlusRealtime-Package -destination 'generic/platform=iOS Simulator' -quiet
+
+      - name: The GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "WordPlusRealtime ${GITHUB_REF_NAME#v}: in Xcode, File, Add Package Dependencies, https://github.com/wordplus-cloud/realtime-swift"
