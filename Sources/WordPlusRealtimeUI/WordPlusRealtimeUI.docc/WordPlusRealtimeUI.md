@@ -1,10 +1,10 @@
 # ``WordPlusRealtimeUI``
 
-Better Messages' native call screen on WordPlus Cloud's calls: the ring, the call between two, the group call's grid and the controls, with no screen code of yours.
+The native call screen of Better Messages on WordPlus Cloud's calls: the ring, the call between two, the group call's grid and the controls, with no screen code of yours.
 
 ## Overview
 
-The screen is the same files as Better Messages' app, so it improves with it. It sits in a window of its own above the app; its chevron puts it away while the call goes on. The [calls guide](https://docs.wordplus.cloud/ios/calls/#the-call-screen) has more.
+The screen is the same files as the Better Messages app, so it improves with it. It sits in a window of its own above the app, and its chevron puts it away while the call goes on. The [calls guide](https://docs.wordplus.cloud/ios/calls/#the-call-screen) has more.
 
 ```swift
 CallScreen.shared.attach(rt.calls)

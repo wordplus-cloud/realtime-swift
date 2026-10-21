@@ -27,9 +27,9 @@ The API demo as a SwiftUI app, and the end-to-end proof with a browser on the ot
 
 Calls are a product of their own, `WordPlusRealtimeCalls`, so an app that only uses rooms carries no WebRTC: calls
 between two people (direct, through TURN when they must, or in a room when neither works), group calls, and someone
-rung into a call. Their screen is another, `WordPlusRealtimeUI`: Better Messages' native call screen (the ring, the
-call between two, the group call's grid and the controls), the same files as Better Messages' app, so it improves
-with it. Both are optional; an app that draws its own screen takes the calls alone.
+rung into a call. Their screen is another, `WordPlusRealtimeUI`: the native call screen of Better Messages (the ring, the
+call between two, the group call's grid and the controls), the same files as the Better Messages app, so it improves
+with it. Both are optional. An app that draws its own screen takes the calls alone.
 
 ```swift
 import WordPlusRealtimeCalls
@@ -43,12 +43,12 @@ CallScreen.shared.show(try await rt.calls.group("meeting:daily"), title: "Daily 
 CallScreen.shared.onAnswered = { answered in … }      // the call a ring became, for the app to follow
 ```
 
-The screen sits in a window of its own above the app. Its chevron puts it away and the call goes on;
+The screen sits in a window of its own above the app. Its chevron puts it away and the call goes on.
 `CallScreen.shared.restore()` brings it back.
 
 ## Docs
 
-The iOS guide, on the web with every other: [docs.wordplus.cloud/ios](https://docs.wordplus.cloud/ios/getting-started/). The API reference is DocC's, from the doc comments and each module's catalog (`Sources/<module>/<module>.docc`), at [docs.wordplus.cloud/reference/ios](https://docs.wordplus.cloud/reference/ios/wordplusrealtime/documentation/wordplusrealtime/); Xcode builds it too (**Product → Build Documentation**).
+The iOS guide, on the web with every other: [docs.wordplus.cloud/ios](https://docs.wordplus.cloud/ios/getting-started/). The API reference is DocC's, from the doc comments and each module's catalog (`Sources/<module>/<module>.docc`), at [docs.wordplus.cloud/reference/ios](https://docs.wordplus.cloud/reference/ios/wordplusrealtime/documentation/wordplusrealtime/). Xcode builds it too (**Product → Build Documentation**).
 
 [Getting started](docs/ios/getting-started.md) · [rooms](docs/ios/rooms.md) · [presence and online status](docs/ios/presence.md) · [sending from your server](docs/ios/sending.md) · [events from the app](docs/ios/events.md) · [calls](docs/ios/calls.md) · [encryption and your users](docs/ios/encryption.md) · [customizing the screens](docs/ios/customizing.md) · [shipping](docs/ios/shipping.md) · [the example app](docs/ios/example.md). For coding agents: [the skill](skills/wordplus-realtime-ios/SKILL.md).
 

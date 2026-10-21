@@ -1,10 +1,10 @@
 # WordPlusRealtime for Swift
 
-> WordPlus Cloud's realtime SDK for iOS and macOS apps: rooms with emit, emitWithAck and volatile, presence and who is online, history, what the app's server sends the user, calls between a phone and a browser, group calls, and Better Messages' native call screen, sealed end to end. Three products of one Swift package: WordPlusRealtime, WordPlusRealtimeCalls and WordPlusRealtimeUI. The app's server is the website's own, with @wordplus/realtime, wordplus/realtime-php or wordplus-realtime.
+> WordPlus Cloud's realtime SDK for iOS and macOS apps: rooms with emit, emitWithAck and volatile, presence and who is online, history, what the app's server sends the user, calls between a phone and a browser, group calls, and the native call screen of Better Messages, sealed end to end. Three products of one Swift package: WordPlusRealtime, WordPlusRealtimeCalls and WordPlusRealtimeUI. The app's server is the website's own, with @wordplus/realtime, wordplus/realtime-php or wordplus-realtime.
 
 ## Docs
 
-All of them, with the server packages' and every other guide, on the web: https://docs.wordplus.cloud/llms.txt.
+All of them, with the guides of the server packages and every other, on the web: https://docs.wordplus.cloud/llms.txt.
 
 - [Getting started](docs/ios/getting-started.md): the products, installing, the server knowing the app's user, connecting, a first room
 - [Rooms](docs/ios/rooms.md): joining, events and their meta, async sequences decoded, history after a reconnect
