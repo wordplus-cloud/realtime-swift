@@ -439,11 +439,18 @@ enum CallCodecs {
         // at 3.2) and stays above VP8 (3.1), so it is still there when nothing
         // better is, and never chosen over something that works. The web
         // scores it the same way, number for number.
+        // Summed in typed parts: one expression of them all is more than Xcode 16's
+        // compiler type-checks in time.
+        let smooth: Double = (enc.smooth ? 2 : 0) + (dec.smooth ? 1 : 0)
+
         if heldBack(family, sender: sender, receiver: receiver) {
-            return (enc.smooth ? 2 : 0) + (dec.smooth ? 1 : 0) + 0.15
+            return smooth + 0.15
         }
 
-        return (enc.hw ? 4 : 0) + (dec.hw ? 4 : 0) + (enc.smooth ? 2 : 0) + (dec.smooth ? 1 : 0) + (tie[family] ?? 0)
+        let hardware: Double = (enc.hw ? 4 : 0) + (dec.hw ? 4 : 0)
+        let tieBreak: Double = tie[family] ?? 0
+
+        return hardware + smooth + tieBreak
     }
 
     static func screenDirectionScore(sender: CallCodecCaps, receiver: CallCodecCaps?, family: String) -> Double? {
@@ -452,7 +459,12 @@ enum CallCodecs {
 
         guard enc.ok, dec.ok else { return nil }
 
-        return (screenContent[family] ?? 0) + (enc.smooth ? 2 : 0) + (dec.smooth ? 1 : 0) + (dec.hw ? 1 : 0) + (tie[family] ?? 0)
+        let content: Double = screenContent[family] ?? 0
+        let smooth: Double = (enc.smooth ? 2 : 0) + (dec.smooth ? 1 : 0)
+        let decodeHardware: Double = dec.hw ? 1 : 0
+        let tieBreak: Double = tie[family] ?? 0
+
+        return content + smooth + decodeHardware + tieBreak
     }
 
     /// Whether a direction can run at 60 frames, by both ends' own word.
