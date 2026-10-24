@@ -73,6 +73,11 @@ struct SDPMediaSection {
 
     var mid: String? { attributeValue("mid") }
 
+    /// Track id of the section's `a=msid:<stream id> <track id>` line (RFC 8830 §2), if any.
+    var msidTrackId: String? {
+        attributeValue("msid")?.split(separator: " ").dropFirst().first.map(String.init)
+    }
+
     /// The section's first direction attribute, if any.
     var direction: SDPDirection? {
         lines.dropFirst().lazy.compactMap(SDPDirection.init(line:)).first
@@ -120,6 +125,51 @@ struct SDPMediaSection {
             return true
         }
         return false
+    }
+
+    /// Sets `name=value` in the fmtp config of `payload`: replaces the parameter's value
+    /// if present, appends it to an existing fmtp line otherwise, and inserts a new
+    /// `a=fmtp:<payload> <name>=<value>` line at the end of the section when the payload
+    /// has none (e.g. VP8, which libwebrtc offers without an fmtp line). Returns `true` if
+    /// the section was modified; `false` when the parameter already carries `value`.
+    @discardableResult
+    mutating func setFmtpParameter(_ name: String, value: String, forPayload payload: String) -> Bool {
+        let parameter = "\(name)=\(value)"
+        for (index, line) in lines.enumerated() {
+            guard let fmtp = Self.fmtp(fromLine: line), fmtp.payload == payload else { continue }
+            // Split without trimming so every other parameter is written back verbatim.
+            var pieces = fmtp.config.split(separator: ";", omittingEmptySubsequences: false).map(String.init)
+            if let existing = pieces.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("\(name)=") }) {
+                guard pieces[existing].trimmingCharacters(in: .whitespaces) != parameter else { return false }
+                pieces[existing] = parameter
+            } else {
+                pieces.append(parameter)
+            }
+            lines[index] = "a=fmtp:\(payload) \(pieces.joined(separator: ";"))"
+            return true
+        }
+        lines.append("a=fmtp:\(payload) \(parameter)")
+        return true
+    }
+
+    /// Whether an `a=rtcp-fb:<payload> <value>` line with exactly `value` exists for
+    /// `payload`. Exact-value match: `nack` does not match `nack pli` (RFC 4585 §4.2
+    /// — they are distinct feedback parameters).
+    func hasRtcpFeedback(_ value: String, forPayload payload: String) -> Bool {
+        lines.contains { line in
+            guard let (fbPayload, fbValue) = Self.payloadAttribute(line, name: "rtcp-fb") else { return false }
+            return fbPayload == payload && fbValue == value
+        }
+    }
+
+    /// Appends an `a=rtcp-fb:<payload> <value>` line at the end of the section,
+    /// unless the exact feedback is already present. Returns `true` if the section
+    /// was modified.
+    @discardableResult
+    mutating func appendRtcpFeedback(_ value: String, forPayload payload: String) -> Bool {
+        guard !hasRtcpFeedback(value, forPayload: payload) else { return false }
+        lines.append("a=rtcp-fb:\(payload) \(value)")
+        return true
     }
 
     /// Appends a raw line at the end of the section.

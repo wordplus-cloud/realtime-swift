@@ -29,7 +29,7 @@ final class PreviewTests: XCTestCase {
             if shown == .ringing {
                 XCTAssertTrue( said.contains( "Answer" ), "ringing in offers to answer: \( said )" )
                 XCTAssertTrue( said.contains( "Reject" ), "ringing in offers to reject: \( said )" )
-            } else if shown == .group || shown == .groupVoice {
+            } else if shown.isGroup {
                 // A group call is left, not ended, and lists its people.
                 XCTAssertTrue( said.contains( "Exit Chat" ), "\( shown ) offers Exit Chat: \( said )" )
                 XCTAssertTrue( said.contains( "Participants (4)" ), "\( shown ) lists its people: \( said )" )
@@ -37,6 +37,24 @@ final class PreviewTests: XCTestCase {
                 XCTAssertTrue( said.contains( "End Call" ), "\( shown ) offers End Call: \( said )" )
             }
         }
+    }
+
+    func testACameraChangingCodecIsSaidOnItsTileAndNowhereElse() {
+        let words = "Optimizing video quality..."
+        let ( _, changing ) = drawn( .optimizing )
+        XCTAssertEqual( labels( changing.view ).filter { $0 == words }.count, 1, "one tile says it: \( labels( changing.view ) )" )
+        let ( _, still ) = drawn( .group )
+        XCTAssertFalse( labels( still.view ).contains( words ), "no tile says it with no camera changing" )
+    }
+
+    func testACameraChangingCodecIsToldOncePerPersonWhereverTheirTileGoes() {
+        let said = BmCallsOptimizingSaid()
+        XCTAssertTrue( said.first( "ann" ) )
+        XCTAssertFalse( said.first( "ann" ), "another tile of Ann's, or hers drawn again" )
+        XCTAssertTrue( said.first( "ben" ) )
+        said.keep( [ "ben" ] )
+        XCTAssertTrue( said.first( "ann" ), "Ann's change over: her next one is told" )
+        XCTAssertFalse( said.first( "ben" ) )
     }
 
     func testAGroupCallHasItsPeople() {

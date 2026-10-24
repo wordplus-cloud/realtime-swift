@@ -26,6 +26,8 @@ protocol SignalClientDelegate: AnyObject, Sendable {
     func signalClient(_ signalClient: SignalClient, didReceiveIceCandidate iceCandidate: IceCandidate, target: Livekit_SignalTarget) async
     func signalClient(_ signalClient: SignalClient, didUnpublishLocalTrack localTrack: Livekit_TrackUnpublishedResponse) async
     func signalClient(_ signalClient: SignalClient, didUpdateParticipants participants: [Livekit_ParticipantInfo]) async
+    /// A message handed over as received, after its decoded counterpart above has been applied.
+    func signalClient(_ signalClient: SignalClient, didReceiveEncodedResponse response: SignalClient.EncodedResponse) async
     func signalClient(_ signalClient: SignalClient, didUpdateRoom room: Livekit_Room) async
     func signalClient(_ signalClient: SignalClient, didUpdateSpeakers speakers: [Livekit_SpeakerInfo]) async
     func signalClient(_ signalClient: SignalClient, didUpdateConnectionQuality connectionQuality: [Livekit_ConnectionQualityInfo]) async
@@ -35,11 +37,22 @@ protocol SignalClientDelegate: AnyObject, Sendable {
     func signalClient(_ signalClient: SignalClient, didReceiveRoomMoved response: Livekit_RoomMovedResponse) async
     func signalClient(_ signalClient: SignalClient, didUpdateSubscriptionPermission permission: Livekit_SubscriptionPermissionUpdate) async
     func signalClient(_ signalClient: SignalClient, didUpdateToken token: String) async
-    func signalClient(_ signalClient: SignalClient, didReceiveLeave action: Livekit_LeaveRequest.Action, reason: Livekit_DisconnectReason, regions: Livekit_RegionSettings?) async
+    func signalClient(_ signalClient: SignalClient, didReceiveLeave action: Livekit_LeaveRequest_Action, reason: Livekit_DisconnectReason, regions: Livekit_RegionSettings?) async
     func signalClient(_ signalClient: SignalClient, didSubscribeTrack trackSid: Track.Sid) async
     func signalClient(_ signalClient: SignalClient, didReceiveMediaSectionsRequirement requirement: Livekit_MediaSectionsRequirement) async
+    func signalClient(_ signalClient: SignalClient, didReceiveDataTrackResponse data: Data) async
     /// WordPlus Mesh: the region list a node sent over this connection (`Mesh.regionsField`).
     func signalClient(_ signalClient: SignalClient, didReceiveMeshRegions regions: [RegionInfo]) async
     /// WordPlus Mesh (1.0.3): whether anyone hears a local audio track, as its node says.
     func signalClient(_ signalClient: SignalClient, didUpdateSubscribedAudioCodecs codecs: [Livekit_SubscribedAudioCodec], forTrackSid sid: String) async
+    /// WordPlus Mesh (1.0.7): how often the node asks for the reports, ms (0: none).
+    func signalClient(_ signalClient: SignalClient, didReceiveMeshReportPace every: Int) async
+}
+
+/// WordPlus Mesh (1.0.7): the mesh's messages are the room's alone; any other delegate (upstream's test doubles among
+/// them) ignores them.
+extension SignalClientDelegate {
+    func signalClient(_: SignalClient, didReceiveMeshRegions _: [RegionInfo]) async {}
+    func signalClient(_: SignalClient, didUpdateSubscribedAudioCodecs _: [Livekit_SubscribedAudioCodec], forTrackSid _: String) async {}
+    func signalClient(_: SignalClient, didReceiveMeshReportPace _: Int) async {}
 }

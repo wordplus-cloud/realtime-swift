@@ -15,7 +15,10 @@ import UIKit
 public final class CallScreenPreview: UIViewController, UITableViewDataSource, UITableViewDelegate {
     /// A state the screen can be in.
     public enum Shown: String, CaseIterable, Sendable {
-        case calling, ringing, connecting, voice, video, off, peerLost, reconnecting, group, groupVoice
+        case calling, ringing, connecting, voice, video, off, peerLost, reconnecting, group, groupVoice, optimizing
+
+        /// A group call, whose grid the screen draws.
+        var isGroup: Bool { self == .group || self == .groupVoice || self == .optimizing }
 
         public var title: String {
             switch self {
@@ -29,6 +32,7 @@ public final class CallScreenPreview: UIViewController, UITableViewDataSource, U
             case .reconnecting: return "This side reconnecting"
             case .group: return "Group call by video"
             case .groupVoice: return "Group call by voice"
+            case .optimizing: return "A camera changing codec"
             }
         }
     }
@@ -125,11 +129,11 @@ public final class CallScreenPreview: UIViewController, UITableViewDataSource, U
         self.screen = screen
         applyTraits()
 
-        let group = shown == .group || shown == .groupVoice
+        let group = shown.isGroup
         let video = shown != .voice && shown != .groupVoice
         screen.show( name: group ? "Daily meeting" : "Ann", avatar: "", video: video )
         screen.apply( state: Self.state( shown ) )
-        if group { screen.setRoster( Self.people() ) }
+        if group { screen.setRoster( Self.people( optimizing: shown == .optimizing ) ) }
     }
 
     /// The state as the call screen hands it to the screen in a call (CallScreen.state).
@@ -142,7 +146,7 @@ public final class CallScreenPreview: UIViewController, UITableViewDataSource, U
         case .peerLost, .reconnecting: phase = "reconnecting"
         default: phase = "in_progress"
         }
-        let group = shown == .group || shown == .groupVoice
+        let group = shown.isGroup
         let video = shown != .voice && shown != .groupVoice
         let off = shown == .off
         let trouble: Any
@@ -168,8 +172,9 @@ public final class CallScreenPreview: UIViewController, UITableViewDataSource, U
         ]
     }
 
-    /// A group call's people with no pictures: this side, someone speaking, someone muted, someone else.
-    static func people() -> [ BmCallsRoomParticipant ] {
+    /// A group call's people with no pictures: this side, someone speaking, someone muted, someone else. With
+    /// `optimizing`, the one speaking is changing their camera's codec, under the tile's placeholder.
+    static func people( optimizing: Bool = false ) -> [ BmCallsRoomParticipant ] {
         func person( _ identity: String, _ name: String, local: Bool = false, speaking: Bool = false, muted: Bool = false ) -> BmCallsRoomParticipant {
             BmCallsRoomParticipant(
                 identity: identity, name: name, avatar: "", isLocal: local, video: nil, screen: nil,
@@ -177,9 +182,11 @@ public final class CallScreenPreview: UIViewController, UITableViewDataSource, U
                 isPinned: false, canPublish: true, canAdmin: false, mode: "participant", lost: false
             )
         }
+        var speaking = person( "ann", "Ann", speaking: true )
+        speaking.optimizing = optimizing
         return [
             person( "me", "You", local: true ),
-            person( "ann", "Ann", speaking: true ),
+            speaking,
             person( "ben", "Ben", muted: true ),
             person( "cara", "Cara" ),
         ]

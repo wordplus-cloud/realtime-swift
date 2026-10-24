@@ -215,6 +215,7 @@ class Utils: Loggable {
         reconnectMode: ReconnectMode? = nil,
         participantSid: Participant.Sid? = nil,
         adaptiveStream: Bool,
+        publisherOffer: Livekit_SessionDescription? = nil,
     ) throws -> URL {
         let connectOptions = connectOptions ?? ConnectOptions()
 
@@ -240,7 +241,8 @@ class Utils: Loggable {
         let encoded = try buildWrappedJoinRequest(connectOptions: connectOptions,
                                                   reconnectMode: reconnectMode,
                                                   participantSid: participantSid,
-                                                  adaptiveStream: adaptiveStream)
+                                                  adaptiveStream: adaptiveStream,
+                                                  publisherOffer: publisherOffer)
 
         builder.queryItems = [URLQueryItem(name: "join_request", value: encoded)] + Mesh.queryItems(for: url, connectOptions: connectOptions)
 
@@ -273,38 +275,59 @@ class Utils: Loggable {
         reconnectMode: ReconnectMode?,
         participantSid: Participant.Sid?,
         adaptiveStream: Bool,
+        publisherOffer: Livekit_SessionDescription?,
     ) throws -> String {
-        var joinRequest = Livekit_JoinRequest()
-        joinRequest.clientInfo = Livekit_ClientInfo.with {
-            $0.sdk = .swift
-            $0.version = LiveKitSDK.version
-            $0.protocol = Int32(connectOptions.protocolVersion.rawValue)
-            $0.clientProtocol = Int32(connectOptions.clientProtocol.rawValue)
-            $0.os = String(describing: os())
-            $0.osVersion = osVersionString()
-            if let model = modelIdentifier() { $0.deviceModel = model }
-            if let network = networkTypeString() { $0.network = network }
-        }
-        joinRequest.connectionSettings = Livekit_ConnectionSettings.with {
-            $0.autoSubscribe = connectOptions.autoSubscribe
-            $0.adaptiveStream = adaptiveStream
-        }
+        let joinRequest = Livekit_JoinRequest.with { request in
+            request.clientInfo = Livekit_ClientInfo.with {
+                $0.sdk = .swift
+                $0.version = LiveKitSDK.version
+                $0.protocol = Int32(connectOptions.protocolVersion.rawValue)
+                $0.clientProtocol = Int32(connectOptions.clientProtocol.rawValue)
+                $0.os = String(describing: os())
+                $0.osVersion = osVersionString()
+                if let model = modelIdentifier() { $0.deviceModel = model }
+                if let network = networkTypeString() { $0.network = network }
+            }
+            request.connectionSettings = Livekit_ConnectionSettings.with {
+                $0.autoSubscribe = connectOptions.autoSubscribe
+                $0.adaptiveStream = adaptiveStream
+            }
 
-        if reconnectMode == .quick {
-            joinRequest.reconnect = true
-            joinRequest.reconnectReason = .rrSignalDisconnected
-            if let sid = participantSid {
-                joinRequest.participantSid = sid.stringValue
+            // Bundling the publisher offer lets the server answer it in the same exchange,
+            // removing a round trip from the connect path.
+            if let publisherOffer {
+                request.publisherOffer = publisherOffer
+            }
+
+            if reconnectMode == .quick {
+                request.reconnect = true
+                request.reconnectReason = .rrSignalDisconnected
+                if let sid = participantSid {
+                    request.participantSid = sid.stringValue
+                }
             }
         }
 
         let joinRequestData = try joinRequest.serializedData()
+
+        // The request travels in the WebSocket upgrade URL, so keeping it within
+        // a single TCP segment avoids paying a retransmission timeout before the
+        // handshake even starts on a lossy link. Mirrors client-sdk-js and
+        // rust-sdks: gzip, but keep the compressed form only when it is actually
+        // smaller — gzip framing exceeds the savings on a small request.
+        let (payload, compression): (Data, Livekit_WrappedJoinRequest_Compression) =
+            if let compressed = Gzip.compress(joinRequestData), compressed.count < joinRequestData.count {
+                (compressed, .gzip)
+            } else {
+                (joinRequestData, .none)
+            }
+
         let wrappedData = try Livekit_WrappedJoinRequest.with {
-            $0.compression = .none
-            $0.joinRequest = joinRequestData
+            $0.compression = compression
+            $0.joinRequest = payload
         }.serializedData()
 
-        return wrappedData.base64EncodedString()
+        return wrappedData.base64URLEncodedString()
     }
 }
 

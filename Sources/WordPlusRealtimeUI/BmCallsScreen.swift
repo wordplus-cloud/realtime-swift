@@ -196,6 +196,12 @@ final class BmCallsScreen: UIViewController {
     private var roomLocalVideo: VideoTrack?
     private var roomPeerCamera: VideoTrack?
     private var roomPeerScreen: VideoTrack?
+    /// The other side's camera changing codec in a two-person room
+    /// (`BmCallsCameraSwitch`): the room holds it until the frame that ends
+    /// it, for `applyRoomOptimizing`.
+    private var roomPeerOptimizing = false
+    /// Over the stage while that lasts, below the corners and the dock.
+    private let roomOptimizing = BmCallsOptimizingView()
     private var selfShowing: LKRTCVideoTrack?
 
     private var phase = "idle"
@@ -395,11 +401,18 @@ final class BmCallsScreen: UIViewController {
 
         view.addSubview(roomStage)
 
+        roomOptimizing.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(roomOptimizing)
+
         NSLayoutConstraint.activate([
             roomStage.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             roomStage.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             roomStage.topAnchor.constraint(equalTo: view.topAnchor),
-            roomStage.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+            roomStage.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            roomOptimizing.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            roomOptimizing.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            roomOptimizing.topAnchor.constraint(equalTo: view.topAnchor),
+            roomOptimizing.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
 
         // The second chip sits under the first, and tapping it swaps what is
@@ -1547,6 +1560,7 @@ final class BmCallsScreen: UIViewController {
             roomStage.isHidden = true
             roomPeerChip.track = nil
             peerChipHolder.isHidden = true
+            roomOptimizing.show(false, picture: nil)
             return
         }
 
@@ -1592,10 +1606,13 @@ final class BmCallsScreen: UIViewController {
 
         drawSelfStage()
 
+        applyRoomOptimizing()
+
         // The web draws the avatar, the name and the timer only where it has
         // no picture to draw instead; over a live camera it draws nothing at
-        // all, and neither does this.
-        let picture = onStage != nil || roomOnStage != nil
+        // all, and neither does this. A camera changing codec is a picture on
+        // its way back, under its placeholder: not the camera turned off.
+        let picture = onStage != nil || roomOnStage != nil || roomOptimizing.isUp
 
         avatar.isHidden = picture
         drawPresence()
@@ -1758,6 +1775,32 @@ final class BmCallsScreen: UIViewController {
         drawPeerVideo()
     }
 
+    /// The other side's camera changing codec, as the room holds it: from the
+    /// word until the frame that ends it (`BmCallsCameraSwitch`).
+    func setRoomPeerOptimizing(_ optimizing: Bool) {
+        guard roomPeerOptimizing != optimizing else { return }
+
+        roomPeerOptimizing = optimizing
+
+        drawPeerVideo()
+    }
+
+    /// The placeholder over the stage while the other side's camera changes
+    /// codec, wherever their camera is the one on the stage: not over a
+    /// shared screen there.
+    private func applyRoomOptimizing() {
+        let onStage = roomStageTrack
+        let showsScreen = onStage != nil && onStage === roomPeerScreen
+
+        roomOptimizing.show(!inRoom && roomPeerOptimizing && !showsScreen, picture: avatarImage.image)
+    }
+
+    /// Their camera away for a moment while it changes codec: it keeps its
+    /// place, under the placeholder, rather than being taken for off.
+    private var roomPeerCameraHeld: Bool {
+        roomPeerOptimizing && roomPeerCamera == nil
+    }
+
     /// The corner a room's second picture sits in, shaped like that picture
     /// once it says what size it is, and until then like what it is.
     private func shapeRoomCorner() {
@@ -1770,13 +1813,25 @@ final class BmCallsScreen: UIViewController {
     }
 
     private var roomStageTrack: VideoTrack? {
-        guard let screen = roomPeerScreen, !swapped else { return roomPeerCamera ?? roomPeerScreen }
+        if let screen = roomPeerScreen, !swapped { return screen }
 
-        return screen
+        // Their camera's place, swapped onto the stage or with no screen to
+        // share it: while it changes codec the stage keeps it, under the
+        // placeholder, and the screen stays in the corner, as the web's stage
+        // does for its `primaryVideo === 'camera'`.
+        if roomPeerCameraHeld { return nil }
+
+        return roomPeerCamera ?? roomPeerScreen
     }
 
     private var roomCornerTrack: VideoTrack? {
-        guard let camera = roomPeerCamera, let screen = roomPeerScreen else { return nil }
+        guard let screen = roomPeerScreen else { return nil }
+
+        // The camera held on the stage leaves the corner to the screen; held
+        // in the corner, the corner waits for it.
+        if roomPeerCameraHeld { return roomStageTrack === screen ? nil : screen }
+
+        guard let camera = roomPeerCamera else { return nil }
 
         return roomStageTrack === screen ? camera : screen
     }
@@ -2286,6 +2341,17 @@ final class BmCallsScreenHost {
         }
     }
 
+    /// The other side of a two-person room changing its camera's codec
+    /// (`BmCallsCameraSwitch`).
+    private var roomPeerOptimizing = false
+
+    func setRoomPeerOptimizing(_ optimizing: Bool) {
+        onMain {
+            self.roomPeerOptimizing = optimizing
+            self.screen?.setRoomPeerOptimizing(optimizing)
+        }
+    }
+
     /// A screen made after the pictures were handed over is given them.
     private func replayPictures(to screen: BmCallsScreen) {
         if let track = localVideo { screen.setLocalVideo(track) }
@@ -2297,6 +2363,10 @@ final class BmCallsScreenHost {
 
         if roomPeerVideo.camera != nil || roomPeerVideo.screen != nil {
             screen.setRoomPeerVideo(camera: roomPeerVideo.camera, screen: roomPeerVideo.screen)
+        }
+
+        if roomPeerOptimizing {
+            screen.setRoomPeerOptimizing(true)
         }
     }
 
@@ -2317,6 +2387,7 @@ final class BmCallsScreenHost {
             self.roomLocalVideo = nil
             self.remoteVideo = [:]
             self.roomPeerVideo = (nil, nil)
+            self.roomPeerOptimizing = false
         }
     }
 }

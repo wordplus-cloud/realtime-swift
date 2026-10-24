@@ -1,4 +1,5 @@
 import Foundation
+import LiveKit
 import LiveKitWebRTC
 
 /// Which video codec each direction of a direct call uses.
@@ -253,7 +254,14 @@ enum CallCodecs {
     private static func withoutBroken(_ caps: CallCodecCaps) -> CallCodecCaps {
         let current = broken()
 
-        guard !current.isEmpty else { return caps }
+        // A codec whose hardware this device saw taking a camera's frames off
+        // (the room client's MeshHardwareDrops, as the web's
+        // encoder-watch.ts) is not sent: a room's camera goes out in VP8
+        // (roomPublishCodec), and a direct call's is not sent from that
+        // hardware at a few frames a second. Remembered for a month.
+        let dropped = Set(MeshHardwareDrops.codecs().map { "video/" + $0.uppercased() })
+
+        guard !current.isEmpty || !dropped.isEmpty else { return caps }
 
         var result = caps.families
 
@@ -261,7 +269,7 @@ enum CallCodecs {
             let directions = current[family] ?? []
 
             result[family] = (
-                enc: directions.contains(encode) ? CallCodecScore.none : pair.enc,
+                enc: directions.contains(encode) || dropped.contains(family) ? CallCodecScore.none : pair.enc,
                 dec: directions.contains(decode) ? CallCodecScore.none : pair.dec
             )
         }

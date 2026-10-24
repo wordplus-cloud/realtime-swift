@@ -16,6 +16,9 @@
 
 // swiftlint:disable file_length
 
+#if !COCOAPODS && !LK_XCFRAMEWORK
+import LiveKitNanopb
+#endif
 import Foundation
 
 internal import LiveKitWebRTC
@@ -44,7 +47,7 @@ extension Room: SignalClientDelegate {
         }
     }
 
-    func signalClient(_: SignalClient, didReceiveLeave action: Livekit_LeaveRequest.Action, reason: Livekit_DisconnectReason, regions: Livekit_RegionSettings?) async {
+    func signalClient(_: SignalClient, didReceiveLeave action: Livekit_LeaveRequest_Action, reason: Livekit_DisconnectReason, regions: Livekit_RegionSettings?) async {
         log("action: \(action), reason: \(reason)")
 
         if let regions, let providedUrl = _state.providedUrl, let regionManager = await regionManager(for: providedUrl) {
@@ -84,7 +87,7 @@ extension Room: SignalClientDelegate {
 
         if !codecs.isEmpty {
             guard let videoTrack = publication.track as? LocalVideoTrack else { return }
-            let missingSubscribedCodecs = (try? videoTrack._set(subscribedCodecs: codecs)) ?? []
+            let missingSubscribedCodecs = await (try? videoTrack._set(subscribedCodecs: codecs)) ?? []
 
             if !missingSubscribedCodecs.isEmpty {
                 log("Missing codecs: \(missingSubscribedCodecs)")
@@ -99,7 +102,7 @@ extension Room: SignalClientDelegate {
             }
 
         } else {
-            localParticipant._set(subscribedQualities: qualities, forTrackSid: trackSid)
+            await localParticipant._set(subscribedQualities: qualities, forTrackSid: trackSid)
         }
     }
 
@@ -113,9 +116,9 @@ extension Room: SignalClientDelegate {
 
             _state.mutate {
                 $0.apply(roomInfo: joinResponse.room)
-                $0.serverInfo = joinResponse.serverInfo
-                // WordPlus Mesh (1.0.3): the node's codec policy, in a field LiveKit's JoinResponse hasn't got
-                $0.meshCodecPolicy = Mesh.codecPolicy(inJoinResponseUnknownFields: joinResponse.unknownFields.data)
+                $0.serverInfo = joinResponse.serverInfo.owned()
+                // WordPlus Mesh (1.0.3): the node's codec policy, in a field LiveKit's JoinResponse hasn't got, is read
+                // from the message's bytes since 1.0.7 (didReceiveEncodedResponse), as nanopb keeps no unknown fields
 
                 localParticipant.set(info: joinResponse.participant, connectionState: $0.connectionState)
                 localParticipant.set(enabledPublishCodecs: joinResponse.enabledPublishCodecs)
@@ -129,7 +132,7 @@ extension Room: SignalClientDelegate {
         } else if case let .reconnect(response) = connectResponse, response.hasServerInfo {
             // WordPlus Mesh: a resume may land on another node (`moveResumeToNextServer`), which is the one to leave
             // out of the next failover.
-            _state.mutate { $0.serverInfo = response.serverInfo }
+            _state.mutate { $0.serverInfo = response.serverInfo.owned() }
         }
     }
 
@@ -155,6 +158,11 @@ extension Room: SignalClientDelegate {
 
         let newParticipants = _addNewParticipants(from: response.otherParticipants)
         _notifyNewParticipants(newParticipants)
+
+        // Republish local data tracks into the new room and surface its existing publications.
+        if let identity = localParticipant.identity?.stringValue {
+            dataTracks?.handleRoomMoved(response.otherParticipants, localIdentity: identity)
+        }
     }
 
     func signalClient(_: SignalClient, didUpdateSpeakers speakers: [Livekit_SpeakerInfo]) async {
@@ -356,6 +364,12 @@ extension Room: SignalClientDelegate {
         do {
             let publisher = try requirePublisher()
             try await publisher.set(remoteDescription: answer, offerId: offerId)
+
+            // Applying the answer re-enables every encoding, and the server only reports
+            // qualities that changed, so nothing else brings the paused layers back.
+            if _state.roomOptions.dynacast {
+                await localParticipant.refreshSubscribedQualities()
+            }
         } catch {
             log("Failed to set remote description with offerId: \(offerId), error: \(error)", .error)
         }
@@ -371,8 +385,11 @@ extension Room: SignalClientDelegate {
 
         do {
             try await subscriber.set(remoteDescription: offer)
-            let answer = try await subscriber.createAnswer()
-            try await subscriber.set(localDescription: answer)
+            var answer = try await subscriber.createAnswer()
+            answer = try await subscriber.set(localDescription: answer, munging: [
+                { Transport.mungeOpusStereo($0, matchingOffer: offer.sdp) },
+                { Transport.mungeOpusNack($0, matchingOffer: offer.sdp) },
+            ])
             try await signalClient.send(answer: answer, offerId: offerId)
             connectSpan?.record("answer_sent")
         } catch {
@@ -403,6 +420,26 @@ extension Room: SignalClientDelegate {
         }
     }
 
+    /// Feeds the data track managers, which parse these themselves. Ordered after the decoded
+    /// form, so the participants each message announces are already registered and
+    /// `onTrackPublished` can resolve its publisher.
+    func signalClient(_: SignalClient, didReceiveEncodedResponse response: SignalClient.EncodedResponse) async {
+        switch response {
+        case let .join(encoded):
+            // WordPlus Mesh (1.0.3, read here since 1.0.7): the node's codec policy, in a field LiveKit's JoinResponse
+            // hasn't got, from the signal message's own bytes
+            _state.mutate { $0.meshCodecPolicy = Mesh.codecPolicy(inSignalMessage: encoded) }
+            dataTracks?.handleJoinResponse(encoded)
+        case let .participantUpdate(encoded):
+            guard let identity = localParticipant.identity?.stringValue else { return }
+            dataTracks?.handleParticipantUpdate(encoded, localIdentity: identity)
+        }
+    }
+
+    func signalClient(_: SignalClient, didReceiveDataTrackResponse data: Data) async {
+        dataTracks?.handleSignalResponse(data)
+    }
+
     func signalClient(_: SignalClient, didReceiveMeshRegions regions: [RegionInfo]) async {
         guard let providedUrl = _state.providedUrl, let regionManager = await regionManager(for: providedUrl) else { return }
 
@@ -416,7 +453,12 @@ extension Room: SignalClientDelegate {
         guard let publication = localParticipant.trackPublications[Track.Sid(from: trackSid)] as? LocalTrackPublication,
               let track = publication.track as? LocalAudioTrack else { return }
 
-        track._setMeshHeard(codecs.contains { $0.enabled })
+        await track._setMeshHeard(codecs.contains { $0.enabled })
+    }
+
+    /// WordPlus Mesh (1.0.7, rtc-client 1.0.16): the node's pace for the reports (MeshEncoderReporter's tick).
+    func signalClient(_: SignalClient, didReceiveMeshReportPace every: Int) async {
+        _meshEncoders.setPace(every)
     }
 
     func signalClient(_: SignalClient, didReceiveMediaSectionsRequirement requirement: Livekit_MediaSectionsRequirement) async {
@@ -426,11 +468,13 @@ extension Room: SignalClientDelegate {
         transceiverInit.direction = .recvOnly
 
         do {
-            for _ in 0 ..< requirement.numAudios {
-                _ = try await publisher.addTransceiver(ofType: .audio, transceiverInit: transceiverInit)
-            }
-            for _ in 0 ..< requirement.numVideos {
-                _ = try await publisher.addTransceiver(ofType: .video, transceiverInit: transceiverInit)
+            try await RTC.run {
+                for _ in 0 ..< requirement.numAudios {
+                    _ = try publisher.addTransceiver(ofType: .audio, transceiverInit: transceiverInit)
+                }
+                for _ in 0 ..< requirement.numVideos {
+                    _ = try publisher.addTransceiver(ofType: .video, transceiverInit: transceiverInit)
+                }
             }
             try await publisherShouldNegotiate()
         } catch {

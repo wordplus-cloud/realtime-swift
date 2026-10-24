@@ -20,7 +20,8 @@ import Foundation
 
 internal import LiveKitWebRTC
 
-actor Transport: NSObject, Loggable {
+@RTC
+final class Transport: NSObject, Loggable {
     // MARK: - Types
 
     typealias OnOfferBlock = @Sendable (LKRTCSessionDescription, UInt32) async throws -> Void
@@ -57,27 +58,48 @@ actor Transport: NSObject, Loggable {
     private let _debounce = Debounce(delay: 0.02) // 20ms
 
     private var _reNegotiate: Bool = false
+
+    /// A local offer that has been signalled but not yet applied with
+    /// `setLocalDescription`. See ``createInitialOffer()``.
+    private var _pendingInitialOffer: LKRTCSessionDescription?
     private var _onOffer: OnOfferBlock?
     private var _isRestartingIce: Bool = false
     private var _latestOfferId: UInt32 = 0
+    private var _isClosed: Bool = false
+    /// `x-google-start-bitrate` (kbps) hinted for each video sender id, recorded by
+    /// ``addTransceiver(with:transceiverInit:startBitrateKbps:)``. The largest hint among the
+    /// senders in an offer is the connection-level value; see
+    /// ``mungeVideoStartBitrate(_:kbpsBySenderId:)``.
+    private var _startBitrateKbpsBySenderId: [String: Int] = [:]
+    /// Whether an offer carrying `x-google-start-bitrate` has been accepted locally. The hint
+    /// is written once per peer connection: libwebrtc retains `start_bitrate_bps` in
+    /// `RtpBitrateConfigurator` and re-applies it on network route changes, so a later rewrite
+    /// is at best a no-op and at worst restarts a converged bandwidth estimator. A full
+    /// reconnect builds a new `Transport`, whose new estimator is seeded again.
+    private var _hasAppliedVideoStartBitrate = false
 
-    // forbid direct access to PeerConnection
-    private let _pc: LKRTCPeerConnection
+    // forbid direct access to PeerConnection; the box parks its blocking release on deinit
+    private let _pcBox: RTCBox<LKRTCPeerConnection>
+
+    @RTC private var _pc: LKRTCPeerConnection { _pcBox.value }
 
     private lazy var _iceCandidatesQueue = QueueActor<IceCandidate>(onProcess: { [weak self] iceCandidate in
         guard let self else { return }
 
         do {
-            let rtcCandidate = iceCandidate.toRTCType()
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                self._pc.add(rtcCandidate) { error in
-                    if let error { continuation.resume(throwing: error) } else { continuation.resume() }
-                }
-            }
+            try await add(rtcCandidate: iceCandidate.toRTCType())
         } catch {
             log("Failed to add(iceCandidate:) with error: \(error)", .error)
         }
     })
+
+    private func add(rtcCandidate: LKRTCIceCandidate) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            _pc.add(rtcCandidate) { @Sendable error in
+                if let error { continuation.resume(throwing: error) } else { continuation.resume() }
+            }
+        }
+    }
 
     init(config: LKRTCConfiguration,
          target: Livekit_SignalTarget,
@@ -94,7 +116,7 @@ actor Transport: NSObject, Loggable {
         self.target = target
         isPrimary = primary
         self.singlePCMode = singlePCMode
-        _pc = pc
+        _pcBox = RTCBox(pc)
 
         super.init()
         log()
@@ -119,6 +141,67 @@ actor Transport: NSObject, Loggable {
         _onOffer = block
     }
 
+    /// Creates the offer that rides along with the JOIN request, *without* applying it.
+    ///
+    /// `setLocalDescription` is deferred until the answer arrives, because applying it
+    /// starts ICE gathering — and at this point the peer connection has only the
+    /// client-side configuration, so it would gather without the server's TURN servers
+    /// and never produce relay candidates. ``set(remoteDescription:)`` applies the
+    /// pending offer once ``set(configuration:)`` has installed them, mirroring
+    /// `createInitialOffer` in client-sdk-js and `create_initial_offer` in rust-sdks.
+    ///
+    /// - Returns: The offer to signal and its id, or `nil` outside single PC mode
+    ///   (the dual-PC subscriber-primary flow has the server offer first).
+    /// - Note: The munges are applied here and the result is signalled as-is, so unlike
+    ///   ``set(localDescription:munging:)`` a munge libwebrtc rejects cannot be dropped
+    ///   and retried — the peer has already been told what we offered. Both munges on
+    ///   this path are the ones every single PC mode offer already carries.
+    /// - Note: The video start bitrate is deliberately not written here. It derives from
+    ///   senders added by ``addTransceiver(with:transceiverInit:startBitrateKbps:)``, and
+    ///   none exist before the JOIN, so there is never a value to write; and the one-shot
+    ///   latch could not be set safely, since this offer may be dropped unapplied
+    ///   (``clearPendingInitialOffer()``). ``createAndSendOffer(iceRestart:)`` owns the hint
+    ///   and latches only once the offer carrying it has been accepted, as in rust-sdks.
+    func createInitialOffer() async throws -> (offer: LKRTCSessionDescription, offerId: UInt32)? {
+        guard singlePCMode else { return nil }
+
+        guard signalingState == .stable else {
+            log("Signaling state is \(signalingState), cannot create the initial offer", .warning)
+            return nil
+        }
+
+        let offer = try await createOffer()
+        let mungedSDP = [Self.mungeInactiveToRecvOnlyForMedia, Self.mungeOpusStereoForAllAudio]
+            .reduce(offer.sdp) { $1($0) }
+        let munged = mungedSDP == offer.sdp ? offer : RTC.createSessionDescription(type: offer.type, sdp: mungedSDP)
+
+        _latestOfferId += 1
+        _pendingInitialOffer = munged
+        return (munged, _latestOfferId)
+    }
+
+    /// Drops an initial offer that will never be answered, so the transport falls back to
+    /// ordinary negotiation. Used when the JOIN it was bundled with did not succeed.
+    func clearPendingInitialOffer() {
+        _pendingInitialOffer = nil
+    }
+
+    /// Applies a deferred initial offer, if one is outstanding. Take-once, so callers on
+    /// both remote-description paths are safe.
+    ///
+    /// Cleared before the `await` and not restored if the apply throws. `didReceiveAnswer` only
+    /// logs, so the answer is gone either way; keeping the offer would additionally leave
+    /// `isAwaitingAnswer` true forever, making every later `createAndSendOffer` a no-op. Dropping
+    /// it costs the in-flight negotiation, which the connect timeout and reconnect rebuild
+    /// anyway. Same as `take()` in rust-sdks.
+    private func applyPendingInitialOffer() async throws {
+        guard let pendingInitialOffer = _pendingInitialOffer else { return }
+        _pendingInitialOffer = nil
+
+        log("Applying the initial offer deferred from JOIN")
+        try await set(localDescription: pendingInitialOffer)
+    }
+
     func setIsRestartingIce() {
         _isRestartingIce = true
     }
@@ -128,22 +211,31 @@ actor Transport: NSObject, Loggable {
     }
 
     func set(remoteDescription sd: LKRTCSessionDescription, offerId: UInt32) async throws {
-        if signalingState != .haveLocalOffer {
-            log("Received answer with unexpected signaling state: \(signalingState), expected .haveLocalOffer", .warning)
-        }
-
+        // Validate before mutating anything: applying the deferred offer consumes it and moves
+        // the connection to `.haveLocalOffer`, so an answer we are about to reject must not get
+        // that far.
         if offerId == 0 {
             log("Skipping validation for legacy server (missing offerId), latestOfferId: \(_latestOfferId)", .warning)
         } else if offerId != _latestOfferId {
             throw LiveKitError(.invalidState, message: "OfferId mismatch, expected \(_latestOfferId) but got \(offerId)")
         }
 
+        // Before the state check: an offer bundled with JOIN leaves the connection
+        // `.stable` until its answer arrives.
+        try await applyPendingInitialOffer()
+
+        if signalingState != .haveLocalOffer {
+            log("Received answer with unexpected signaling state: \(signalingState), expected .haveLocalOffer", .warning)
+        }
+
         try await set(remoteDescription: sd)
     }
 
     func set(remoteDescription sd: LKRTCSessionDescription) async throws {
+        try await applyPendingInitialOffer()
+
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            _pc.setRemoteDescription(sd) { error in
+            _pc.setRemoteDescription(sd) { @Sendable error in
                 if let error {
                     continuation.resume(throwing: error)
                 } else {
@@ -181,7 +273,11 @@ actor Transport: NSObject, Loggable {
             _isRestartingIce = true
         }
 
-        if signalingState == .haveLocalOffer, !(iceRestart && remoteDescription != nil) {
+        // A deferred initial offer counts as awaiting an answer even though the
+        // connection still reads `.stable`, so a publish racing the JOIN queues a
+        // renegotiation instead of offering over the top of it.
+        let isAwaitingAnswer = signalingState == .haveLocalOffer || _pendingInitialOffer != nil
+        if isAwaitingAnswer, !(iceRestart && remoteDescription != nil) {
             _reNegotiate = true
             return
         }
@@ -190,12 +286,23 @@ actor Transport: NSObject, Loggable {
         func _negotiateSequence() async throws {
             _latestOfferId += 1
             var offer = try await createOffer(for: constraints)
-            let mungedSDP = singlePCMode ? Self.mungeInactiveToRecvOnlyForMedia(offer.sdp) : offer.sdp
-            if mungedSDP != offer.sdp {
-                offer = try await set(mungedLocalDescription: RTC.createSessionDescription(type: offer.type, sdp: mungedSDP),
-                                      fallingBackTo: offer)
-            } else {
-                try await set(localDescription: offer)
+            // The direction rewrite is required to receive media in single PC mode; the
+            // stereo preference and the video start bitrate are optional and are dropped
+            // from the right on rejection. The start bitrate is written on the first offer
+            // that carries local video only: offers before any video is published (data
+            // channel or audio only) find no target and leave the latch unset.
+            let kbpsBySenderId = _startBitrateKbpsBySenderId
+            let hasAppliedStartBitrate = _hasAppliedVideoStartBitrate
+            let startBitrate: (String) -> String = {
+                hasAppliedStartBitrate ? $0 : Self.mungeVideoStartBitrate($0, kbpsBySenderId: kbpsBySenderId)
+            }
+            offer = try await set(localDescription: offer, munging: singlePCMode
+                ? [Self.mungeInactiveToRecvOnlyForMedia, Self.mungeOpusStereoForAllAudio, startBitrate]
+                : [startBitrate])
+            // A rejected munge is dropped and the offer retried without it, so the one-shot
+            // hint is consumed only once the description that carries it has been accepted.
+            if !_hasAppliedVideoStartBitrate, Self.carriesVideoStartBitrate(offer.sdp) {
+                _hasAppliedVideoStartBitrate = true
             }
             try await _onOffer(offer, _latestOfferId)
         }
@@ -210,8 +317,12 @@ actor Transport: NSObject, Loggable {
     }
 
     func close() async {
+        _isClosed = true
+
         // prevent debounced negotiate firing
         await _debounce.cancel()
+
+        _pendingInitialOffer = nil
 
         // Stop listening to delegate
         _pc.delegate = nil
@@ -231,7 +342,7 @@ extension Transport {
     /// Munge SDP to change `a=inactive` to `a=recvonly` for RTP media m-lines in single PC mode.
     /// WebRTC can generate inactive direction even when transceivers were configured as recvonly.
     /// Only rewrites RTP m-sections — non-RTP sections (e.g. data channel `m=application`) are preserved.
-    static func mungeInactiveToRecvOnlyForMedia(_ sdp: String) -> String {
+    nonisolated static func mungeInactiveToRecvOnlyForMedia(_ sdp: String) -> String {
         var document = SDP(parsing: sdp)
         for index in document.mediaSections.indices {
             let section = document.mediaSections[index]
@@ -242,21 +353,223 @@ extension Transport {
         return document.write()
     }
 
-    /// Sets `munged` as the local description, falling back to `original` when libwebrtc
-    /// rejects it — a rejected set leaves the peer connection state untouched, so
-    /// negotiation proceeds without the munge instead of failing. libwebrtc validates
-    /// munged SDP and rejects some munging types outright (`IsSdpMungingAllowed`,
-    /// expanding via field-trial kill switches). Returns the description that was applied.
-    func set(mungedLocalDescription munged: LKRTCSessionDescription,
-             fallingBackTo original: LKRTCSessionDescription) async throws -> LKRTCSessionDescription
+    /// Munge an answer to declare `stereo=1` on the Opus fmtp of every section whose
+    /// counterpart in `offer` advertises `sprop-stereo=1`.
+    ///
+    /// Per [RFC 7587 §7.1](https://datatracker.ietf.org/doc/html/rfc7587#section-7.1) `stereo`
+    /// is the *receiver's* preference: without it libwebrtc instantiates a mono Opus decoder and
+    /// downmixes, regardless of what the sender transmits. `sprop-stereo` states only what the
+    /// sender emits, so it does not carry the answerer's preference on its own. This mirrors
+    /// `ensureAudioNackAndStereo()` in client-sdk-js.
+    ///
+    /// Sections are matched by mid rather than by position, and the Opus payload type is
+    /// resolved independently in each document, so an answerer that reorders or renumbers
+    /// still lands the parameter on the right section.
+    nonisolated static func mungeOpusStereo(_ sdp: String, matchingOffer offer: String) -> String {
+        let stereoMids = Set(SDP(parsing: offer).mediaSections.compactMap { section -> String? in
+            guard section.mediaType == "audio",
+                  let mid = section.mid,
+                  let payload = section.payload(forCodec: "opus"),
+                  section.fmtp(forPayload: payload)?.parameters.contains("sprop-stereo=1") == true
+            else { return nil }
+            return mid
+        })
+        guard !stereoMids.isEmpty else { return sdp }
+
+        var document = SDP(parsing: sdp)
+        for index in document.mediaSections.indices {
+            let section = document.mediaSections[index]
+            guard let mid = section.mid, stereoMids.contains(mid),
+                  let payload = section.payload(forCodec: "opus") else { continue }
+            document.mediaSections[index].appendFmtpParameter("stereo=1", forPayload: payload)
+        }
+        return document.write()
+    }
+
+    /// Munge an answer to accept `nack` feedback for Opus on every section whose
+    /// counterpart in `offer` advertises it.
+    ///
+    /// libwebrtc does not support NACK for audio in its codec capabilities, so its answer
+    /// drops the `a=rtcp-fb:<pt> nack` the SFU offers (the SFU offers it when RED is off
+    /// for the track) and retransmission never activates — feedback is active only when
+    /// both sides agree ([RFC 4585 §4.2](https://datatracker.ietf.org/doc/html/rfc4585#section-4.2)).
+    /// This mirrors `ensureAudioNackAndStereo()` in client-sdk-js, with the same
+    /// mid-and-payload matching as ``mungeOpusStereo(_:matchingOffer:)``.
+    nonisolated static func mungeOpusNack(_ sdp: String, matchingOffer offer: String) -> String {
+        let nackMids = Set(SDP(parsing: offer).mediaSections.compactMap { section -> String? in
+            guard section.mediaType == "audio",
+                  let mid = section.mid,
+                  let payload = section.payload(forCodec: "opus"),
+                  section.hasRtcpFeedback("nack", forPayload: payload)
+            else { return nil }
+            return mid
+        })
+        guard !nackMids.isEmpty else { return sdp }
+
+        var document = SDP(parsing: sdp)
+        for index in document.mediaSections.indices {
+            let section = document.mediaSections[index]
+            guard let mid = section.mid, nackMids.contains(mid),
+                  let payload = section.payload(forCodec: "opus") else { continue }
+            document.mediaSections[index].appendRtcpFeedback("nack", forPayload: payload)
+        }
+        return document.write()
+    }
+
+    /// Munge a local offer to declare `stereo=1` on the Opus fmtp of every audio section.
+    ///
+    /// In single PC mode the client is the offerer for its own receive sections, and at
+    /// offer time it cannot know which remote publications are stereo — so the receive
+    /// preference is declared unconditionally, mirroring client-sdk-js (which munges every
+    /// local offer) and rust-sdks (`munge_stereo_for_audio`). Dual-PC offers don't take
+    /// this path: receive negotiation happens in the subscriber answer munge above, and a
+    /// publisher offer's send-only sections gain nothing from a receive preference.
+    nonisolated static func mungeOpusStereoForAllAudio(_ sdp: String) -> String {
+        var document = SDP(parsing: sdp)
+        for index in document.mediaSections.indices {
+            let section = document.mediaSections[index]
+            guard section.mediaType == "audio",
+                  let payload = section.payload(forCodec: "opus") else { continue }
+            document.mediaSections[index].appendFmtpParameter("stereo=1", forPayload: payload)
+        }
+        return document.write()
+    }
+
+    /// Video codecs libwebrtc reads `x-google-start-bitrate` from.
+    nonisolated static let startBitrateCodecs: Set<String> = ["VP8", "VP9", "AV1", "H264", "H265"]
+
+    /// Largest start bitrate hinted for a non-screen-share track, in kbps. Stops the
+    /// bandwidth estimator from opening too aggressively on high-bitrate (e.g. 4K) tracks.
+    nonisolated static let maxStartBitrateKbps = 1000
+
+    /// Start bitrate hinted to libwebrtc's bandwidth estimator for a video sender whose
+    /// encodings total `targetBps`, or `nil` to leave libwebrtc's default in place.
+    ///
+    /// libwebrtc starts every new video send stream at roughly 300 kbps and ramps up from
+    /// there, regardless of the encodings' `maxBitrate`, so the first seconds of a published
+    /// track are visibly blurry. The hint is 90% of the target bitrate: high enough to skip
+    /// most of the ramp, with headroom for the estimator to settle. The same multiplier is
+    /// used for every codec because the target already reflects the codec's efficiency.
+    /// Camera and other sources are capped at ``maxStartBitrateKbps``; screen share is not,
+    /// because its content needs the bitrate immediately to be legible. Targets under
+    /// 300 kbps get no hint: below that, seeding above the real capacity costs more than the
+    /// ramp it saves.
+    ///
+    /// Same formula as client-sdk-js (`computeTrackStartBitrate`), rust-sdks
+    /// (`compute_start_bitrate_kbps`) and client-sdk-android (`computeTrackStartBitrate`).
+    nonisolated static func startBitrateKbps(targetBps: Int, isScreenShare: Bool) -> Int? {
+        let targetKbps = targetBps / 1000
+        guard targetKbps >= 300 else { return nil }
+        let startKbps = Int((Double(targetKbps) * 0.9).rounded())
+        return isScreenShare ? startKbps : min(startKbps, maxStartBitrateKbps)
+    }
+
+    /// ``startBitrateKbps(targetBps:isScreenShare:)`` for a sender's encodings: the target is
+    /// the sum of the active encodings' `maxBitrate` — every simulcast layer, since they are
+    /// independent streams the estimator has to fund together; for a single (or SVC) encoding
+    /// that is simply its own `maxBitrate`. Encodings without a `maxBitrate` contribute
+    /// nothing, so a track that declares none gets no hint.
+    nonisolated static func startBitrateKbps(for encodings: [LKRTCRtpEncodingParameters], isScreenShare: Bool) -> Int? {
+        let targetBps = encodings.filter(\.isActive).compactMap { $0.maxBitrateBps?.intValue }.reduce(0, +)
+        return startBitrateKbps(targetBps: targetBps, isScreenShare: isScreenShare)
+    }
+
+    /// Whether `section` is a video section that can carry local media. `recvonly` and
+    /// `inactive` are the only directions that cannot, and are exactly where a subscribed,
+    /// pre-populated or unpublished section lands; `sendonly`, `sendrecv` and an omitted
+    /// direction (which defaults to `sendrecv`, RFC 8866 §6.7) all send.
+    nonisolated static func isSendingVideoSection(_ section: SDPMediaSection) -> Bool {
+        section.mediaType == "video" && section.direction != .recvonly && section.direction != .inactive
+    }
+
+    /// The single start bitrate for the peer connection described by `document`: the largest
+    /// hint among its sending video sections whose `a=msid` track id — which libwebrtc sets
+    /// to the sender id — is a key of `kbpsBySenderId`.
+    ///
+    /// libwebrtc reads `x-google-start-bitrate` per m-section but applies it to the shared
+    /// `Call` (`WebRtcVideoSendChannel::ApplyChangedParams` → `SetSdpBitrateParameters`),
+    /// where `RtpBitrateConfigurator` holds one config for the whole peer connection.
+    /// Differing per-section values are therefore last-writer-wins in m-section order — a
+    /// camera capped at 1 Mbps and an uncapped screen share in one offer would seed the
+    /// estimator from whichever section libwebrtc applies last — so every video section is
+    /// given the same number instead.
+    ///
+    /// Only sending sections count: a section that stays in the SDP after its track was
+    /// removed keeps its `a=msid` but sends nothing, and must neither contribute a stale
+    /// target nor consume the one-shot hint.
+    nonisolated static func connectionStartBitrateKbps(for document: SDP, kbpsBySenderId: [String: Int]) -> Int? {
+        document.mediaSections.lazy
+            .filter(isSendingVideoSection)
+            .compactMap { $0.msidTrackId.flatMap { kbpsBySenderId[$0] } }
+            .max()
+    }
+
+    /// Munge the offer to declare `x-google-start-bitrate=<kbps>` — the connection-level value
+    /// from ``connectionStartBitrateKbps(for:kbpsBySenderId:)`` — on every video codec's fmtp
+    /// of every sending video section, inserting an fmtp line for payloads (typically VP8)
+    /// that have none and replacing an existing value. libwebrtc only reads the selected send
+    /// codec's fmtp, so the other codecs' entries are harmless and keep the value uniform
+    /// should the send codec change. An SDP with no sending video, no mapped sender or no
+    /// hint is returned unmodified.
+    ///
+    /// `x-google-max-bitrate` is deliberately never written: the same `Call`-level promotion
+    /// would turn a per-track cap into a ceiling on the connection's total send bandwidth,
+    /// starving concurrent tracks. Per-track and per-layer caps belong in the encodings'
+    /// `maxBitrateBps`, which is scoped per encoding.
+    ///
+    /// Same behaviour as client-sdk-js (`PCTransport.computeConnectionStartBitrate`),
+    /// rust-sdks (`PeerTransport::create_and_send_offer`) and client-sdk-android
+    /// (`PeerConnectionTransport.ensureCodecBitrates`).
+    nonisolated static func mungeVideoStartBitrate(_ sdp: String, kbpsBySenderId: [String: Int]) -> String {
+        guard !kbpsBySenderId.isEmpty else { return sdp }
+        var document = SDP(parsing: sdp)
+        guard let kbps = connectionStartBitrateKbps(for: document, kbpsBySenderId: kbpsBySenderId) else { return sdp }
+        var modified = false
+        for index in document.mediaSections.indices where isSendingVideoSection(document.mediaSections[index]) {
+            for rtpmap in document.mediaSections[index].rtpmaps where startBitrateCodecs.contains(rtpmap.codec.uppercased()) {
+                if document.mediaSections[index].setFmtpParameter("x-google-start-bitrate", value: "\(kbps)", forPayload: rtpmap.payload) {
+                    modified = true
+                }
+            }
+        }
+        return modified ? document.write() : sdp
+    }
+
+    /// Whether any video section of `sdp` declares `x-google-start-bitrate`. Checked on the
+    /// description libwebrtc accepted, since a rejected munge is dropped rather than applied.
+    nonisolated static func carriesVideoStartBitrate(_ sdp: String) -> Bool {
+        SDP(parsing: sdp).mediaSections.contains { section in
+            section.mediaType == "video" && section.fmtps.contains { fmtp in
+                fmtp.parameters.contains { $0.hasPrefix("x-google-start-bitrate=") }
+            }
+        }
+    }
+
+    /// Applies `munges` composed left-to-right and sets the result as the local
+    /// description. libwebrtc validates munged SDP and rejects some munging types
+    /// outright (`IsSdpMungingAllowed`, expanding via field-trial kill switches);
+    /// a rejected set leaves the peer connection state untouched, so on rejection
+    /// the last munge is dropped and the set retried. Order munges most-required
+    /// first: a rejected optional munge then cannot revert the ones before it.
+    /// A no-op composition sets `original` directly, so nothing munged is ever
+    /// offered to libwebrtc. Returns the description that was applied — the one
+    /// to signal, since signalling a rejected munge would advertise parameters
+    /// the peer connection was never configured with.
+    func set(localDescription original: LKRTCSessionDescription,
+             munging munges: [(String) -> String]) async throws -> LKRTCSessionDescription
     {
+        let mungedSDP = munges.reduce(original.sdp) { $1($0) }
+        guard mungedSDP != original.sdp else {
+            try await set(localDescription: original)
+            return original
+        }
         do {
+            let munged = RTC.createSessionDescription(type: original.type, sdp: mungedSDP)
             try await set(localDescription: munged)
             return munged
         } catch {
-            log("Munged local description was rejected, falling back to the original: \(error)", .warning)
-            try await set(localDescription: original)
-            return original
+            log("Munged local description was rejected, dropping the last munge and retrying: \(error)", .warning)
+            return try await set(localDescription: original, munging: Array(munges.dropLast()))
         }
     }
 }
@@ -264,20 +577,44 @@ extension Transport {
 // MARK: - Stats
 
 extension Transport {
-    func statistics(for sender: LKRTCRtpSender) async -> LKRTCStatisticsReport {
-        await withCheckedContinuation { (continuation: CheckedContinuation<LKRTCStatisticsReport, Never>) in
-            _pc.statistics(for: sender) { sd in
+    func statistics(for sender: RTCSender) async -> LKRTCStatisticsReport {
+        let raw = sender.raw
+        return await withCheckedContinuation { (continuation: CheckedContinuation<LKRTCStatisticsReport, Never>) in
+            _pc.statistics(for: raw) { @Sendable sd in
                 continuation.resume(returning: sd)
             }
         }
     }
 
-    func statistics(for receiver: LKRTCRtpReceiver) async -> LKRTCStatisticsReport {
-        await withCheckedContinuation { (continuation: CheckedContinuation<LKRTCStatisticsReport, Never>) in
-            _pc.statistics(for: receiver) { sd in
+    func statistics(for receiver: RTCReceiver) async -> LKRTCStatisticsReport {
+        let raw = receiver.raw
+        return await withCheckedContinuation { (continuation: CheckedContinuation<LKRTCStatisticsReport, Never>) in
+            _pc.statistics(for: raw) { @Sendable sd in
                 continuation.resume(returning: sd)
             }
         }
+    }
+
+    /// WordPlus Mesh (1.0.7, rtc-client 1.0.16's meshStats.ts): the whole connection's stats, one gathering libwebrtc
+    /// makes for every sender and receiver at once (a reading for one of them gathers the same and keeps its part).
+    func statistics() async -> LKRTCStatisticsReport {
+        await withCheckedContinuation { (continuation: CheckedContinuation<LKRTCStatisticsReport, Never>) in
+            _pc.statistics { @Sendable sd in
+                continuation.resume(returning: sd)
+            }
+        }
+    }
+
+    /// WordPlus Mesh (1.0.7): the mid of the transceiver a sender is on, by which its outbound streams are named in the
+    /// connection's stats; nil before negotiation, or for a sender this connection hasn't.
+    func mid(of sender: RTCSender) -> String? {
+        _pc.transceivers.first { $0.sender.senderId == sender.senderId }?.mid
+    }
+
+    /// WordPlus Mesh (1.0.7): how many of this connection's senders send the track (a backup codec's sends its
+    /// primary's), which tells whether a track's media source names one sender's streams.
+    func senderCount(ofTrack trackId: String) -> Int {
+        _pc.senders.filter { $0.track?.trackId == trackId }.count
     }
 }
 
@@ -290,7 +627,9 @@ extension Transport: LKRTCPeerConnectionDelegate {
     }
 
     nonisolated func peerConnection(_: LKRTCPeerConnection, didGenerate candidate: LKRTCIceCandidate) {
-        _delegate.notify { $0.transport(self, didGenerateIceCandidate: candidate.toLKType()) }
+        // Convert on the signaling thread so the raw candidate never crosses isolation.
+        let iceCandidate = candidate.toLKType()
+        _delegate.notify { $0.transport(self, didGenerateIceCandidate: iceCandidate) }
     }
 
     nonisolated func peerConnectionShouldNegotiate(_: LKRTCPeerConnection) {
@@ -305,7 +644,12 @@ extension Transport: LKRTCPeerConnectionDelegate {
         }
 
         log("type: \(type(of: track)), track.id: \(track.trackId), streams: \(streams.map { "Stream(hash: \($0.hash), id: \($0.streamId), videoTracks: \($0.videoTracks.count), audioTracks: \($0.audioTracks.count))" })")
-        _delegate.notify { $0.transport(self, didAddTrack: track, rtpReceiver: rtpReceiver, streams: streams) }
+        let receiver = RTCReceiver(rtpReceiver)
+        let mediaTrack = RTCMediaTrack(track)
+        // Only the ids travel on: the streams' blocking proxy destructors run here, on the
+        // signaling thread, instead of wherever the delegate pipeline drops them.
+        let streamIds = streams.map(\.streamId)
+        _delegate.notify { $0.transport(self, didAddTrack: mediaTrack, rtpReceiver: receiver, streamIds: streamIds) }
     }
 
     nonisolated func peerConnection(_: LKRTCPeerConnection, didRemove rtpReceiver: LKRTCRtpReceiver) {
@@ -314,8 +658,11 @@ extension Transport: LKRTCPeerConnectionDelegate {
             return
         }
 
-        log("didRemove track: \(track.trackId)")
-        _delegate.notify { $0.transport(self, didRemoveTrack: track) }
+        // Only the id travels on: nothing downstream needs the proxy, and boxing it here would
+        // add a release to park for a track that is already gone.
+        let trackId = track.trackId
+        log("didRemove track: \(trackId)")
+        _delegate.notify { $0.transport(self, didRemoveTrackWithId: trackId) }
     }
 
     nonisolated func peerConnection(_: LKRTCPeerConnection, didOpen dataChannel: LKRTCDataChannel) {
@@ -341,7 +688,7 @@ extension Transport {
                                                      optionalConstraints: nil)
 
         return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<LKRTCSessionDescription, Error>) in
-            _pc.offer(for: mediaConstraints) { sd, error in
+            _pc.offer(for: mediaConstraints) { @Sendable sd, error in
                 if let error {
                     continuation.resume(throwing: error)
                 } else if let sd {
@@ -358,7 +705,7 @@ extension Transport {
                                                      optionalConstraints: nil)
 
         return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<LKRTCSessionDescription, Error>) in
-            _pc.answer(for: mediaConstraints) { sd, error in
+            _pc.answer(for: mediaConstraints) { @Sendable sd, error in
                 if let error {
                     continuation.resume(throwing: error)
                 } else if let sd {
@@ -372,7 +719,7 @@ extension Transport {
 
     func set(localDescription sd: LKRTCSessionDescription) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            _pc.setLocalDescription(sd) { error in
+            _pc.setLocalDescription(sd) { @Sendable error in
                 if let error {
                     continuation.resume(throwing: error)
                 } else {
@@ -382,11 +729,24 @@ extension Transport {
         }
     }
 
+    /// `startBitrateKbps` (see ``startBitrateKbps(targetBps:isScreenShare:)``) is recorded
+    /// against the new sender here, before returning, so the offer libwebrtc asks for in
+    /// response to this call cannot be created without it. It only matters until the
+    /// connection-level hint has been written once (``mungeVideoStartBitrate(_:kbpsBySenderId:)``).
     func addTransceiver(with track: LKRTCMediaStreamTrack,
-                        transceiverInit: LKRTCRtpTransceiverInit) throws -> LKRTCRtpTransceiver
+                        transceiverInit: LKRTCRtpTransceiverInit,
+                        startBitrateKbps: Int? = nil) throws -> LKRTCRtpTransceiver
     {
+        guard !_isClosed else {
+            throw LiveKitError(.invalidState, message: "Transport is closed")
+        }
+
         guard let transceiver = _pc.addTransceiver(with: track, init: transceiverInit) else {
             throw LiveKitError(.webRTC, message: "Failed to add transceiver")
+        }
+
+        if let startBitrateKbps {
+            _startBitrateKbpsBySenderId[transceiver.sender.senderId] = startBitrateKbps
         }
 
         return transceiver
@@ -395,6 +755,10 @@ extension Transport {
     func addTransceiver(ofType mediaType: LKRTCRtpMediaType,
                         transceiverInit: LKRTCRtpTransceiverInit) throws -> LKRTCRtpTransceiver
     {
+        guard !_isClosed else {
+            throw LiveKitError(.invalidState, message: "Transport is closed")
+        }
+
         guard let transceiver = _pc.addTransceiver(of: mediaType, init: transceiverInit) else {
             throw LiveKitError(.webRTC, message: "Failed to add transceiver")
         }
@@ -402,23 +766,29 @@ extension Transport {
         return transceiver
     }
 
-    func remove(track sender: LKRTCRtpSender) throws {
-        guard _pc.removeTrack(sender) else {
+    func remove(track sender: RTCSender) throws {
+        let raw = sender.raw
+        guard _pc.removeTrack(raw) else {
             throw LiveKitError(.webRTC, message: "Failed to remove track")
         }
+        _startBitrateKbpsBySenderId.removeValue(forKey: sender.senderId)
 
-        releaseTransceiver(sender: sender)
+        releaseTransceiver(sender: raw)
     }
 
     // Try to stop the transceiver and free the resources
     // Workaround: https://groups.google.com/g/discuss-webrtc/c/WDsGuVucBjQ?pli=1
     private func releaseTransceiver(sender: LKRTCRtpSender) {
         if let transceiver = _pc.transceivers.first(where: { $0.sender == sender }),
-           transceiver.mediaType == .video, !transceiver.isStopped
+           !transceiver.isStopped
         {
-            log("Stopping video transceiver", .debug)
+            log("Stopping transceiver", .debug)
             transceiver.stopInternal()
         }
+    }
+
+    var unstoppedTransceiverCount: Int {
+        _pc.transceivers.filter { !$0.isStopped }.count
     }
 
     func dataChannel(for label: String,

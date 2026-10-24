@@ -39,6 +39,27 @@ public class RemoteTrackPublication: TrackPublication, @unchecked Sendable {
     // this must be on .main queue
     private var _asTimer = AsyncTimer(interval: 0.3)
 
+    /// WordPlus Mesh (1.0.8, rtc-client 1.0.17): while this device has the track turned off (its view hidden or gone,
+    /// `set(enabled: false)`), since when; and when it last turned it back on (ms since 1970), so the gap it made isn't
+    /// told as the call's (MeshReceivers)
+    struct MeshTurns: Sendable {
+        var offAt: Double?
+        var onAt: Double?
+
+        mutating func sent(enabled: Bool, at now: Double) {
+            if !enabled {
+                offAt = offAt ?? now
+            } else if offAt != nil {
+                offAt = nil
+                onAt = now
+            }
+        }
+    }
+
+    let _meshTurns = StateSync(MeshTurns())
+
+    var meshOnAt: Double? { _meshTurns.onAt }
+
     override func updateFromInfo(info: Livekit_TrackInfo) {
         super.updateFromInfo(info: info)
         track?.set(muted: info.muted)
@@ -290,6 +311,7 @@ extension RemoteTrackPublication {
         do {
             try await room.signalClient.sendUpdateTrackSettings(trackSid: sid, settings: newValue)
             _state.mutate { $0.isSendingTrackSettings = false }
+            _meshTurns.mutate { $0.sent(enabled: newValue.isEnabled, at: Date().timeIntervalSince1970 * 1000) }
         } catch {
             // Revert track settings on failure
             _state.mutate {
@@ -374,9 +396,9 @@ extension RemoteTrackPublication {
             log("[adaptiveStream] disabling sid: \(sid), videoRenderersCount: \(videoRenderers.count), \(viewsString)")
         }
 
-        if let videoTrack = track?.mediaTrack as? LKRTCVideoTrack {
+        if let mediaTrack = track?.mediaTrack, mediaTrack.kind == kLKRTCMediaStreamTrackKindVideo {
             log("VideoTrack.shouldReceive: \(isEnabled)")
-            DispatchQueue.liveKitWebRTC.sync { videoTrack.shouldReceive = isEnabled }
+            await RTC.run { (mediaTrack.raw as? LKRTCVideoTrack)?.shouldReceive = isEnabled }
         }
 
         do {

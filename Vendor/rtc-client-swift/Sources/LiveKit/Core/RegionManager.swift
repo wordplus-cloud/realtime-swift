@@ -129,10 +129,18 @@ actor RegionManager: Loggable {
         _ = startSettingsFetchIfNeeded(token: token)
     }
 
-    func resolveBest(token: String) async throws -> RegionInfo {
+    /// The best region still worth trying, or `nil` once every region has been marked failed.
+    ///
+    /// Exhaustion is a `nil` result rather than a thrown error so callers can tell it apart from a
+    /// failure to fetch or parse the region settings, which still throws `.regionManager`. The
+    /// failover loop needs that distinction: on exhaustion it is holding the connection error that
+    /// drove it there, and that error — a 403 the server explained — is what the caller needs, not
+    /// "No more remaining regions."
+    func resolveBest(token: String) async throws -> RegionInfo? {
         try await requestSettingsIfNeeded(token: token)
         guard let selected = state.remaining.first else {
-            throw LiveKitError(.regionManager, message: "No more remaining regions.")
+            log("[Region] No remaining regions to try", .debug)
+            return nil
         }
 
         log("[Region] Resolved region: \(String(describing: selected))", .debug)
@@ -213,8 +221,18 @@ actor RegionManager: Loggable {
 
     private func applyFetchedRegions(_ allRegions: [RegionInfo]) {
         log("[Region] all regions: \(String(describing: allRegions))", .debug)
+
+        // Failed regions stay excluded across a refresh, matching
+        // ``updateFromServerReportedRegions``. Resetting `remaining` to every region here would
+        // refill the list from inside the failover loop: once per-region failure takes longer than
+        // `cacheInterval`, the refresh puts regions back faster than `markFailed` removes them and
+        // the loop never exhausts. `resetAttempts()` is what deliberately clears the failed set,
+        // at the start of a new connect.
+        let failedRegionIds = Set(state.all.map(\.regionId))
+            .subtracting(state.remaining.map(\.regionId))
+
         state.all = allRegions
-        state.remaining = allRegions
+        state.remaining = allRegions.filter { !failedRegionIds.contains($0.regionId) }
         state.lastRequested = Date()
     }
 
@@ -240,22 +258,42 @@ actor RegionManager: Loggable {
 
         let statusCode = httpResponse.statusCode
         guard (200 ..< 300).contains(statusCode) else {
-            let rawBody = String(data: data, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let body = if let rawBody, !rawBody.isEmpty {
-                rawBody.count > 1024 ? String(rawBody.prefix(1024)) + "..." : rawBody
-            } else {
-                "(No server message)"
-            }
+            let details = "HTTP \(statusCode): \(HTTP.describeErrorBody(data))"
 
             if (400 ..< 500).contains(statusCode) {
-                throw LiveKitError(.validation, message: "Region settings error: HTTP \(statusCode): \(body)")
+                throw LiveKitError(.validation, message: "Region settings error: \(details)")
             }
 
-            throw LiveKitError(.regionManager, message: "Failed to fetch region settings: HTTP \(statusCode): \(body)")
+            throw LiveKitError(.regionManager, message: "Failed to fetch region settings: \(details)")
         }
 
         return data
+    }
+
+    /// Cloud region settings arrive as JSON over HTTPS; the nanopb-backed
+    /// protocol layer has no JSON codec, so this endpoint is decoded with a
+    /// Codable mirror of `livekit.RegionSettings`.
+    private struct RegionSettingsJSON: Decodable {
+        struct Region: Decodable {
+            var region: String?
+            var url: String?
+            // proto3 JSON serializes int64 as a string; accept both.
+            var distance: FlexibleInt64?
+        }
+
+        struct FlexibleInt64: Decodable {
+            var value: Int64
+            init(from decoder: Decoder) throws {
+                let container = try decoder.singleValueContainer()
+                if let number = try? container.decode(Int64.self) {
+                    value = number
+                } else {
+                    value = try Int64(container.decode(String.self)) ?? 0
+                }
+            }
+        }
+
+        var regions: [Region]?
     }
 
     private nonisolated static func parseRegionSettings(data: Data) throws -> [RegionInfo] {
@@ -263,8 +301,14 @@ actor RegionManager: Loggable {
         if let regions = Mesh.regions(json: data) { return regions }
 
         do {
-            let regionSettings = try Livekit_RegionSettings(jsonUTF8Data: data)
-            let allRegions = regionSettings.regions.compactMap { $0.toLKType() }
+            let json = try JSONDecoder().decode(RegionSettingsJSON.self, from: data)
+            let allRegions = (json.regions ?? []).compactMap { region in
+                Livekit_RegionInfo.with {
+                    $0.region = region.region ?? ""
+                    $0.url = region.url ?? ""
+                    $0.distance = region.distance?.value ?? 0
+                }.toLKType()
+            }
             guard !allRegions.isEmpty else {
                 throw LiveKitError(.regionManager, message: "Fetched region data is empty.")
             }

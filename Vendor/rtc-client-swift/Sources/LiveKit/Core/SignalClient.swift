@@ -23,7 +23,7 @@ internal import LiveKitWebRTC
 actor SignalClient: Loggable {
     // MARK: - Types
 
-    typealias AddTrackRequestPopulator = @Sendable (inout Livekit_AddTrackRequest) throws -> Void
+    typealias AddTrackRequestPopulator = @Sendable (inout Livekit_AddTrackRequest.Builder) throws -> Void
 
     enum ConnectResponse {
         case join(Livekit_JoinResponse)
@@ -42,6 +42,14 @@ actor SignalClient: Loggable {
             case let .reconnect(response): response.clientConfiguration
             }
         }
+    }
+
+    /// A response handed over as received, for consumers that decode the wire format themselves.
+    ///
+    /// Delivered after the decoded form of the same message, so the room has already applied it.
+    enum EncodedResponse {
+        case join(Data)
+        case participantUpdate(Data)
     }
 
     // MARK: - Public
@@ -76,10 +84,14 @@ actor SignalClient: Loggable {
         }
     })
 
-    private lazy var _responseQueue = QueueActor<Livekit_SignalResponse>(onProcess: { [weak self] response in
+    // Queued with the bytes it arrived as, not just the decoded form: consumers that parse the
+    // wire format themselves (the data track managers) need the original encoding, and
+    // re-encoding our decoded copy would drop every field this client's protocol pin doesn't
+    // know — nanopb discards unknown fields on decode.
+    private lazy var _responseQueue = QueueActor<(response: Livekit_SignalResponse, encoded: Data)>(onProcess: { [weak self] element in
         guard let self else { return }
 
-        await _process(signalResponse: response)
+        await _process(element.response, encoded: element.encoded)
     })
 
     private let _connectResponseCompleter = AsyncCompleter<ConnectResponse>(label: "Join response", defaultTimeout: .defaultJoinResponse)
@@ -94,12 +106,31 @@ actor SignalClient: Loggable {
         var messageLoopTask: AnyTaskCancellable?
         var lastJoinResponse: Livekit_JoinResponse?
         var rtt: Int64 = 0
+        // Set by cleanUp() until the next Join/ReconnectResponse; other messages in that window are dropped.
+        var isAwaitingConnectResponse: Bool = false
         // Tracks whether the v0 signal path (/rtc) is in use, set during connect.
         // Reused by reconnect to avoid re-attempting the unsupported v1 path.
         var useV0SignalPath: Bool = false
     }
 
     let _state = StateSync(State())
+
+    // The data-track managers parse signal responses themselves, so the ones they consume are
+    // forwarded as raw protobuf bytes. They drain through a single consumer task per connection,
+    // so the managers see them in wire order — a detached task per message could reorder e.g. a
+    // publish/unpublish response pair. The path deliberately bypasses `_responseQueue`: the
+    // managers own their reconnect semantics (republish, subscription re-requests, sync state)
+    // and consume wire order directly. Connection-scoped — started in `connect`, stopped in
+    // `cleanUp` — so messages still buffered from a dead connection are dropped, not applied to
+    // the next.
+    private var _dataTrackResponses: AsyncStream<Data>.Continuation?
+    private var _dataTrackResponsesConsumer: AnyTaskCancellable?
+
+    // Requests the SFU answers by echoing an id, keyed by it. The counter is shared so ids stay
+    // unique per connection; data blobs are the only user today. (Data track publishes also
+    // report failures through `RequestResponse`, but correlate on the echoed request instead.)
+    private var _nextRequestId: UInt32 = 0
+    private var _dataBlobCompleters: [UInt32: AsyncCompleter<Data>] = [:]
 
     init() {
         log()
@@ -122,6 +153,7 @@ actor SignalClient: Loggable {
                  participantSid: Participant.Sid? = nil,
                  adaptiveStream: Bool,
                  singlePeerConnection: Bool,
+                 publisherOffer: Livekit_SessionDescription? = nil,
                  connectSpan: Span? = nil) async throws -> ConnectResponse
     {
         await cleanUp()
@@ -135,7 +167,8 @@ actor SignalClient: Loggable {
                                           connectOptions: connectOptions,
                                           reconnectMode: reconnectMode,
                                           participantSid: participantSid,
-                                          adaptiveStream: adaptiveStream)
+                                          adaptiveStream: adaptiveStream,
+                                          publisherOffer: publisherOffer)
         } else {
             try Utils.buildUrl(url,
                                connectOptions: connectOptions,
@@ -167,12 +200,16 @@ actor SignalClient: Loggable {
                                                  ? Mesh.resumeWait(rttMs: _state.read { $0.rtt },
                                                                    cap: connectOptions?.socketConnectTimeoutInterval ?? .defaultSocketConnect)
                                                  : nil)
+            try Task.checkCancellation()
             connectSpan?.record("ws_open")
 
+            _state.mutate { $0.socket = socket }
+            startDataTrackResponses()
+
             let messageLoopTask = socket.subscribe(self) { observer, message in
-                await observer.onWebSocketMessage(message)
+                await observer.onWebSocketMessage(message, from: socket)
             } onFailure: { observer, error in
-                await observer.cleanUp(withError: error)
+                await observer.onWebSocketFailure(error, from: socket)
             }
             _state.mutate { $0.messageLoopTask = messageLoopTask }
 
@@ -181,10 +218,7 @@ actor SignalClient: Loggable {
             try Task.checkCancellation()
 
             // Successfully connected
-            _state.mutate {
-                $0.socket = socket
-                $0.connectionState = .connected
-            }
+            _state.mutate { $0.connectionState = .connected }
 
             return connectResponse
         } catch let connectionError {
@@ -245,9 +279,8 @@ actor SignalClient: Loggable {
     //
     // Only called from:
     //   Room.cleanUp()           ──► forwards disconnectError
-    //   subscribe() onFailure    ──► WebSocket error (guarded: suppressed when
-    //                                Task.isCancelled, preventing stale loops
-    //                                from tearing down a new connection)
+    //   onWebSocketFailure()     ──► WebSocket error (guarded by cancellation
+    //                                and socket identity)
     func cleanUp(withError disconnectError: Error? = nil) async {
         log("withError: \(String(describing: disconnectError))")
 
@@ -260,13 +293,19 @@ actor SignalClient: Loggable {
             $0.socket?.close()
             $0.socket = nil
             $0.lastJoinResponse = nil
+            $0.isAwaitingConnectResponse = true
         }
 
         _connectResponseCompleter.reset(throwing: disconnectError)
 
         await _addTrackCompleters.reset(throwing: disconnectError)
+        for completer in _dataBlobCompleters.values {
+            completer.reset(throwing: disconnectError)
+        }
+        _dataBlobCompleters.removeAll()
         await _requestQueue.clear()
         await _responseQueue.clear()
+        stopDataTrackResponses()
 
         _state.mutate {
             $0.disconnectError = LiveKitError.from(error: disconnectError)
@@ -288,7 +327,44 @@ private extension SignalClient {
         await _requestQueue.processIfResumed(request, elseEnqueue: request.canBeQueued())
     }
 
-    func onWebSocketMessage(_ message: URLSessionWebSocketTask.Message) async {
+    /// Starts delivering data-track responses for a new connection; see the property note.
+    func startDataTrackResponses() {
+        let (responses, continuation) = AsyncStream.makeStream(of: Data.self)
+        _dataTrackResponses = continuation
+        _dataTrackResponsesConsumer = Task { [weak self] in
+            for await data in responses {
+                guard let self else { break }
+                try? await _delegate.notifyAsync { await $0.signalClient(self, didReceiveDataTrackResponse: data) }
+            }
+        }.cancellable()
+    }
+
+    /// Stops delivery and drops anything still buffered from the connection being torn down
+    /// (releasing the consumer cancels it; finishing alone would let it drain the backlog).
+    func stopDataTrackResponses() {
+        _dataTrackResponses?.finish()
+        _dataTrackResponses = nil
+        _dataTrackResponsesConsumer = nil
+    }
+}
+
+extension SignalClient {
+    func onWebSocketFailure(_ error: Error, from socket: WebSocket) async {
+        guard !Task.isCancelled, _state.socket === socket else { return }
+        await cleanUp(withError: error)
+    }
+
+    func onWebSocketMessage(_ message: URLSessionWebSocketTask.Message, from socket: WebSocket) async {
+        guard !Task.isCancelled, _state.socket === socket else { return }
+
+        // The server mirrors the client's encoding and this SDK has sent
+        // binary protobuf since 2021, so text (JSON) frames cannot occur
+        // against livekit-server; they are unsupported here (as on Android).
+        if case .string = message {
+            log("Received JSON signal message, unsupported in this version.", .warning)
+            return
+        }
+
         // WordPlus Mesh: a node sends its region list once the client is in, again whenever the mesh's nodes
         // change, and every 2 minutes, in a field upstream's protocol hasn't got.
         if case let .data(data) = message, let regions = Mesh.regions(inSignalMessage: data) {
@@ -297,15 +373,30 @@ private extension SignalClient {
             return
         }
 
-        let response: Livekit_SignalResponse? = switch message {
-        case let .data(data): try? Livekit_SignalResponse(serializedBytes: data)
-        case let .string(string): try? Livekit_SignalResponse(jsonString: string)
-        default: nil
+        // WordPlus Mesh (1.0.7, rtc-client 1.0.16): how often the node asks for the reports, in a response of its own
+        // (`Mesh.reportsField`), which nanopb would read as an empty message
+        if case let .data(data) = message, let every = Mesh.reportPace(inSignalMessage: data) {
+            log("report pace from the server: \(every) ms", .debug)
+            _delegate.notifyDetached { await $0.signalClient(self, didReceiveMeshReportPace: every) }
+            return
         }
 
-        guard let response else {
+        guard case let .data(rawData) = message,
+              let response = try? Livekit_SignalResponse(serializedBytes: rawData)
+        else {
             log("Failed to decode SignalResponse", .warning)
             return
+        }
+
+        guard passesConnectResponseGate(response) else { return }
+
+        // Forward only what the data-track managers consume; every other message would cross the
+        // FFI boundary just to be rejected as an unsupported type. `requestResponse` carries
+        // publish request errors, so it belongs here even though it isn't data-track-specific.
+        switch response.message {
+        case .requestResponse, .publishDataTrackResponse, .dataTrackSubscriberHandles:
+            _dataTrackResponses?.yield(rawData)
+        default: break
         }
 
         Task.detached {
@@ -314,12 +405,14 @@ private extension SignalClient {
             default: false
             }
             // Always process join or reconnect messages even if suspended...
-            await self._responseQueue.processIfResumed(response, or: alwaysProcess)
+            await self._responseQueue.processIfResumed((response: response, encoded: rawData), or: alwaysProcess)
         }
     }
+}
 
+private extension SignalClient {
     // swiftlint:disable:next cyclomatic_complexity function_body_length
-    func _process(signalResponse: Livekit_SignalResponse) async {
+    func _process(_ signalResponse: Livekit_SignalResponse, encoded: Data) async {
         guard connectionState != .disconnected else {
             log("connectionState is .disconnected", .error)
             return
@@ -332,8 +425,15 @@ private extension SignalClient {
 
         switch message {
         case let .join(joinResponse):
-            _state.mutate { $0.lastJoinResponse = joinResponse }
-            _delegate.notifyDetached { await $0.signalClient(self, didReceiveConnectResponse: .join(joinResponse)) }
+            // owned: the oneof getter hands out a view into the decoded
+            // `SignalResponse`, and this is kept for the whole session
+            _state.mutate { $0.lastJoinResponse = joinResponse.owned() }
+            // The encoded form second: consumers that parse the wire format themselves must see
+            // it only once the room has applied the decoded one. Ordered but not awaited — this
+            // runs on the response queue, so waiting here would put app delegate code in front
+            // of every later signal message.
+            _delegate.notifyDetached(inOrder: { await $0.signalClient(self, didReceiveConnectResponse: .join(joinResponse)) },
+                                     { await $0.signalClient(self, didReceiveEncodedResponse: .join(encoded)) })
             _connectResponseCompleter.resume(returning: .join(joinResponse))
             await _restartPingTimer()
 
@@ -355,10 +455,12 @@ private extension SignalClient {
                 return
             }
 
-            _delegate.notifyDetached { await $0.signalClient(self, didReceiveIceCandidate: rtcCandidate.toLKType(), target: trickle.target) }
+            let iceCandidate = rtcCandidate.toLKType()
+            _delegate.notifyDetached { await $0.signalClient(self, didReceiveIceCandidate: iceCandidate, target: trickle.target) }
 
         case let .update(update):
-            _delegate.notifyDetached { await $0.signalClient(self, didUpdateParticipants: update.participants) }
+            _delegate.notifyDetached(inOrder: { await $0.signalClient(self, didUpdateParticipants: update.participants) },
+                                     { await $0.signalClient(self, didReceiveEncodedResponse: .participantUpdate(encoded)) })
 
         case let .roomUpdate(update):
             _delegate.notifyDetached { await $0.signalClient(self, didUpdateRoom: update.room) }
@@ -417,6 +519,32 @@ private extension SignalClient {
         case let .mediaSectionsRequirement(requirement):
             _delegate.notifyDetached { await $0.signalClient(self, didReceiveMediaSectionsRequirement: requirement) }
 
+        case let .storeDataBlobResponse(response):
+            _dataBlobCompleters[response.requestID]?.resume(returning: Data())
+
+        case let .getDataBlobResponse(response):
+            _dataBlobCompleters[response.requestID]?.resume(returning: response.blob.contents)
+
+        case let .requestResponse(response):
+            // The failure half of the id-correlated requests above; success arrives as the typed
+            // response, so an acknowledgement (`ok`) or a progress report (`queued`) leaves the
+            // request waiting. Anything else arriving here is for a request that reports its own
+            // errors (data track publishes) or none.
+            let isFailure = response.reason != .ok && response.reason != .queued
+            if isFailure, let completer = _dataBlobCompleters[response.requestID] {
+                let message = response.message.isEmpty ? "Request rejected (reason \(response.reason.rawValue))" : response.message
+                completer.resume(throwing: LiveKitError(.invalidState, message: message))
+            }
+
+        case .publishDataTrackResponse, .dataTrackSubscriberHandles:
+            // Handled by the data-track subsystem via didReceiveDataTrackResponse.
+            break
+
+        case .unpublishDataTrackResponse:
+            // No data-track manager consumes this yet; unpublishes are tracked locally and, for
+            // remote tracks, through participant updates.
+            break
+
         // WordPlus Mesh (1.0.3): whether anyone hears a local audio track (LocalAudioTrack._setMeshHeard)
         case let .subscribedAudioCodecUpdate(update):
             _delegate.notifyDetached { await $0.signalClient(self, didUpdateSubscribedAudioCodecs: update.subscribedAudioCodecs,
@@ -435,21 +563,88 @@ extension SignalClient {
         await _responseQueue.resume()
         await _requestQueue.resume()
     }
+
+    /// Whether `response` passes the gate armed by `cleanUp()`; a Join/ReconnectResponse opens it.
+    func passesConnectResponseGate(_ response: Livekit_SignalResponse) -> Bool {
+        switch response.message {
+        case .join, .reconnect:
+            _state.mutate { $0.isAwaitingConnectResponse = false }
+        case .leave:
+            break
+        default:
+            if _state.isAwaitingConnectResponse {
+                log("Dropping signal message received before connect response: \(response.messageName)", .warning)
+                return false
+            }
+        }
+        return true
+    }
 }
 
 // MARK: - Send methods
 
 extension SignalClient {
-    /// WordPlus Mesh (1.0.3, rtc-client 1.0.10's `sendMeshEncoders`): the published videos' encoders, as JSON in a
-    /// request with no message of LiveKit's (`MeshEncoders.field`). Sent only while connected, never queued: the next
-    /// reading tells it again. Whether it went.
-    func sendMeshEncoders(_ json: Data) async -> Bool {
+    func sendRequest(_ request: Livekit_SignalRequest) async throws {
+        try await _sendRequest(request)
+    }
+
+    /// Stores a blob on the server under `key`, replacing nothing — a key can only be written once.
+    func sendStoreDataBlob(key: Livekit_DataBlobKey, contents: Data) async throws {
+        _ = try await _sendIdCorrelatedRequest { requestId in
+            Livekit_SignalRequest.with {
+                $0.storeDataBlobRequest = Livekit_StoreDataBlobRequest.with {
+                    $0.requestID = requestId
+                    $0.blob = Livekit_DataBlob.with {
+                        $0.key = key
+                        $0.contents = contents
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reads back a blob `participantIdentity` stored under `key`.
+    func sendGetDataBlob(key: Livekit_DataBlobKey, participantIdentity: String) async throws -> Data {
+        try await _sendIdCorrelatedRequest { requestId in
+            Livekit_SignalRequest.with {
+                $0.getDataBlobRequest = Livekit_GetDataBlobRequest.with {
+                    $0.requestID = requestId
+                    $0.participantIdentity = participantIdentity
+                    $0.key = key
+                }
+            }
+        }
+    }
+
+    /// Sends a request the SFU answers by echoing its id, and waits for that answer.
+    private func _sendIdCorrelatedRequest(_ build: (UInt32) -> Livekit_SignalRequest) async throws -> Data {
+        _nextRequestId += 1
+        let requestId = _nextRequestId
+        let completer = AsyncCompleter<Data>(label: "Signal request \(requestId)", defaultTimeout: .defaultDataBlobRequest)
+        _dataBlobCompleters[requestId] = completer
+        defer { _dataBlobCompleters[requestId] = nil }
+        try await _sendRequest(build(requestId))
+        return try await completer.wait()
+    }
+
+    /// WordPlus Mesh: a reading's reports in one request with no message of LiveKit's, each its JSON in a field of its
+    /// own: the published videos' encoders when they changed (1.0.3, `MeshEncoders.field`), what this client receives
+    /// as it plays it (1.0.6, `MeshReceivers.field`), and the device and the app (1.0.7, rtc-client 1.0.16's
+    /// `sendMeshReports`, `MeshHealth.field`). Until 1.0.7 the first two went in a request each; one is a message less for
+    /// the node every round. A node reads every field it knows of a request; one before 1.0.53 skips the health. Sent
+    /// only while connected, never queued: the next reading tells it again. Whether it went.
+    func sendMeshReports(encoders: Data?, receivers: Data?, health: Data?) async -> Bool {
+        var request = Data()
+        if let encoders { request += Mesh.lengthDelimited(MeshEncoders.field, encoders) }
+        if let receivers { request += Mesh.lengthDelimited(MeshReceivers.field, receivers) }
+        if let health { request += Mesh.lengthDelimited(MeshHealth.field, health) }
+        guard !request.isEmpty else { return true }
         guard connectionState == .connected, let socket = _state.socket else { return false }
         do {
-            try await socket.send(data: Mesh.lengthDelimited(MeshEncoders.field, json))
+            try await socket.send(data: request)
             return true
         } catch {
-            log("Could not send the encoders: \(error)", .debug)
+            log("Could not send the reports: \(error)", .debug)
             return false
         }
     }
@@ -499,15 +694,14 @@ extension SignalClient {
                       encryption: Livekit_Encryption.TypeEnum = .none,
                       _ populator: AddTrackRequestPopulator) async throws -> Livekit_TrackInfo
     {
-        var addTrackRequest = Livekit_AddTrackRequest.with {
+        let addTrackRequest = try Livekit_AddTrackRequest.with {
             $0.cid = cid
             $0.name = name
             $0.type = type
             $0.source = source
             $0.encryption = encryption
+            try populator(&$0)
         }
-
-        try populator(&addTrackRequest)
 
         let request = Livekit_SignalRequest.with {
             $0.addTrack = addTrackRequest
@@ -612,6 +806,7 @@ extension SignalClient {
                        offer: Livekit_SessionDescription?,
                        subscription: Livekit_UpdateSubscription,
                        publishTracks: [Livekit_TrackPublishedResponse]? = nil,
+                       publishDataTracks: [Livekit_PublishDataTrackResponse]? = nil,
                        dataChannels: [Livekit_DataChannelInfo]? = nil,
                        dataChannelReceiveStates: [Livekit_DataChannelReceiveState]? = nil) async throws
     {
@@ -625,6 +820,7 @@ extension SignalClient {
                 }
                 $0.subscription = subscription
                 $0.publishTracks = publishTracks ?? []
+                $0.publishDataTracks = publishDataTracks ?? []
                 $0.dataChannels = dataChannels ?? []
                 $0.datachannelReceiveStates = dataChannelReceiveStates ?? []
             }
@@ -750,6 +946,13 @@ private extension SignalClient {
             try await _onPingIntervalTimer()
         }
         _pingIntervalTimer.restart()
+    }
+}
+
+extension Livekit_SignalResponse {
+    /// The oneof case name only; payloads can carry credentials (`refreshToken`).
+    var messageName: String {
+        message.flatMap { Mirror(reflecting: $0).children.first?.label } ?? "unknown"
     }
 }
 

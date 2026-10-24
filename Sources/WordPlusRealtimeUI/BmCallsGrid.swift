@@ -82,6 +82,11 @@ final class BmCallsGrid: UIView, UIScrollViewDelegate {
 
     private final class Tile: UIView, TrackDelegate {
         let video = VideoView()
+        /// Over the picture while the person's camera changes codec
+        /// (`BmCallsCameraSwitch`), until the room hears the frame that ends
+        /// it: the web's "Optimizing video quality..." tile, in place of a
+        /// camera that looks turned off for a second.
+        let optimizing = BmCallsOptimizingView()
         /// Someone sharing their screen is still a face worth seeing, so the
         /// web insets their camera in the corner of the same tile
         /// (`.bm-small-video`: 72px tall, 8px in, a hairline of white).
@@ -206,6 +211,7 @@ final class BmCallsGrid: UIView, UIScrollViewDelegate {
             addSubview(picture)
             addSubview(initial)
             addSubview(dot)
+            addSubview(optimizing)
             addSubview(label)
             addSubview(handChip)
             addSubview(micChip)
@@ -223,6 +229,22 @@ final class BmCallsGrid: UIView, UIScrollViewDelegate {
             video.track = nil
             cameraInset.track = nil
             person = nil
+            optimizing.show(false, picture: nil)
+        }
+
+        /// The placeholder over a camera changing codec: up while the room
+        /// holds the person's camera as changing (the frame that ends it is the
+        /// room's to hear, so a renderer that stalls brings nothing back), and
+        /// never in a row or over a shared screen, which are not the camera.
+        /// Said to VoiceOver once a change per person, wherever their tile goes
+        /// meanwhile.
+        fileprivate func applyOptimizing() {
+            guard let who = person, !isRow, !showsScreen else {
+                optimizing.show(false, picture: nil)
+                return
+            }
+
+            optimizing.show(who.optimizing, picture: picture.image, key: who.identity)
         }
 
         /// The info line of a row. What sits above it is the picture, and how
@@ -402,8 +424,12 @@ final class BmCallsGrid: UIView, UIScrollViewDelegate {
                     self.picture.image = image
                     self.picture.isHidden = image == nil || (!self.isRow && !self.video.isHidden)
                     self.initial.isHidden = image != nil || (!self.isRow && !self.video.isHidden)
+                    // The placeholder's backdrop is the same face, blurred.
+                    if self.optimizing.isUp { self.applyOptimizing() }
                 }
             }
+
+            applyOptimizing()
 
             // The host's own view over the tile, where it gives one (BmCallsPieces): the same view again stays.
             let own = BmCallsPiecesStore.current.tile?(who)
@@ -423,6 +449,8 @@ final class BmCallsGrid: UIView, UIScrollViewDelegate {
             super.layoutSubviews()
 
             if isRow { layoutRow() } else { layoutTile() }
+
+            optimizing.frame = bounds
 
             if let piece {
                 piece.frame = bounds
@@ -587,6 +615,10 @@ final class BmCallsGrid: UIView, UIScrollViewDelegate {
     /// How many of them are the web's "primary" row — pinned, or speaking in a
     /// broadcast. They are the first cells, so a count is all the layout needs.
     private var primaryCount = 0
+    /// Whose camera changing codec VoiceOver has heard of, shared by every
+    /// tile: a person's tile moves to another place in the grid as the order
+    /// changes, and the same change is said once, not once a tile.
+    private let optimizingSaid = BmCallsOptimizingSaid()
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -616,6 +648,7 @@ final class BmCallsGrid: UIView, UIScrollViewDelegate {
             tiles = []
             cells = []
             primaryCount = 0
+            optimizingSaid.keep([])
             return
         }
 
@@ -643,9 +676,13 @@ final class BmCallsGrid: UIView, UIScrollViewDelegate {
             // And its order for the rest: anyone with a picture first, then
             // whoever is talking, then everybody else — a phone shows very few
             // tiles, so what is in them matters more than anywhere else.
-            let seen = rest.filter { $0.video != nil || $0.screen != nil }
-            let heard = rest.filter { $0.video == nil && $0.screen == nil && $0.speaking }
-            let quiet = rest.filter { $0.video == nil && $0.screen == nil && !$0.speaking }
+            // A camera changing codec is still a picture: its tile keeps its
+            // place under the placeholder rather than dropping down the grid
+            // for the second the camera is away.
+            let pictured: (BmCallsRoomParticipant) -> Bool = { $0.video != nil || $0.screen != nil || $0.optimizing }
+            let seen = rest.filter { pictured($0) }
+            let heard = rest.filter { !pictured($0) && $0.speaking }
+            let quiet = rest.filter { !pictured($0) && !$0.speaking }
 
             // And your own tile last, wherever the ordering above left it.
             // The web moves it to the end of the page for the same reason —
@@ -671,6 +708,7 @@ final class BmCallsGrid: UIView, UIScrollViewDelegate {
             let tile = Tile()
 
             tile.isRow = audioRoom
+            tile.optimizing.said = optimizingSaid
 
             // A picture reporting its shape changes how much room its tile
             // wants, and that is worked out here rather than in the tile.
@@ -693,6 +731,10 @@ final class BmCallsGrid: UIView, UIScrollViewDelegate {
         }
 
         rebind()
+
+        // Whoever's camera is no longer changing may be told of the next
+        // change.
+        optimizingSaid.keep(Set(participants.filter(\.optimizing).map(\.identity)))
     }
 
     /// Redraw what is already there. Presence moves while a call runs and

@@ -14,13 +14,51 @@
  * limitations under the License.
  */
 
+import Foundation
+
 internal import LiveKitWebRTC
 
 @objcMembers
 public class RemoteParticipant: Participant, @unchecked Sendable {
+    /// Data tracks published by this participant, keyed by track name.
+    ///
+    /// Names are the stable identifier: a track's SID rotates when the publisher republishes
+    /// after a full reconnect (the track object itself survives).
+    public var dataTracks: [String: RemoteDataTrack] {
+        _state.dataTracks.reduce(into: [:]) { $0[$1.name] = $1 }
+    }
+
     init(info: Livekit_ParticipantInfo, room: Room, connectionState: ConnectionState) {
         super.init(room: room, sid: Participant.Sid(from: info.sid), identity: Participant.Identity(from: info.identity))
         set(info: info, connectionState: connectionState)
+    }
+
+    /// Adds the track, returning `false` if this exact track is already attached. Identity-based
+    /// so it stays race-free while the track's SID is being reassigned by the manager.
+    @discardableResult
+    func addDataTrack(_ track: RemoteDataTrack) -> Bool {
+        _state.mutate {
+            guard !$0.dataTracks.contains(where: { $0 === track }) else { return false }
+            $0.dataTracks.append(track)
+            return true
+        }
+    }
+
+    @discardableResult
+    func removeDataTrack(sid: DataTrack.Sid) -> RemoteDataTrack? {
+        // `info` crosses the FFI boundary, so resolve the track before taking the state lock.
+        guard let track = _state.dataTracks.first(where: { $0.info.sid == sid }) else { return nil }
+        return _state.mutate {
+            guard let index = $0.dataTracks.firstIndex(where: { $0 === track }) else { return nil }
+            return $0.dataTracks.remove(at: index)
+        }
+    }
+
+    /// Drops the data tracks without notifying, for when they outlive this participant object: a
+    /// full reconnect recreates participants, but the data track subsystem keeps its tracks and
+    /// re-attaches them, so they were never really unpublished.
+    func detachDataTracks() {
+        _state.mutate { $0.dataTracks = [] }
     }
 
     override func set(info: Livekit_ParticipantInfo, connectionState: ConnectionState) {
@@ -73,42 +111,49 @@ public class RemoteParticipant: Participant, @unchecked Sendable {
         }
     }
 
-    func addSubscribedMediaTrack(rtcTrack: LKRTCMediaStreamTrack, rtpReceiver: LKRTCRtpReceiver, trackSid: Track.Sid) async throws {
+    private func notifyDidFailToSubscribe(trackSid: Track.Sid, room: Room, message: String) -> LiveKitError {
+        let error = LiveKitError(.invalidState, message: message)
+        delegates.notify(label: { "participant.didFailToSubscribe trackSid: \(trackSid)" }) {
+            $0.participant?(self, didFailToSubscribeTrackWithSid: trackSid, error: error)
+        }
+        room.delegates.notify(label: { "room.didFailToSubscribe trackSid: \(trackSid)" }) {
+            $0.room?(room, participant: self, didFailToSubscribeTrackWithSid: trackSid, error: error)
+        }
+        return error
+    }
+
+    func addSubscribedMediaTrack(mediaTrack: RTCMediaTrack, rtpReceiver: RTCReceiver, trackSid: Track.Sid) async throws {
         let room = try requireRoom()
         let track: Track
 
         guard let publication = trackPublications[trackSid] as? RemoteTrackPublication else {
             log("Could not subscribe to mediaTrack \(trackSid), unable to locate track publication. existing sids: (\(_state.trackPublications.keys.map { String(describing: $0) }.joined(separator: ", ")))", .error)
-            let error = LiveKitError(.invalidState, message: "Could not find published track with sid: \(trackSid)")
-            delegates.notify(label: { "participant.didFailToSubscribe trackSid: \(trackSid)" }) {
-                $0.participant?(self, didFailToSubscribeTrackWithSid: trackSid, error: error)
-            }
-            room.delegates.notify(label: { "room.didFailToSubscribe trackSid: \(trackSid)" }) {
-                $0.room?(room, participant: self, didFailToSubscribeTrackWithSid: trackSid, error: error)
-            }
-            throw error
+            throw notifyDidFailToSubscribe(trackSid: trackSid, room: room,
+                                           message: "Could not find published track with sid: \(trackSid)")
         }
 
-        switch rtcTrack.kind {
+        // Constructed on the RTC executor: attaching the audio sink an audio track needs is a
+        // signaling-thread BlockingCall, and this runs on a cooperative-pool task.
+        let reportStatistics = room._state.roomOptions.reportRemoteTrackStatistics
+
+        switch mediaTrack.kind {
         case "audio":
-            track = RemoteAudioTrack(name: publication.name,
-                                     source: publication.source,
-                                     track: rtcTrack,
-                                     reportStatistics: room._state.roomOptions.reportRemoteTrackStatistics)
+            track = await RTC.run { () -> Track in
+                RemoteAudioTrack(name: publication.name,
+                                 source: publication.source,
+                                 track: mediaTrack,
+                                 reportStatistics: reportStatistics)
+            }
         case "video":
-            track = RemoteVideoTrack(name: publication.name,
-                                     source: publication.source,
-                                     track: rtcTrack,
-                                     reportStatistics: room._state.roomOptions.reportRemoteTrackStatistics)
+            track = await RTC.run { () -> Track in
+                RemoteVideoTrack(name: publication.name,
+                                 source: publication.source,
+                                 track: mediaTrack,
+                                 reportStatistics: reportStatistics)
+            }
         default:
-            let error = LiveKitError(.invalidState, message: "Unsupported type: \(rtcTrack.kind.description)")
-            delegates.notify(label: { "participant.didFailToSubscribe trackSid: \(trackSid)" }) {
-                $0.participant?(self, didFailToSubscribeTrackWithSid: trackSid, error: error)
-            }
-            room.delegates.notify(label: { "room.didFailToSubscribe trackSid: \(trackSid)" }) {
-                $0.room?(room, participant: self, didFailToSubscribeTrackWithSid: trackSid, error: error)
-            }
-            throw error
+            throw notifyDidFailToSubscribe(trackSid: trackSid, room: room,
+                                           message: "Unsupported type: \(mediaTrack.kind)")
         }
 
         await publication.set(track: track)
@@ -140,6 +185,24 @@ public class RemoteParticipant: Participant, @unchecked Sendable {
                 try await unpublish(publication: publication, notify: _notify)
             } catch {
                 log("Failed to unpublish track \(publication.sid) with error \(error)", .error)
+            }
+        }
+
+        // Data tracks: on disconnect the participant is removed before the async manager callback
+        // arrives, so it can't route the unpublish — clear them here, mirroring the media path.
+        let dataTracks = _state.mutate { state in
+            let tracks = state.dataTracks
+            state.dataTracks = []
+            return tracks
+        }
+        guard _notify, let room = _room else { return }
+        // `info` crosses the FFI boundary; read it outside the state lock above.
+        for sid in dataTracks.map(\.info.sid) {
+            delegates.notify(label: { "participant.didUnpublishDataTrack \(sid)" }) {
+                $0.participant?(self, didUnpublishDataTrack: sid)
+            }
+            room.delegates.notify(label: { "room.didUnpublishDataTrack \(sid)" }) {
+                $0.room?(room, participant: self, didUnpublishDataTrack: sid)
             }
         }
     }

@@ -58,4 +58,4 @@ App Store Connect asks whether the app uses encryption, and the Info.plist `ITSA
 
 ## Versions
 
-The package carries the room client its calls run on: the WordPlus RTC client for Swift, which is LiveKit's Swift SDK 2.16.0 with WordPlus Mesh's changes, as the Better Messages app runs it. It takes LiveKit's WebRTC build at the exact version that app is tested with. The room client's module is `LiveKit`, so an app can't also add LiveKit's own Swift SDK. An app that draws with LiveKit takes the package's `LiveKit` product instead.
+The package carries the room client its calls run on: the WordPlus RTC client for Swift, which is LiveKit's Swift SDK 2.18.0 with WordPlus Mesh's changes, as the Better Messages app runs it. It takes LiveKit's WebRTC build at the exact version that app is tested with. The room client's module is `LiveKit`, so an app can't also add LiveKit's own Swift SDK. An app that draws with LiveKit takes the package's `LiveKit` product instead.

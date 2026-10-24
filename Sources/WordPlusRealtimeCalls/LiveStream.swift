@@ -307,7 +307,8 @@ public final class LiveStream {
             if let track = localVideo {
                 if published.contains(ObjectIdentifier(track)) { try await track.unmute() } else { try await track.start() }
             } else {
-                let track = LocalVideoTrack.createCameraTrack()
+                // on the room client's RTC executor (async since LiveKit 2.18)
+                let track = await LocalVideoTrack.createCameraTrack()
                 try await track.start()
                 localVideo = track
                 if state == .live, let room { try await publish(room) }
@@ -325,7 +326,7 @@ public final class LiveStream {
             if let track = localAudio {
                 if published.contains(ObjectIdentifier(track)) { try await track.unmute() }
             } else {
-                localAudio = LocalAudioTrack.createTrack()
+                localAudio = await LocalAudioTrack.createTrack()
                 if state == .live, let room { try await publish(room) }
             }
         } else if let track = localAudio, published.contains(ObjectIdentifier(track)) {

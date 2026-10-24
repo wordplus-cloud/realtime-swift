@@ -72,15 +72,30 @@ public struct MeshApp: Sendable, Hashable {
 /// A mesh node's codec policy (1.0.3, rtc-client 1.0.8's `MeshCodecPolicy`), `Room.meshCodecPolicy`: each list the
 /// codecs it would have a camera or a screen go out in, first choice first (`h265:hw` only from hardware), and what goes
 /// behind a camera. A preference: the product takes the first its device sends.
+///
+/// Since 1.0.7 (rtc-client 1.0.16's, WordPlus Mesh 1.0.53): the node's switches for the product's camera check and
+/// its camera moving to another codec during a call (`check`, `adapt`: JSON booleans only, nil from a node that says
+/// neither), which nothing in this client acts on, and its numbers by name (`tune`), which the product holds each to
+/// its own range: `failsafeS`, for one, the longest a viewer shows a camera moving to another codec as "Optimizing
+/// video quality...".
 public struct MeshCodecPolicy: Sendable, Hashable {
     public let camera: [String]?
     public let screen: [String]?
     public let backup: String?
+    public let check: Bool?
+    public let adapt: Bool?
+    /// At most 32, each a name of 24 characters at most and a finite number; nil where the node sends no `tune`.
+    public let tune: [String: Double]?
 
-    public init(camera: [String]? = nil, screen: [String]? = nil, backup: String? = nil) {
+    public init(camera: [String]? = nil, screen: [String]? = nil, backup: String? = nil,
+                check: Bool? = nil, adapt: Bool? = nil, tune: [String: Double]? = nil)
+    {
         self.camera = camera
         self.screen = screen
         self.backup = backup
+        self.check = check
+        self.adapt = adapt
+        self.tune = tune
     }
 }
 
@@ -189,6 +204,19 @@ enum Mesh {
     /// client skips it.
     static let regionsField: UInt64 = 100
 
+    /// The signal response field a node tells a client how often to send its reports in (1.0.7, rtc-client 1.0.16's
+    /// `MESH_REPORTS_FIELD`, WordPlus Mesh 1.0.53): JSON, `{"every": ms}`, 0 for not at all; every 10 s in a small call,
+    /// less often in a big room. Any other client skips it.
+    static let reportsField: UInt64 = 101
+
+    /// The pace a signal response asks for the reports at (`reportsField`), ms; nil when the message is another.
+    static func reportPace(inSignalMessage data: Data) -> Int? {
+        guard let raw = lengthDelimitedField(reportsField, in: data),
+              let object = try? JSONSerialization.jsonObject(with: raw) as? [String: Any],
+              let every = (object["every"] as? NSNumber)?.doubleValue, every.isFinite, every >= 0 else { return nil }
+        return Int(every)
+    }
+
     /// How long to wait before trying a failed join again, or nil when it isn't one to try again or the deadline
     /// comes first: a full mesh after its Retry-After, within a second after it (or 5 s, give or take half); a
     /// server that couldn't be reached after 1 to 3 s.
@@ -207,7 +235,7 @@ enum Mesh {
     /// The WordPlus RTC client for Swift's own version, which a mesh node is told on each join (`rtc_client`) beside
     /// upstream's, which the client reports as its SDK's and servers gate protocol features on. build.sh refuses a
     /// patch whose version here isn't the one its revisions list.
-    static let clientVersion = "1.0.4"
+    static let clientVersion = "1.0.9"
 
     /// What this client can do beyond upstream's, which a mesh node is told on each join (`mesh_caps`, 1.0.3, as
     /// rtc-client 1.0.7 and 1.0.8): it stops sending an audio track nobody hears when its node says so
@@ -282,9 +310,17 @@ enum Mesh {
     /// one LiveKit's JoinResponse hasn't got, so any other client skips it.
     static let codecPolicyField: UInt64 = 1001
 
-    /// The codec policy a join response's unknown fields carry (`codecPolicyField`), if any: only lists of names (eight,
-    /// 16 characters each) and a name are kept, so whatever else a server sends can't reach a product's codec choice.
-    static func codecPolicy(inJoinResponseUnknownFields data: Data) -> MeshCodecPolicy? {
+    /// The codec policy a signal message carrying a join response has (its `join`, field 1, then `codecPolicyField` in
+    /// it), if any: read from the message's bytes, since the nanopb layer of upstream 2.17 on keeps no unknown fields
+    /// (1.0.7).
+    static func codecPolicy(inSignalMessage data: Data) -> MeshCodecPolicy? {
+        lengthDelimitedField(1, in: data).flatMap { codecPolicy(inJoinResponse: $0) }
+    }
+
+    /// The codec policy a join response's bytes carry (`codecPolicyField`), if any: only lists of names (eight, 16
+    /// characters each), a name, two booleans and numbers by name (`codecTune`) are kept, so whatever else a server
+    /// sends can't reach a product's codec choice.
+    static func codecPolicy(inJoinResponse data: Data) -> MeshCodecPolicy? {
         guard let raw = lengthDelimitedField(codecPolicyField, in: data),
               let object = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] else { return nil }
         func names(_ value: Any?) -> [String]? {
@@ -292,7 +328,31 @@ enum Mesh {
             return Array(list.compactMap { $0 as? String }.filter { $0.count <= 16 }.prefix(8))
         }
         let backup = (object["backup"] as? String).flatMap { $0.count <= 16 ? $0 : nil }
-        return MeshCodecPolicy(camera: names(object["camera"]), screen: names(object["screen"]), backup: backup)
+        return MeshCodecPolicy(camera: names(object["camera"]), screen: names(object["screen"]), backup: backup,
+                               check: jsonBoolean(object["check"]), adapt: jsonBoolean(object["adapt"]),
+                               tune: codecTune(object["tune"]))
+    }
+
+    /// A JSON `true` or `false` (1.0.7), never a number Foundation would read as one, as the browser's client takes
+    /// only a boolean.
+    static func jsonBoolean(_ value: Any?) -> Bool? {
+        guard let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() else { return nil }
+        return number.boolValue
+    }
+
+    /// The codec policy's numbers by name (1.0.7, as rtc-client 1.0.16's meshCodecPolicy reads `tune`): an object's
+    /// first 32 keys, each kept where its name has 24 characters at most and its value is a finite number (no
+    /// boolean, string or null). Its keys come in the order the node writes them, which is sorted (Go's encoding of a
+    /// map), and Foundation keeps no order, so they are taken sorted. Nil where `tune` is not an object.
+    static func codecTune(_ value: Any?) -> [String: Double]? {
+        guard let object = value as? [String: Any] else { return nil }
+        var tune: [String: Double] = [:]
+        for name in object.keys.sorted().prefix(32) where name.utf16.count <= 24 {
+            guard let number = object[name] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else { continue }
+            let value = number.doubleValue
+            if value.isFinite { tune[name] = value }
+        }
+        return tune
     }
 
     /// The first length-delimited field `no` of a protobuf message's bytes, or nil when it has none or can't be read.

@@ -112,6 +112,11 @@ struct BmCallsRoomParticipant {
     let mode: String
     /// The room says this person has lost their connection to it.
     let lost: Bool
+    /// Their camera is changing codec (`BmCallsCameraSwitch`): the tile keeps
+    /// the "Optimizing video quality..." placeholder up, never the look of a
+    /// camera turned off, until the room hears the frame that ends it, the
+    /// camera turned off or the failsafe.
+    var optimizing = false
 }
 
 /// The picture sizes a view asks the sender for: the same rungs Better Messages' engine sends at.

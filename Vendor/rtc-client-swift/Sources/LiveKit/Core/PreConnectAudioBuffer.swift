@@ -81,13 +81,17 @@ public final class PreConnectAudioBuffer: NSObject, Sendable, Loggable {
     public func startRecording(timeout: TimeInterval = Constants.timeout, recorder: LocalAudioTrackRecorder? = nil) async throws {
         let timeout = timeout.isFinite ? min(max(timeout, 0), 86400) : Constants.timeout
         let roomOptions = room?._state.roomOptions
-        let newRecorder = recorder ?? LocalAudioTrackRecorder(
-            track: LocalAudioTrack.createTrack(options: roomOptions?.defaultAudioCaptureOptions,
-                                               reportStatistics: roomOptions?.reportRemoteTrackStatistics ?? false),
-            format: .pcmFormatInt16,
-            sampleRate: Constants.sampleRate,
-            maxSize: Constants.maxSize,
-        )
+        let newRecorder: LocalAudioTrackRecorder
+        if let recorder {
+            newRecorder = recorder
+        } else {
+            let track = await LocalAudioTrack.createTrack(options: roomOptions?.defaultAudioCaptureOptions,
+                                                          reportStatistics: roomOptions?.reportRemoteTrackStatistics ?? false)
+            newRecorder = LocalAudioTrackRecorder(track: track,
+                                                  format: .pcmFormatInt16,
+                                                  sampleRate: Constants.sampleRate,
+                                                  maxSize: Constants.maxSize)
+        }
 
         let stream = try await newRecorder.start()
         log("Started capturing audio", .info)
@@ -114,16 +118,20 @@ public final class PreConnectAudioBuffer: NSObject, Sendable, Loggable {
     public func stopRecording(flush: Bool = false) {
         guard let recorder, recorder.isRecording else { return }
 
+        // Take ownership of the stream *before* the recorder reports stopped. A send that races
+        // the flush finds nothing to claim and returns silently, which is the contract; taken the
+        // other way round, a send landing between `stop()` and the take would claim the stream
+        // and carry it to a room that may not be connected.
+        let flushed = flush ? state.mutate { $0.audioStream.take() } : nil
+
         recorder.stop()
         log("Stopped capturing audio", .info)
 
         if flush {
-            // Take ownership of the stream so it cannot race with an in-flight send
-            let stream = state.mutate { $0.audioStream.take() }
-            if let stream {
+            if let flushed {
                 log("Flushing audio stream", .info)
                 Task {
-                    for await _ in stream {}
+                    for await _ in flushed {}
                 }
             }
             agentCompleter.reset()

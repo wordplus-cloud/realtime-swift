@@ -97,7 +97,12 @@ public final class SessionRequirementHandle: @unchecked Sendable {
     }
 }
 
-// Audio Session Configuration related
+/// Configures the SDK's audio engine, devices, and audio session behavior.
+///
+/// - Note: The synchronous methods that reach the audio device module (``startLocalRecording(audioProcessingOptions:)``,
+///   ``stopLocalRecording()``, ``setEngineAvailability(_:)``, device selection, mute modes) wait for WebRTC's worker
+///   thread to apply the change and block the calling thread until it does. They are safe to call from any thread, but
+///   a Swift Concurrency task calling them holds its thread while the audio stack is busy or stalled.
 public class AudioManager: Loggable {
     // MARK: - Public
 
@@ -425,9 +430,12 @@ public class AudioManager: Loggable {
     /// - Parameter enabled: Pass `true` to enable always-prepared recording, or `false` to disable it.
     /// - Parameter audioProcessingOptions: Optional voice-processing options used when prewarming mic input.
     /// - Note: If `audioSession.isAutomaticConfigurationEnabled` is `true`, the session category is configured to `.playAndRecord`.
-    /// - Note: Microphone permission is required. iOS may prompt if not already granted.
+    /// - Note: Microphone permission is required to enable, but is not requested here: prewarming is not a
+    ///   user-initiated capture, so prompting from it would surprise the user. Request it up front with
+    ///   ``LiveKitSDK/ensureDeviceAccess(for:)``, otherwise this throws ``LiveKitError`` of type
+    ///   ``LiveKitErrorType/deviceAccessDenied`` when the audio device module reports the missing permission.
     /// - Note: This persists across ``Room`` lifecycles and connections until disabled.
-    /// - Throws: An error if the underlying audio device module fails to apply the setting.
+    /// - Throws: An error if microphone permission is not granted, or if the underlying audio device module fails to apply the setting.
     public func setRecordingAlwaysPreparedMode(
         _ enabled: Bool,
         audioProcessingOptions: AudioProcessingOptions? = nil,
@@ -444,6 +452,9 @@ public class AudioManager: Loggable {
 
     /// Starts mic input to the SDK even without any ``Room`` or a connection.
     /// Audio buffers will flow into ``LocalAudioTrack/add(audioRenderer:)`` and ``capturePostProcessingDelegate``.
+    ///
+    /// - Note: Being synchronous, this cannot request microphone permission. Ensure permission is granted first (for example via
+    ///   ``LiveKitSDK/ensureDeviceAccess(for:)``), otherwise it throws ``LiveKitError`` of type ``LiveKitErrorType/deviceAccessDenied``.
     public func startLocalRecording(audioProcessingOptions: AudioProcessingOptions? = nil) throws {
         updateExpectedPlatformVoiceProcessing(for: audioProcessingOptions)
         // Always unmute APM if muted by last session.
@@ -476,6 +487,11 @@ public class AudioManager: Loggable {
     /// This is useful when you need to set up connections without touching the audio
     /// device yet (e.g., CallKit flows), or to guarantee the engine remains off
     /// regardless of subscription/publication requests.
+    ///
+    /// - Note: Microphone permission is not requested here. If recording was requested while input
+    ///   was unavailable, ensure permission is granted (for example via
+    ///   ``LiveKitSDK/ensureDeviceAccess(for:)``) before restoring input availability, otherwise
+    ///   this throws ``LiveKitError`` of type ``LiveKitErrorType/deviceAccessDenied``.
     public func setEngineAvailability(_ availability: AudioEngineAvailability) throws {
         let result = RTC.audioDeviceModule.setEngineAvailability(availability.toRTCType())
         try checkAdmResult(code: result)

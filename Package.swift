@@ -26,9 +26,8 @@ let package = Package(
         // Calls: the same libwebrtc under the rooms and the direct connection, at the version Better Messages' app
         // pins, whose call engine this is; and what the room client needs beside it, as its build lists them
         // (scripts/rtc-client.sh prints them).
-        .package(url: "https://github.com/livekit/webrtc-xcframework.git", exact: "144.7559.11"),
-        .package(url: "https://github.com/livekit/livekit-uniffi-xcframework.git", exact: "0.0.6"),
-        .package(url: "https://github.com/apple/swift-protobuf.git", from: "1.31.0"),
+        .package(url: "https://github.com/livekit/webrtc-xcframework.git", exact: "150.7871.03"),
+        .package(url: "https://github.com/livekit/livekit-uniffi-xcframework.git", exact: "0.1.9"),
     ],
     targets: [
         // Each privacy manifest declares UserDefaults, where the connection keeps the realtime nodes it reached and the
@@ -52,17 +51,27 @@ let package = Package(
             ]
         ),
         // The rooms of group calls, calls moved to one, and live streams: the WordPlus RTC client for Swift, LiveKit's
-        // Swift SDK 2.16.0 with WordPlus Mesh's patch (Vendor/rtc-client-swift, Apache License 2.0, its LICENSE and
+        // Swift SDK 2.18.0 with WordPlus Mesh's patch (Vendor/rtc-client-swift, Apache License 2.0, its LICENSE and
         // NOTICE there), the client Better Messages' app runs. Its module is LiveKit's own, so an app can't also take
-        // stock LiveKit. scripts/rtc-client.sh copies a new build in.
+        // stock LiveKit. Its protocol layer is nanopb (CLiveKitProto, LiveKitNanopb) since upstream 2.17, as its build
+        // lists the targets. scripts/rtc-client.sh copies a new build in.
+        .target(
+            name: "CLiveKitProto",
+            path: "Vendor/rtc-client-swift/Sources/CLiveKitProto",
+            exclude: ["LICENSE-nanopb.txt", "module.modulemap"],
+            publicHeadersPath: "include",
+            cSettings: [.headerSearchPath("include")]
+        ),
+        .target(name: "LiveKitNanopb", dependencies: ["CLiveKitProto"], path: "Vendor/rtc-client-swift/Sources/LiveKitNanopb"),
         .target(name: "LKObjCHelpers", path: "Vendor/rtc-client-swift/Sources/LKObjCHelpers", publicHeadersPath: "include"),
         .target(
             name: "LiveKit",
             dependencies: [
                 "LKObjCHelpers",
+                "LiveKitNanopb",
+                "CLiveKitProto",
                 .product(name: "LiveKitWebRTC", package: "webrtc-xcframework"),
                 .product(name: "LiveKitUniFFI", package: "livekit-uniffi-xcframework"),
-                .product(name: "SwiftProtobuf", package: "swift-protobuf"),
             ],
             path: "Vendor/rtc-client-swift/Sources/LiveKit",
             exclude: ["Broadcast/NOTICE"],
@@ -79,7 +88,8 @@ let package = Package(
         .executableTarget(name: "WordPlusUITool"),
         .testTarget(name: "WordPlusRealtimeTests", dependencies: ["WordPlusRealtime"], resources: [.copy("vectors.json")]),
         // The calls' own logic with no call: a live stream's state from its chat socket's events.
-        .testTarget(name: "WordPlusRealtimeCallsTests", dependencies: ["WordPlusRealtimeCalls"]),
+        // LiveKit too: the room client's own types, as the calls are handed them (CameraSwitchTests).
+        .testTarget(name: "WordPlusRealtimeCallsTests", dependencies: ["WordPlusRealtimeCalls", "LiveKit"]),
         // The call screens on a simulator, with no call (xcodebuild test, an iOS destination): their pieces.
         .testTarget(name: "WordPlusRealtimeUITests", dependencies: ["WordPlusRealtimeUI"]),
         // The live stream drawn ready, on a simulator, with a stream whose events the test gives.

@@ -60,7 +60,7 @@ CallScreen.shared.show(meeting, title: "Daily meeting")
 - **It sits in a window of its own** above the app. Its chevron puts it away and the call goes on: show a bar of your own meanwhile, and `CallScreen.shared.restore()` brings it back. `hide()` puts it away from your code.
 - **A call ringing during another** is answered busy.
 - **A call that becomes a group call** stays on the screen, as the group call.
-- **Its words and colours:** `configure(.init(strings: [...], tokens: [...], tokensDark: [...], darkMode: false))`, the strings by the Better Messages keys (`answer`, `reject`, `end_call`, `calling`, `connecting` …), the colours by its design tokens (`"--bm-color-accent": "#21759b"`). The English is the default for any string left out.
+- **Its words and colours:** `configure(.init(strings: [...], tokens: [...], tokensDark: [...], darkMode: false))`, the strings by the Better Messages keys (`answer`, `reject`, `end_call`, `calling`, `connecting`, `optimizing_video` over a camera changing codec …), the colours by its design tokens (`"--bm-color-accent": "#21759b"`). The English is the default for any string left out.
 - `CallScreen.shared.log` hands you the lines the screen writes, for your own log.
 
 ## Ringing a locked phone
@@ -153,7 +153,7 @@ let invite = try await call.add("43")                   // rings user 43, throws
 let group = try await rt.calls.group("meeting:daily", type: .video)
 group.microphone = true                       // nothing is sent into a group call until asked
 group.camera = true
-group.onPeople { people = group.people }      // [GroupPerson]: user, info, camera, microphone, screen, speaking, publish
+group.onPeople { people = group.people }      // [GroupPerson]: user, info, camera, microphone, screen, speaking, publish, optimizing
 group.onState { state in label.text = state.rawValue }
 group.onEnded { reason in close(reason) }
 group.leave()
@@ -161,6 +161,7 @@ group.leave()
 
 - **`group.encrypted`** says whether its media is encrypted end to end: always for the group call that comes from a call, and for one your server names when its rule says `encrypt`.
 - **Drawing it yourself:** a `GroupVideoView` shows anyone's camera, `view.show(person.identity, of: group)`, or their shared screen with `source: .screen`, and `view.showOwn(of: group)` this app's own camera. Audio plays by itself.
+- **A camera changing codec:** a browser in the call may move its camera to the codec its computer sends best, which takes the camera away for a moment. `GroupPerson.optimizing` is true from its word until the new camera arrives, the camera is turned off, or the media server's failsafe has passed (10 seconds unless it sets another): draw a placeholder such as "Optimizing video quality..." over their picture then, not a camera turned off. The call screen does it for you, and holds its placeholder until the new camera's first frame.
 
 ### Speakers and listeners
 

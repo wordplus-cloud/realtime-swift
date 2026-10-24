@@ -23,6 +23,12 @@ public struct GroupPerson: Equatable, Sendable {
     public let screen: Bool
     /// Whether they may send their camera, microphone and screen: the rule of the app, or what its server changed since.
     public let publish: Bool
+    /// Whether their camera is changing codec (a browser moving to the codec its computer sends best): it is away for a
+    /// moment, not turned off, so a screen shows a placeholder such as "Optimizing video quality..." where the camera
+    /// was rather than a camera turned off. From their word until a new camera of theirs arrives (`camera` true again
+    /// with a new track), their camera is turned off, or the media server's failsafe has passed (10 seconds unless it
+    /// says otherwise). False by default.
+    public internal(set) var optimizing: Bool = false
 }
 
 /// What this app may do in a group call, as the media server holds it now.
@@ -94,6 +100,11 @@ public final class GroupCall: NSObject, @unchecked Sendable {
     /// server's policy says otherwise.
     private var cameraCodec: VideoCodec = .vp8
     private var cameraBackup: VideoCodec?
+    /// Cameras changing codec, by who said so (`CameraSwitch.topic`), the look that ends one at its failsafe, and the ear
+    /// on each camera whose next frame ends one (`watchCameraSwitches`). On the main queue.
+    private var cameraSwitch = CameraSwitch()
+    private var cameraSwitchLook: DispatchWorkItem?
+    private var cameraSwitchEars: [String: (track: VideoTrack, sid: String, ear: CameraNextFrame)] = [:]
 
     init(owner: RealtimeCalls, name: String, link: GroupOf?, key: String?, microphone: Bool, camera: Bool) {
         self.owner = owner
@@ -179,8 +190,12 @@ public final class GroupCall: NSObject, @unchecked Sendable {
         return try await owner.invite(link, user: user)
     }
 
-    /// Leaves the room.
+    /// Leaves the room. From any thread: the call ends on the main queue, where its state lives.
     public func leave() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { self.leave() }
+            return
+        }
         SystemCalls.shared.endingHere(group: self)
         finish("left")
     }
@@ -238,6 +253,9 @@ public final class GroupCall: NSObject, @unchecked Sendable {
         if let policy = room.meshCodecPolicy {
             await MainActor.run { useCodecs(policy, caps: caps, onMesh: onMesh) }
         }
+        // A camera changing codec is shown so for the node's failsafe at most.
+        let failsafe = CameraSwitch.failsafe(tune: CameraSwitch.tune("failsafeS", of: room.meshCodecPolicy))
+        await MainActor.run { cameraSwitch.failsafe = failsafe }
         if microphoneOn { _ = try? await room.localParticipant.setMicrophone(enabled: true) }
         if cameraOn {
             let publish = await MainActor.run { cameraPublish }
@@ -251,12 +269,16 @@ public final class GroupCall: NSObject, @unchecked Sendable {
 
     /// Everyone else in the room, read again, their info opened with the app's keys.
     private func refresh() {
+        // The cameras whose next frame ends a switch, with the tracks read here.
+        watchCameraSwitches()
         let keyring = owner.rt.keyring
         people = room.remoteParticipants.values.compactMap { participant in
             guard let identity = participant.identity?.stringValue else { return nil }
             let user = identity.hasPrefix("user_") ? String(identity.dropFirst(5)) : nil
             let sealed = participant.metadata.flatMap(JSONValue.parse) ?? .null
             let tracks = participant.trackPublications.values
+            // The camera of theirs that has arrived here, which ends a switch once it is not the old one.
+            let arrived = tracks.first { $0.source == .camera && !$0.isMuted && $0.track != nil }?.sid.stringValue
             return GroupPerson(
                 identity: identity,
                 user: user,
@@ -265,7 +287,8 @@ public final class GroupCall: NSObject, @unchecked Sendable {
                 microphone: tracks.contains { $0.source == .microphone && !$0.isMuted },
                 speaking: participant.isSpeaking,
                 screen: tracks.contains { $0.source == .screenShareVideo && !$0.isMuted },
-                publish: participant.permissions.canPublish
+                publish: participant.permissions.canPublish,
+                optimizing: cameraSwitch.awaiting(identity, camera: arrived)
             )
         }.sorted { $0.identity < $1.identity }
         peopleHandlers.forEach { $0() }
@@ -277,8 +300,99 @@ public final class GroupCall: NSObject, @unchecked Sendable {
         stateHandlers.forEach { $0(next) }
     }
 
-    func finish(_ reason: String) {
+    /// A camera changing codec, said by the web's call screen before it takes the camera down and after it is up again
+    /// (`CameraSwitch`). On the main queue.
+    func heardCameraSwitch(_ word: String, from identity: String, camera: String?, at now: Date = Date()) {
         guard state != .ended else { return }
+        let changed = cameraSwitch.heard(word, from: identity, camera: camera, at: now)
+        // `ready` changes which frame ends the switch, if not the switch.
+        watchCameraSwitches()
+        if changed { refresh() }
+        lookAtCameraSwitches()
+    }
+
+    /// Their camera taken out of the room, or muted: turned off, unless it is the move taking the old camera down. On
+    /// the main queue.
+    func cameraWentOff(_ identity: String, camera: String?, muted: Bool) {
+        guard state != .ended else { return }
+        let ended = muted ? cameraSwitch.muted(identity) : camera.map { cameraSwitch.unpublished(identity, camera: $0) } ?? false
+        if ended { lookAtCameraSwitches() }
+    }
+
+    /// A frame of `identity`'s camera `camera`, heard by its ear. On the main queue.
+    func cameraDrew(_ identity: String, camera: String) {
+        guard state != .ended else { return }
+        if cameraSwitch.shown(identity, camera: camera) {
+            refresh()
+        } else {
+            watchCameraSwitches()
+        }
+        lookAtCameraSwitches()
+    }
+
+    /// Takes down a switch whose new camera never came, at its failsafe (the node's, from the first word of the move),
+    /// and looks again while any is up.
+    private func lookAtCameraSwitches() {
+        cameraSwitchLook?.cancel()
+        cameraSwitchLook = nil
+        let now = Date()
+        if !cameraSwitch.expire(at: now).isEmpty { refresh() }
+        guard state != .ended, let next = cameraSwitch.nextExpiry() else { return }
+        let look = DispatchWorkItem { [weak self] in self?.lookAtCameraSwitches() }
+        cameraSwitchLook = look
+        let wait = max(0.1, next.timeIntervalSince(now))
+        DispatchQueue.main.asyncAfter(deadline: .now() + wait, execute: look)
+    }
+
+    /// Each switch up listens for the next frame of the camera that ends it (`CameraSwitch.watches`): a new camera's
+    /// first, or after `ready` any camera's next. Heard on the track itself rather than in a view, so a switch ends once
+    /// and for all, and a renderer that stalls or a tile drawn again later can't bring it back. On the main queue.
+    private func watchCameraSwitches() {
+        guard cameraSwitch.anyUp || !cameraSwitchEars.isEmpty else { return }
+        var wanted: [String: (track: VideoTrack, sid: String)] = [:]
+        if state != .ended, cameraSwitch.anyUp {
+            for participant in room.remoteParticipants.values {
+                guard let identity = participant.identity?.stringValue, cameraSwitch.optimizing(identity) else { continue }
+                let publication = participant.trackPublications.values.first { $0.source == .camera && !$0.isMuted }
+                guard
+                    let sid = publication?.sid.stringValue,
+                    let track = publication?.track as? VideoTrack,
+                    cameraSwitch.watches(identity, camera: sid)
+                else { continue }
+                wanted[identity] = (track, sid)
+            }
+        }
+        for (identity, ear) in cameraSwitchEars where wanted[identity]?.track !== ear.track || wanted[identity]?.sid != ear.sid {
+            ear.track.remove(videoRenderer: ear.ear)
+            cameraSwitchEars[identity] = nil
+        }
+        for (identity, want) in wanted where cameraSwitchEars[identity] == nil {
+            let ear = CameraNextFrame { [weak self] in self?.cameraDrew(identity, camera: want.sid) }
+            want.track.add(videoRenderer: ear)
+            cameraSwitchEars[identity] = (want.track, want.sid, ear)
+        }
+    }
+
+    /// Someone's camera changing codec as this room holds it, for the SDK's call screens, which draw their placeholder
+    /// while it is up: whether a switch is up for `identity` (until the frame that ends it, the camera turned off or
+    /// the failsafe), and the camera publication that was up when it was said. `GroupPerson.optimizing` is the same
+    /// switch, ended as soon as the new camera arrives.
+    @_spi(WordPlusUI) public func cameraSwitch(of identity: String) -> (pending: Bool, from: String?) {
+        (cameraSwitch.optimizing(identity), cameraSwitch.from(identity))
+    }
+
+    /// Ends the room for this app. On the main queue, where its state, its handlers and its camera switches live: a
+    /// caller elsewhere (`leave()` from any thread) is moved there.
+    func finish(_ reason: String) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { self.finish(reason) }
+            return
+        }
+        guard state != .ended else { return }
+        cameraSwitchLook?.cancel()
+        cameraSwitchLook = nil
+        for ear in cameraSwitchEars.values { ear.track.remove(videoRenderer: ear.ear) }
+        cameraSwitchEars.removeAll()
         endReason = reason
         state = .ended
         Task { await room.disconnect() }
@@ -293,7 +407,24 @@ extension GroupCall: RoomDelegate {
     }
 
     public func room(_ room: LiveKit.Room, participantDidDisconnect participant: RemoteParticipant) {
-        DispatchQueue.main.async { self.refresh() }
+        let identity = participant.identity?.stringValue
+        DispatchQueue.main.async {
+            // Gone: their switch goes with them.
+            if let identity { self.cameraSwitch.left(identity) }
+            self.refresh()
+        }
+    }
+
+    /// The web's call screen says its camera is changing codec, and when it is back (`CameraSwitch.topic`).
+    public func room(_ room: LiveKit.Room, participant: RemoteParticipant?, didReceiveData data: Data, forTopic topic: String, encryptionType: EncryptionType) {
+        guard
+            topic == CameraSwitch.topic,
+            let participant,
+            let identity = participant.identity?.stringValue,
+            let word = CameraSwitch.state(of: data)
+        else { return }
+        let camera = participant.videoTracks.first { $0.source == .camera && !$0.isMuted }?.sid.stringValue
+        DispatchQueue.main.async { self.heardCameraSwitch(word, from: identity, camera: camera) }
     }
 
     public func room(_ room: LiveKit.Room, participant: RemoteParticipant, didSubscribeTrack publication: RemoteTrackPublication) {
@@ -305,7 +436,24 @@ extension GroupCall: RoomDelegate {
     }
 
     public func room(_ room: LiveKit.Room, participant: Participant, trackPublication: TrackPublication, didUpdateIsMuted isMuted: Bool) {
-        DispatchQueue.main.async { self.refresh() }
+        // A camera muted while it was changing codec: turned off, which no move does.
+        let identity = participant is RemoteParticipant && trackPublication.source == .camera && isMuted
+            ? participant.identity?.stringValue
+            : nil
+        DispatchQueue.main.async {
+            if let identity { self.cameraWentOff(identity, camera: nil, muted: true) }
+            self.refresh()
+        }
+    }
+
+    public func room(_ room: LiveKit.Room, participant: RemoteParticipant, didUnpublishTrack publication: RemoteTrackPublication) {
+        // A camera turned off while it was changing codec, other than by the move itself.
+        let identity = participant.identity?.stringValue
+        let camera = publication.source == .camera ? publication.sid.stringValue : nil
+        DispatchQueue.main.async {
+            if let identity, let camera { self.cameraWentOff(identity, camera: camera, muted: false) }
+            self.refresh()
+        }
     }
 
     public func room(_ room: LiveKit.Room, participant: Participant, didUpdateMetadata metadata: String?) {
@@ -337,5 +485,32 @@ extension GroupCall: RoomDelegate {
 
     public func room(_ room: LiveKit.Room, didDisconnectWithError error: LiveKitError?) {
         DispatchQueue.main.async { self.finish("disconnected") }
+    }
+}
+
+/// The next frame a camera's track delivers, heard once and told on the main queue: what ends a camera switch
+/// (`GroupCall.watchCameraSwitches`). It is no view, and says so to adaptive stream, so it never counts as someone
+/// looking: the app's own views decide what is sent. Taken off its track on the main queue, never from a frame's own
+/// thread.
+final class CameraNextFrame: NSObject, VideoRenderer, @unchecked Sendable {
+    private let lock = NSLock()
+    private var heard = false
+    private let onFrame: () -> Void
+
+    init(_ onFrame: @escaping () -> Void) {
+        self.onFrame = onFrame
+    }
+
+    var isAdaptiveStreamEnabled: Bool { false }
+
+    var adaptiveStreamSize: CGSize { .zero }
+
+    func render(frame: VideoFrame) {
+        lock.lock()
+        let first = !heard
+        heard = true
+        lock.unlock()
+        guard first else { return }
+        DispatchQueue.main.async(execute: onFrame)
     }
 }

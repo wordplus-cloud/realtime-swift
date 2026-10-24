@@ -29,7 +29,8 @@ public final class CallScreen {
     /// The screen's words and colours.
     public struct Appearance {
         /// Its strings in the user's language, by key: `answer`, `reject`, `end_call`, `calling`, `connecting`,
-        /// `enable_camera` … (the English is the default for any left out).
+        /// `enable_camera`, `optimizing_video` (over a camera changing codec) … (the English is the default for any
+        /// left out).
         public var strings: [String: String]
         /// Design tokens, Better Messages' (`--bm-color-accent: "33, 117, 155"` or a hex value), light and dark.
         public var tokens: [String: String]
@@ -503,7 +504,9 @@ public final class CallScreen {
             camera = call.camera
             let media = call.remoteMedia
             peer = [
-                "camera": media[ "camera" ] ?? false,
+                // A camera changing codec is away for a second under its placeholder, not turned off: no "camera off"
+                // notice for it.
+                "camera": ( media[ "camera" ] ?? false ) || peerOptimizing( call ),
                 "microphone": media[ "microphone" ] ?? false,
                 "screen": media[ "screen_share" ] ?? false,
                 "known": !media.isEmpty,
@@ -550,13 +553,23 @@ public final class CallScreen {
         if let room = call.carryingRoom {
             let other = room.liveKitRoom.remoteParticipants.values.first
             BmCallsScreenHost.shared.setRoomPeerVideo( camera: Self.track( other, .camera ), screen: Self.track( other, .screenShareVideo ) )
+            // Its camera changing codec, as the room holds it (`GroupCall.cameraSwitch(of:)`): the stage draws the
+            // placeholder until the frame that ends it.
+            BmCallsScreenHost.shared.setRoomPeerOptimizing( peerOptimizing( call ) )
             BmCallsScreenHost.shared.setRoomLocalVideo( Self.track( room.liveKitRoom.localParticipant, .camera ) )
             BmCallsScreenHost.shared.setRemoteVideo( source: .camera, track: nil )
             BmCallsScreenHost.shared.setLocalVideo( nil )
         } else {
+            BmCallsScreenHost.shared.setRoomPeerOptimizing( false )
             BmCallsScreenHost.shared.setRemoteVideo( source: .camera, track: call.remoteCamera?.rtcTrack )
             BmCallsScreenHost.shared.setLocalVideo( call.camera ? call.localCamera?.rtcTrack : nil )
         }
+    }
+
+    /// Whether the other side of a call carried by a room is changing its camera's codec.
+    private func peerOptimizing( _ call: Call ) -> Bool {
+        guard let room = call.carryingRoom, let other = room.liveKitRoom.remoteParticipants.values.first else { return false }
+        return room.cameraSwitch( of: other.identity?.stringValue ?? "" ).pending
     }
 
     /// A group call's people, this side first, as the grid draws them.
@@ -568,7 +581,11 @@ public final class CallScreen {
         let me = room.localParticipant
         people.append( Self.participant( me, info: nil, local: true ) )
         for participant in room.remoteParticipants.values.sorted( by: { ( $0.identity?.stringValue ?? "" ) < ( $1.identity?.stringValue ?? "" ) } ) {
-            people.append( Self.participant( participant, info: info[ participant.identity?.stringValue ?? "" ], local: false ) )
+            var person = Self.participant( participant, info: info[ participant.identity?.stringValue ?? "" ], local: false )
+            // A camera changing codec, as the room holds it: the tile draws its placeholder until the frame that ends
+            // it.
+            person.optimizing = group.cameraSwitch( of: person.identity ).pending
+            people.append( person )
         }
         BmCallsScreenHost.shared.setRoomLocalVideo( Self.track( me, .camera ) )
         BmCallsScreenHost.shared.update { $0.setRoster( people ) }

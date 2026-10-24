@@ -90,7 +90,7 @@ public class Track: NSObject, @unchecked Sendable, Loggable {
 
     let delegates = MulticastDelegate<TrackDelegate>(label: "TrackDelegate")
 
-    let mediaTrack: LKRTCMediaStreamTrack
+    let mediaTrack: RTCMediaTrack
 
     struct State {
         let name: String
@@ -112,9 +112,14 @@ public class Track: NSObject, @unchecked Sendable, Loggable {
 
         weak var transport: Transport?
         var videoCodec: VideoCodec?
-        var rtpSender: LKRTCRtpSender?
-        var rtpSenderForCodec: [VideoCodec: LKRTCRtpSender] = [:] // simulcastSender
-        var rtpReceiver: LKRTCRtpReceiver?
+        var rtpSender: RTCSender?
+        var rtpSenderForCodec: [VideoCodec: RTCSender] = [:] // simulcastSender
+        var rtpReceiver: RTCReceiver?
+
+        // Last dynacast state the server sent, so it can be re-applied after a renegotiation
+        // re-enables every encoding. Mirrors the sender split above.
+        var subscribedQualities: [Livekit_SubscribedQuality] = []
+        var subscribedQualitiesForCodec: [VideoCodec: [Livekit_SubscribedQuality]] = [:]
 
         // All VideoRendererAdapters attached to this track, key/value for direct removal.
         var videoRendererAdapters = MapTable<VideoRenderer, VideoRendererAdapter>.weakToStrongObjects()
@@ -131,7 +136,7 @@ public class Track: NSObject, @unchecked Sendable, Loggable {
     init(name: String,
          kind: Kind,
          source: Source,
-         track: LKRTCMediaStreamTrack,
+         track: RTCMediaTrack,
          reportStatistics: Bool)
     {
         _state = StateSync(State(
@@ -167,15 +172,21 @@ public class Track: NSObject, @unchecked Sendable, Loggable {
         }
     }
 
-    func set(transport: Transport?, rtpSender: LKRTCRtpSender?) async {
+    func set(transport: Transport?, rtpSender: RTCSender?) async {
         _state.mutate {
             $0.transport = transport
             $0.rtpSender = rtpSender
+            // Both caches can describe this sender: the per-codec one holds the main sender's
+            // entry when the track publishes its primary codec.
+            if rtpSender == nil {
+                $0.subscribedQualities = []
+                $0.subscribedQualitiesForCodec.removeAll()
+            }
         }
         await _resumeOrSuspendStatisticsTimer()
     }
 
-    func set(transport: Transport?, rtpReceiver: LKRTCRtpReceiver?) async {
+    func set(transport: Transport?, rtpReceiver: RTCReceiver?) async {
         _state.mutate {
             $0.transport = transport
             $0.rtpReceiver = rtpReceiver
@@ -247,17 +258,19 @@ public class Track: NSObject, @unchecked Sendable, Loggable {
 
     // Returns true if didEnable
     @discardableResult
+    @RTC
     func enable() async throws -> Bool {
-        guard !mediaTrack.isEnabled else { return false }
-        mediaTrack.isEnabled = true
+        guard !mediaTrack.raw.isEnabled else { return false }
+        mediaTrack.raw.isEnabled = true
         return true
     }
 
     // Returns true if didDisable
     @discardableResult
+    @RTC
     func disable() async throws -> Bool {
-        guard mediaTrack.isEnabled else { return false }
-        mediaTrack.isEnabled = false
+        guard mediaTrack.raw.isEnabled else { return false }
+        mediaTrack.raw.isEnabled = false
         return true
     }
 
