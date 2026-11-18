@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.1 - 2026-11-18
+
+### Fixed
+
+- The package builds with Xcode 16 again: 1.1.0's call screen stopped it with "ambiguous use of
+  'init(priority:operation:)'". A call screen added to an app with `swift package wordplus-ui add` from 1.1.0 has the
+  same line: add it again from 1.1.1, or change it as `CallScreen.swift` has it now.
+
 ## 1.1.0 - 2026-11-18
 
 Every name that worked in 1.0.3 still works. This release also carries the changes made for 1.0.4, which was never

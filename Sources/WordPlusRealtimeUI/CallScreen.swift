@@ -463,7 +463,9 @@ public final class CallScreen {
             },
             add: { [weak self] person, done in
                 MainActor.assumeIsolated {
-                    Task { @MainActor in
+                    // `_ =`: as the closure's only expression, Xcode 16 took the task for what it returns, and found
+                    // Task's initializers ambiguous.
+                    _ = Task { @MainActor in
                         do {
                             let invite: CallInvite
                             switch self?.showing {

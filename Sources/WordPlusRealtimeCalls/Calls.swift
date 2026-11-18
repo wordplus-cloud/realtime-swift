@@ -76,7 +76,7 @@ public struct CallAsk: Equatable, Sendable {
 public final class RealtimeCalls: @unchecked Sendable {
     /// This package's version, which a group call's join names to the media server (`rtc_app`, "realtime-swift/…"):
     /// the release's, as `scripts/embed-ui.sh` has it.
-    public static let version = "1.1.0"
+    public static let version = "1.1.1"
 
     private static let lock = NSLock()
     private static var byConnection: [ObjectIdentifier: RealtimeCalls] = [:]
