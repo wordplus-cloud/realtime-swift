@@ -1,26 +1,55 @@
 # Events from the app
 
-The app sends events to the rooms it is in, straight through WordPlus Cloud, with no request to your server: chat messages, typing, read ticks, reactions. A room rule says which events may be sent to it ([events in depth](https://docs.wordplus.cloud/apps/events/)):
+The app sends events to the rooms it is in, straight through WordPlus Cloud, with no request to your server: chat messages, typing, read ticks, reactions. A room rule says which events may be sent to it ([events in depth](https://docs.wordplus.cloud/apps/events/)), and what people build with them is in [chat](https://docs.wordplus.cloud/use-cases/chat/).
+
+Here the chat of two people is named `chat:` and their two ids, smaller first: `chat:34:42`. The app asks your server to join it, and the rule decides:
+
+1. Only the two people in the name join their chat.
+2. They may send `message`, `typing`, `reaction` and `read` to it, and nothing else (`emit`).
+3. Each `message` and `reaction` reaches your server by webhook, for your server to keep (`webhook`).
+4. The room keeps its last 50 events (`history`), for an app that comes back after a drop.
 
 **Node**
 
 ```ts
-realtime.room( 'chat:{a}:{b}', { history: 50, emit: [ 'message', 'typing', 'reaction', 'read' ], webhook: [ 'message', 'reaction' ] },
-    ( user, { a, b } ) => [ a, b ].includes( String( user ) ) );
+realtime.room( 'chat:{a}:{b}', {
+    emit: [ 'message', 'typing', 'reaction', 'read' ],   // 2. What the two may send.
+    webhook: [ 'message', 'reaction' ],                   // 3. What reaches your server.
+    history: 50,                                          // 4. The last 50 events kept.
+}, ( user, { a, b } ) => {
+    // 1. The two people in the name, as text: user 34 is "34" there.
+    const pair = [ a, b ];
+    return pair.includes( String( user ) );
+} );
 ```
 
 **PHP**
 
 ```php
-$realtime->room( 'chat:{a}:{b}', fn ( $user, array $p ) => in_array( (string) $user, [ $p['a'], $p['b'] ], true ),
-    [ 'history' => 50, 'emit' => [ 'message', 'typing', 'reaction', 'read' ], 'webhook' => [ 'message', 'reaction' ] ] );
+$realtime->room( 'chat:{a}:{b}', function ( $user, array $p ) {
+    // 1. The two people in the name, as text: user 34 is "34" there.
+    $pair = [ $p['a'], $p['b'] ];
+    return in_array( (string) $user, $pair, true );
+}, [
+    'emit'    => [ 'message', 'typing', 'reaction', 'read' ], // 2. What the two may send.
+    'webhook' => [ 'message', 'reaction' ],                   // 3. What reaches your server.
+    'history' => 50,                                          // 4. The last 50 events kept.
+] );
 ```
 
 **Python**
 
 ```python
-realtime.room("chat:{a}:{b}", lambda user, p: str(user) in (p["a"], p["b"]),
-              history=50, emit=["message", "typing", "reaction", "read"], webhook=["message", "reaction"])
+def in_chat(user, p):
+    # 1. The two people in the name, as text: user 34 is "34" there.
+    pair = [p["a"], p["b"]]
+    return str(user) in pair
+
+
+realtime.room("chat:{a}:{b}", in_chat,
+              emit=["message", "typing", "reaction", "read"],   # 2. What the two may send.
+              webhook=["message", "reaction"],                  # 3. What reaches your server.
+              history=50)                                       # 4. The last 50 events kept.
 ```
 
 ## Sending
@@ -39,7 +68,8 @@ try await chat.emitWithAck("message", Message(text: "Hi"))            // any Enc
 
 - **Everyone in the room** gets it, the other pages and devices of the sender too. This app does not.
 - **`emitWithAck`** returns once WordPlus Cloud has checked the event, kept it (when the room keeps history) and sent it on, with the kept event `id` and time. It throws a `RealtimeError` with its `code`: `not_allowed` (the rule does not list it), `forbidden` (not in the room), `rate_limited`, `too_large`, `bad_event`, `timeout`, or `offline` while the connection is down.
-- **Before the room is joined,** an emit waits for it.
+- **Before the room is joined,** an emit waits for it, except a `volatile.emit`, which is dropped.
+- **`volatile.emitWithAck`** waits for the room, then for WordPlus Cloud to take the event and send it on. It is never kept, so `ack.id` is empty.
 - **`meta.from`** on the other side is this app user, as your server vouched for them: an app cannot send as someone else.
 - **Binary:** `JSONValue.binary(Data)` anywhere in the data, sealed as binary.
 - **Limits:** 1 MB an event (kept in history up to 64 KB), 50 a second a connection, in bursts of up to 100.

@@ -31,12 +31,20 @@ public final class AudioPublishOptions: NSObject, TrackPublishOptions, Sendable 
 
     public let preConnect: Bool
 
+    /// WordPlus Mesh (1.0.15, rtc-client 1.0.27's `resend`): the server may ask this track again for what its upload
+    /// lost, in RED too. The offers sent list `nack` for its Opus (`Transport.listAudioNack`), which a mesh node
+    /// answers whatever its own rule for RED; another server ignores the line. Off by default: a microphone in RED
+    /// isn't asked again, as what was sent again on a narrow upload once took the camera's room. For a product whose
+    /// engine makes that room.
+    public let resend: Bool
+
     public init(name: String? = nil,
                 encoding: AudioEncoding? = nil,
                 dtx: Bool = true,
                 red: Bool = true,
                 streamName: String? = nil,
-                preConnect: Bool = false)
+                preConnect: Bool = false,
+                resend: Bool = false)
     {
         self.name = name
         self.encoding = encoding
@@ -44,6 +52,7 @@ public final class AudioPublishOptions: NSObject, TrackPublishOptions, Sendable 
         self.red = red
         self.streamName = streamName
         self.preConnect = preConnect
+        self.resend = resend
     }
 
     // MARK: - Equal
@@ -55,7 +64,8 @@ public final class AudioPublishOptions: NSObject, TrackPublishOptions, Sendable 
             dtx == other.dtx &&
             red == other.red &&
             streamName == other.streamName &&
-            preConnect == other.preConnect
+            preConnect == other.preConnect &&
+            resend == other.resend
     }
 
     override public var hash: Int {
@@ -66,6 +76,7 @@ public final class AudioPublishOptions: NSObject, TrackPublishOptions, Sendable 
         hasher.combine(red)
         hasher.combine(streamName)
         hasher.combine(preConnect)
+        hasher.combine(resend)
         return hasher.finalize()
     }
 }
@@ -89,6 +100,7 @@ extension AudioPublishOptions {
             red: red,
             streamName: streamName,
             preConnect: enabled,
+            resend: resend,
         )
     }
 }

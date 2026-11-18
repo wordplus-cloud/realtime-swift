@@ -381,6 +381,22 @@ extension SignalClient {
             return
         }
 
+        // WordPlus Mesh (1.0.10): the client's settings on a running call, whenever they change (`Mesh.settingsField`),
+        // which nanopb would read as an empty message as well
+        if case let .data(data) = message, let settings = Mesh.settingsJSON(inSignalMessage: data) {
+            log("settings from the server: \(settings.count) bytes", .debug)
+            _delegate.notifyDetached { await $0.signalClient(self, didReceiveMeshSettings: settings) }
+            return
+        }
+
+        // WordPlus Mesh (1.0.13): the tracks it subscribes to that stopped reaching its node (`Mesh.sourcesDryField`),
+        // which nanopb would read as an empty message as well
+        if case let .data(data) = message, let dry = Mesh.sourcesDry(inSignalMessage: data) {
+            log("sources that stopped reaching the node: \(dry)", .debug)
+            _delegate.notifyDetached { await $0.signalClient(self, didReceiveMeshSourcesDry: dry) }
+            return
+        }
+
         guard case let .data(rawData) = message,
               let response = try? Livekit_SignalResponse(serializedBytes: rawData)
         else {
@@ -560,8 +576,11 @@ private extension SignalClient {
 
 extension SignalClient {
     func resumeQueues() async {
-        await _responseQueue.resume()
+        // WordPlus Mesh (1.0.14): requests first. An answer and its ICE candidates can't be queued (canBeQueued), so
+        // one made before this reached the requests was dropped, and the server, having no answer to its offer, let
+        // the connection fail some 15 seconds later, with nothing said. A queued offer answered quickly did that.
         await _requestQueue.resume()
+        await _responseQueue.resume()
     }
 
     /// Whether `response` passes the gate armed by `cleanUp()`; a Join/ReconnectResponse opens it.

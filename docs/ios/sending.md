@@ -1,6 +1,6 @@
 # Sending from your server
 
-Your server sends to rooms and to users with its secret, the same way whether a browser or an app gets it ([sending in depth](https://docs.wordplus.cloud/apps/sending/)).
+Your server sends to rooms and to users with its secret, the same way whether a browser or an app gets it ([sending in depth](https://docs.wordplus.cloud/apps/sending/)). What people build with it: [live updates and notifications](https://docs.wordplus.cloud/use-cases/live-updates/).
 
 ## To a room
 
@@ -83,16 +83,28 @@ rt.on("notice") { data, _ in toast(data["text"]?.string ?? "") }
 for await (notice, _) in rt.events("notice") { toast(notice["text"]?.string ?? "") }   // or as a sequence
 ```
 
-It reaches the app while it is connected. This SDK has no push yet: an app that is closed, or long in the background, hears it next time it opens only if it was also kept in the history of a room.
+It reaches the app while it is connected. The SDK pushes calls alone ([ringing a locked phone](calls.md#ringing-a-locked-phone)): an app that is closed, or long in the background, hears what your server sent it next time it opens only if it was also kept in the history of a room.
 
 ## Asking the app
 
-Your server asks the open pages and apps of a user, and waits for their replies ([a user](https://docs.wordplus.cloud/apps/sending/#a-user)):
+Your server asks the open pages and apps of a user, and waits for their replies ([a user](https://docs.wordplus.cloud/apps/sending/#a-user), and the use case [every page and app of a user](https://docs.wordplus.cloud/use-cases/devices/)):
 
 **Node**
 
 ```ts
 const replies = await realtime.user( 42 ).ask( 'cart', { why: 'checkout' } );   // [ { data, at } ]
+```
+
+**PHP**
+
+```php
+$replies = $realtime->user( 42 )->ask( 'cart', [ 'why' => 'checkout' ] );   // [ [ 'data' => …, 'at' => … ] ]
+```
+
+**Python**
+
+```python
+replies = realtime.user(42).ask("cart", {"why": "checkout"})   # [ { "data": …, "at": … } ]
 ```
 
 The app answers the events it chooses. The question and the reply are sealed with the key of the user:
@@ -111,4 +123,4 @@ rt.on("signed_out") { _, _ in showSignIn() }
 
 ## Webhooks
 
-What apps and pages send to rooms, and who comes online, reaches your server by webhook, as for your web pages ([webhooks](https://docs.wordplus.cloud/apps/sending/#webhooks)).
+What apps and pages send to rooms, who comes online, and a live stream going live and ending reach your server by webhook, as for your web pages ([webhooks](https://docs.wordplus.cloud/apps/sending/#webhooks), [live streams](streams.md#webhooks)).

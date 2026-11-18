@@ -414,6 +414,8 @@ extension Room {
             $0.isReconnectingWithMode = .quick
             $0.nextReconnectMode = nextReconnectMode
         }
+        // WordPlus Mesh (1.0.13): the node says its list again on the connection restored
+        takeMeshSourcesDry([])
 
         // quick connect sequence, does not update connection state
         @Sendable func quickReconnectSequence() async throws {
@@ -524,13 +526,19 @@ extension Room {
         }
 
         do {
-            let reconnectTask = Task.retrying(totalAttempts: _state.connectOptions.reconnectAttempts,
+            // WordPlus Mesh (1.0.10): the waits the client's settings give (ConnectOptions.meshReconnectDelays), else the curve
+            let meshDelays = _state.connectOptions.meshReconnectDelays
+            let reconnectTask = Task.retrying(totalAttempts: meshDelays?.count ?? _state.connectOptions.reconnectAttempts,
                                               retryDelay: { @Sendable attempt in
-                                                  let delay = TimeInterval.computeReconnectDelay(forAttempt: attempt,
-                                                                                                 baseDelay: self._state.connectOptions.reconnectAttemptDelay,
-                                                                                                 maxDelay: self._state.connectOptions.reconnectMaxDelay,
-                                                                                                 totalAttempts: self._state.connectOptions.reconnectAttempts,
-                                                                                                 addJitter: true)
+                                                  let delay = if let meshDelays {
+                                                      Mesh.reconnectDelay(forAttempt: attempt, delays: meshDelays)
+                                                  } else {
+                                                      TimeInterval.computeReconnectDelay(forAttempt: attempt,
+                                                                                         baseDelay: self._state.connectOptions.reconnectAttemptDelay,
+                                                                                         maxDelay: self._state.connectOptions.reconnectMaxDelay,
+                                                                                         totalAttempts: self._state.connectOptions.reconnectAttempts,
+                                                                                         addJitter: true)
+                                                  }
                                                   self.log("[Connect] Retry cycle waiting for \(String(format: "%.2f", delay)) seconds before attempt \(attempt + 1)")
                                                   return delay
                                               }) { currentAttempt, totalAttempts in

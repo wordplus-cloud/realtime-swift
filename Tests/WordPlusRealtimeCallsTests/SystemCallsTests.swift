@@ -130,5 +130,39 @@ final class SystemCallsTests: XCTestCase {
         SystemCalls.shared.ringOver("ring-sim", reason: "cancelled")
         XCTAssertFalse(SystemCalls.shared.busy)
     }
+
+    /// A ring of the app's own form: the app reads it, a push of the SDK's form never reaches the reader, a push it does
+    /// not know is no ring, and the app calling it off leaves nothing ringing.
+    @MainActor
+    func testAnAppReadsItsOwnRings() async throws {
+        guard !SystemCalls.isAvailable else { throw XCTSkip("CallKit runs here: a phone's check") }
+        SystemCalls.start(.init(name: "Example Shop")) { nil }
+
+        var read: [String] = []
+        SystemCalls.onAppPush { payload in
+            guard let ring = payload["app"] as? [String: Any], let id = ring["id"] as? String else { return nil }
+            read.append(id)
+            return SystemCalls.AppRing(id: id, name: "Visitor 412", video: false, until: Date().addingTimeInterval(30), handle: "app:412")
+        }
+        var declined: [String] = []
+        SystemCalls.onAppDecline { declined.append($0.id) }
+
+        var done = false
+        SystemCalls.shared.pushReceived(["aps": [String: Any](), "app": ["id": "site#412"]]) { done = true }
+        XCTAssertTrue(done, "a VoIP push is always done with at once")
+        XCTAssertEqual(read, ["site#412"])
+
+        SystemCalls.shared.pushReceived(push(ring(id: "ring-sdk"))) {}
+        XCTAssertEqual(read, ["site#412"], "a ring of the line is the SDK's, never the app's")
+        SystemCalls.shared.ringOver("ring-sdk", reason: "cancelled")
+
+        var unread = false
+        SystemCalls.shared.pushReceived(["aps": [String: Any](), "other": 1]) { unread = true }
+        XCTAssertTrue(unread)
+
+        SystemCalls.endAppRing("site#412", answeredElsewhere: true)
+        XCTAssertFalse(SystemCalls.shared.busy)
+        XCTAssertEqual(declined, [], "called off by the app is no decline")
+    }
     #endif
 }

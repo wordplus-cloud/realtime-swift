@@ -94,18 +94,29 @@ public struct LiveStreamHand: Equatable, Sendable {
 }
 
 /**
- A live stream the app's server lets this user into, as its `streams()` rule says: `rt.calls.stream("show:42")`. Its
- state, the audience's count, the chat and the stage change as the stream goes, on the main queue (`onChange`); the
- picture shows in a `LiveStreamVideoView`. A host goes live with the camera and microphone (`goLive()`), and ends it.
- What a role may not do throws its code (`not_host`, `read_only`, `slow` …).
+ A live stream the app's server lets this user into, by a token from its own route, `rt.joinStream(getToken:)`, or as its
+ `streams()` rule says, `rt.calls.stream("show:42")`. Its state, the audience's count, the chat and the stage change as
+ the stream goes, on the main queue (`onChange`), and the picture shows in a `LiveStreamVideoView`. A host goes live with
+ the camera and microphone (`goLive()`), and ends it. What a role may not do throws its code (`not_host`, `read_only`,
+ `slow` …).
  */
 @MainActor
 public final class LiveStream {
     public let name: String
+    /// Whether this app takes the picture: false for one joined with `video: false`, until `watch()`.
+    public private(set) var video: Bool
     public private(set) var role: LiveStreamRole = .viewer
     public private(set) var state: LiveStreamState = .idle
     /// This app's place in the stream's room: `live` once the picture can come.
-    public private(set) var media: LiveStreamMedia = .off
+    public internal(set) var media: LiveStreamMedia = .off {
+        didSet { if media != .connecting { waiting = nil } }
+    }
+    /// While the join waits for a place: until when, and why (`busy`, `slot`, `unreachable`, or `full` while as many watch
+    /// as the stream takes, `until` its next try then). `media` stays `connecting`, and the join goes on by itself. Nil at
+    /// any other time.
+    public private(set) var waiting: CallWait?
+    /// How many may watch at once, as the cloud said at the join; nil where it set no limit.
+    public internal(set) var audience: Int?
     public private(set) var startedAt: Date?
     /// How many watch, the stream's hosts and guests not counted, and the most at once since it went live.
     public private(set) var viewers = 0
@@ -133,15 +144,28 @@ public final class LiveStream {
     public private(set) var handRaised = false
     public private(set) var invited = false
     /// Whether this user, a viewer, is on stage beside the host.
-    public private(set) var onStage = false
-    /// What this app sends, a host's or a guest's: its camera and its microphone.
+    public internal(set) var onStage = false
+    /// Whether this user may ask to come on stage now: signed in, not the host, while it is live and takes guests.
+    public var canAskStage: Bool { role != .host && (identity?.hasPrefix("u:") ?? false) && state == .live && stageOn }
+    /// This user in the stream, and whether the stream takes guests (its setting, which may change as it goes).
+    private var identity: String?
+    private var stageOn = true
+    /// What `ask` does in a test, which has no chat socket.
+    var asking: ((String, [String: JSONValue]) async -> JSONValue?)?
+    /// What this app sends, a host's or a guest's: its camera, its microphone and its screen.
     public private(set) var camera = false
     public private(set) var microphone = false
+    public private(set) var sharingScreen = false
     /// Why this app is out of the stream: `left`, `banned`, `kicked`, or what it couldn't go on with. Nil while in it.
     public private(set) var endReason: String?
+    /// The viewer's choice of picture (`setQuality`): `auto` by the size of the view showing it, the default.
+    public private(set) var quality: LiveStreamQuality = .auto
 
     private unowned let owner: RealtimeCalls
-    private var seats: JSONValue = .null
+    /// Where a grant comes from for a stream joined with a token of the app's server. Nil for one joined by its name,
+    /// whose grant the calls route signs.
+    private let grant: (@MainActor () async throws -> String)?
+    var seats: JSONValue = .null
     private var joinedAt = Date()
     private var chatRight = "read"
     private var chat: NamespaceSocket?
@@ -156,6 +180,10 @@ public final class LiveStream {
     private var messageHandlers: [(LiveStreamMessage) -> Void] = []
     private var reactionHandlers: [([String: Int]) -> Void] = []
     private var endHandlers: [(String) -> Void] = []
+    private var waitingHandlers: [(CallWait) -> Void] = []
+    let playback = LiveStreamPlayback()
+    private var reading: Task<Void, Never>?
+    private var statisticsAsked: Set<ObjectIdentifier> = []
     #if canImport(UIKit)
     private let views = NSHashTable<LiveStreamVideoView>.weakObjects()
     #endif
@@ -165,16 +193,25 @@ public final class LiveStream {
     /// Viewers spread their arrival over this when a stream goes live, so a big audience doesn't come at once.
     static let liveJitter: TimeInterval = 2
     static let historyKept = 200
+    /// A viewer still joining this long in while the stream is full waits for a place, as the web's player has it, and one
+    /// the room refused while it is full tries again this often: the media server doesn't say why it refuses one.
+    static let fullAfter: TimeInterval = 4
+    static let fullRetry: TimeInterval = 10
 
-    init(owner: RealtimeCalls, name: String) {
+    init(owner: RealtimeCalls, name: String, video: Bool = true, grant: (@MainActor () async throws -> String)? = nil) {
         self.owner = owner
         self.name = name
+        self.video = video
+        self.grant = grant
     }
 
     // MARK: - Hearing it
 
     /// Any change: the state, the count, the chat, the stage. On the main queue.
     public func onChange(_ handler: @escaping () -> Void) { changeHandlers.append(handler) }
+
+    /// The join waits for a place on the mesh: until when, and why. It goes on by itself.
+    public func onWaiting(_ handler: @escaping (CallWait) -> Void) { waitingHandlers.append(handler) }
 
     /// Each new message in the chat.
     public func onMessage(_ handler: @escaping (LiveStreamMessage) -> Void) { messageHandlers.append(handler) }
@@ -218,7 +255,14 @@ public final class LiveStream {
 
     /// Comes on stage when invited (`invited`), with the camera and microphone beside the host's.
     public func joinStage() async throws {
-        let reply = try await ask("stage", [:])
+        let reply: JSONValue
+        do {
+            reply = try await ask("stage", [:])
+        } catch {
+            invited = false
+            changed()
+            throw error
+        }
         invited = false
         handRaised = false
         guard let url = reply["media"]?["url"]?.string, let token = reply["media"]?["token"]?.string else {
@@ -238,12 +282,31 @@ public final class LiveStream {
         }
     }
 
-    /// Off stage, by choice or by the host: back to watching.
+    /// Says no to the invitation, for now: the host is told nothing, and may invite again.
+    public func declineStage() {
+        guard invited else { return }
+        invited = false
+        changed()
+    }
+
+    /// Off stage by choice, back to watching. The cloud takes this guest off everyone's stage first: left to itself, the
+    /// guest's session stays a publisher in the room until the media server lets it go, and the viewer's join, the same
+    /// person's, waits for it. A cloud that refuses leaves it at that.
     public func leaveStage() {
+        guard onStage, let identity else { return backToWatching(watch: true) }
+        backToWatching(watch: false)
+        Task { @MainActor in
+            _ = try? await ask("unstage", ["identity": .string(identity)])
+            if video { watch(after: 0) }
+        }
+    }
+
+    /// Off stage, once, whichever comes first: the word of the cloud, or this app.
+    private func backToWatching(watch watching: Bool) {
         guard onStage else { return }
         onStage = false
         stopMedia()
-        if state == .live { watch(after: 0) }
+        if watching && video && state == .live { watch(after: 0) }
     }
 
     // MARK: - A host's
@@ -296,8 +359,10 @@ public final class LiveStream {
     /// One message per `seconds`, 0 to turn it off.
     public func setSlow(_ seconds: Int) async throws { _ = try await ask("slow", ["seconds": .number(Double(seconds))]) }
     public func clearChat() async throws { _ = try await ask("clear", [:]) }
-    /// Out of the stream now; they may come back.
-    public func kick(_ user: String) async throws { _ = try await ask("kick", ["identity": .string("u:" + user)]) }
+    /// Out of the stream now; they may come back. The same word as on a room and a group call.
+    public func remove(_ user: String) async throws { _ = try await ask("kick", ["identity": .string("u:" + user)]) }
+    /// The same as `remove(_:)`.
+    public func kick(_ user: String) async throws { try await remove(user) }
     /// Out of the stream, and kept out.
     public func ban(_ user: String) async throws { _ = try await ask("ban", ["identity": .string("u:" + user)]) }
 
@@ -336,6 +401,40 @@ public final class LiveStream {
         changed()
     }
 
+    /// Shares this phone's screen, or stops, for a host or a guest on stage. To share it needs the app's broadcast extension
+    /// (`ScreenShare`), joins the room, and puts up the system's picker: true says it was asked, and `onChange` shows
+    /// `sharingScreen` when the share begins. It shows as the stage's main picture once the stream is live.
+    @discardableResult
+    public func setScreenShare(_ on: Bool) async -> Bool {
+        guard on else {
+            _ = try? await room?.localParticipant.set(source: .screenShareVideo, enabled: false)
+            stopBroadcast()
+            return false
+        }
+        guard !sharingScreen else { return true }
+        guard sends, ScreenShare.isAvailable, let room = await mediaRoom() else { return false }
+        do {
+            _ = try await room.localParticipant.set(source: .screenShareVideo, enabled: true)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// The room says the screen went out, or came down.
+    func screenPublished(_ on: Bool) {
+        guard sharingScreen != on else { return }
+        sharingScreen = on
+        refreshTiles()
+    }
+
+    /// A broadcast outlives the room that started it unless told.
+    private func stopBroadcast() {
+        #if os(iOS)
+        if BroadcastManager.shared.isBroadcasting { BroadcastManager.shared.requestStop() }
+        #endif
+    }
+
     /// Starts the stream: what this app has on goes out (the camera and microphone when nothing is), then everyone
     /// watching sees it live.
     public func goLive() async throws {
@@ -361,12 +460,19 @@ public final class LiveStream {
     func join() async throws {
         try await requestSeats()
         openChat()
-        if role == .viewer && state == .live { watch(after: 0) }
+        if video && role == .viewer && state == .live { watch(after: 0) }
+    }
+
+    /// The next grant: from the token the app's server gave, or signed by its calls route.
+    private func nextGrant() async throws -> String {
+        if let grant { return try await grant() }
+        let answer = try await owner.authorize(["stream": name])
+        guard let token = answer["token"] as? String else { throw CallError("auth_failed") }
+        return token
     }
 
     private func requestSeats(retried: Bool = false) async throws {
-        let grant = try await owner.authorize(["stream": name])
-        guard let token = grant["token"] as? String else { throw CallError("auth_failed") }
+        let token = try await nextGrant()
 
         var request = URLRequest(url: owner.rt.serverURL.appendingPathComponent("easy-stream/v1/join"))
         request.httpMethod = "POST"
@@ -389,6 +495,7 @@ public final class LiveStream {
 
         seats = reply
         joinedAt = Date()
+        audience = reply["audience"]?.int
         applyYou(reply["you"] ?? .null)
         applyStream(reply["stream"] ?? .null)
     }
@@ -516,7 +623,7 @@ public final class LiveStream {
             invited = true
             handRaised = false
         case "unstaged":
-            leaveStage()
+            backToWatching(watch: true)
         case "banned":
             finish("banned")
             return
@@ -532,6 +639,8 @@ public final class LiveStream {
     private func applyYou(_ you: JSONValue) {
         guard you != .null else { return }
         if let role = you["role"]?.string.flatMap(LiveStreamRole.init(rawValue:)) { self.role = role }
+        identity = you["identity"]?.string ?? identity
+        stageOn = you["stage"]?.bool != false
         chatRight = you["chat"]?.string ?? chatRight
         isModerator = role == .host || you["mod"]?.bool == true
     }
@@ -542,7 +651,7 @@ public final class LiveStream {
         state = next
         startedAt = stream["started_at"]?.number.map { Date(timeIntervalSince1970: $0 / 1000) }
 
-        if next == .live && was != .live && role == .viewer && room == nil {
+        if video && next == .live && was != .live && role == .viewer && room == nil {
             watch(after: was == .idle ? Double.random(in: 0...Self.liveJitter) : 0)
         }
         if next == .ended { stopMedia() }
@@ -581,13 +690,27 @@ public final class LiveStream {
     }
 
     private func ask(_ event: String, _ payload: [String: JSONValue]) async throws -> JSONValue {
-        guard let chat else { throw CallError("not_connected") }
-        guard let reply = await chat.emit(event, .object(payload)) else { throw CallError("timeout") }
+        let answer: JSONValue?
+        if let asking {
+            answer = await asking(event, payload)
+        } else {
+            guard let chat else { throw CallError("not_connected") }
+            answer = await chat.emit(event, .object(payload))
+        }
+        guard let reply = answer else { throw CallError("timeout") }
         guard reply["ok"]?.bool == true else { throw CallError(reply["error"]?.string ?? "server") }
         return reply
     }
 
     // MARK: - The picture
+
+    /// The picture and sound of a stream joined with `video: false`: they come as they would have. A `LiveStreamVideoView`
+    /// asks for them by itself.
+    public func watch() {
+        guard !video else { return }
+        video = true
+        if role == .viewer && state == .live && room == nil { watch(after: 0) }
+    }
 
     private func watch(after delay: TimeInterval) {
         Task { @MainActor [weak self] in
@@ -606,6 +729,7 @@ public final class LiveStream {
         let task = Task { @MainActor [weak self] () -> LiveKit.Room? in
             guard let self else { return nil }
             if self.media != .reconnecting { self.media = .connecting }
+            self.playback.joining()
             self.changed()
             if seat == nil, Date().timeIntervalSince(self.joinedAt) > Self.seatsFresh { try? await self.requestSeats() }
             guard let url = seat?.url ?? self.seats["media"]?["url"]?.string,
@@ -613,6 +737,13 @@ public final class LiveStream {
                 self.media = .off
                 return nil
             }
+
+            let fullCheck = seat == nil && self.role == .viewer ? Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(Self.fullAfter * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                self?.waitIfFull()
+            } : nil
+            defer { fullCheck?.cancel() }
 
             let room = LiveKit.Room()
             let watcher = LiveStreamRoomWatcher(self)
@@ -624,17 +755,14 @@ public final class LiveStream {
             let connectOptions = ConnectOptions(
                 meshJoinBudget: 30,
                 meshHardwareDecoders: CallCodecs.hardwareDecoders(caps),
-                onMeshWait: nil,
+                onMeshWait: { [weak self] wait in Task { @MainActor in self?.heardWait(CallWait(wait)) } },
                 meshHardwareEncoders: CallCodecs.hardwareEncoders(caps)
             )
             do {
                 try await room.connect(url: url, token: token, connectOptions: connectOptions, roomOptions: RoomOptions(adaptiveStream: true, dynacast: true))
             } catch {
                 self.releaseAudio()
-                // Still live: the room again in a while, as the web's player does.
-                self.media = .reconnecting
-                if self.endReason == nil, self.state == .live, self.role == .viewer { self.watch(after: 3) }
-                self.changed()
+                self.joinFailed(asViewer: seat == nil && self.role == .viewer)
                 return nil
             }
             guard self.endReason == nil else {
@@ -645,6 +773,8 @@ public final class LiveStream {
             self.room = room
             self.roomWatcher = watcher
             self.media = .live
+            self.playback.joined(server: LiveStreamStats.Server(url: url, node: room.serverNodeId, region: room.serverRegion, version: room.serverVersion))
+            self.startReading()
             self.refreshTiles()
             return room
         }
@@ -677,8 +807,43 @@ public final class LiveStream {
         return VideoPublishOptions(preferredCodec: VideoCodec.from(name: codec) ?? .vp8, preferredBackupCodec: backup.flatMap { VideoCodec.from(name: $0) })
     }
 
+    /// Whether as many watch as the stream takes.
+    private var full: Bool { audience.map { viewers >= $0 } ?? false }
+
+    /// A viewer's join that is taking a while, while the stream is full, is waiting for a place: the room refuses them
+    /// until someone leaves, and the room client tries again meanwhile.
+    func waitIfFull() {
+        guard room == nil, media == .connecting, waiting == nil, full else { return }
+        heardWait(CallWait(until: Date().addingTimeInterval(Self.fullRetry), reason: "full"))
+    }
+
+    /// The room could not be joined. Still live, a viewer tries again in a while, as the web's player does: every few
+    /// seconds while the stream is full, as a place may come, and told so.
+    func joinFailed(asViewer: Bool) {
+        playback.failed(asViewer ? "media_unreachable" : "publish_failed")
+        let live = video && endReason == nil && state == .live
+        if asViewer, full {
+            media = .connecting
+            heardWait(CallWait(until: Date().addingTimeInterval(Self.fullRetry), reason: "full"))
+            if live { watch(after: Self.fullRetry + Double.random(in: 0...Self.liveJitter)) }
+            return
+        }
+        media = .reconnecting
+        if live, asViewer { watch(after: 3) }
+        changed()
+    }
+
+    /// A join waiting for a place on the mesh, as the room client tells it.
+    func heardWait(_ wait: CallWait) {
+        guard room == nil, media == .connecting || media == .reconnecting else { return }
+        waiting = wait
+        waitingHandlers.forEach { $0(wait) }
+        changed()
+    }
+
     /// The room left, what this app sends kept: for another place in it (a viewer's for a guest's).
     private func leaveRoom() {
+        stopReading()
         let room = self.room
         self.room = nil
         roomWatcher = nil
@@ -706,6 +871,7 @@ public final class LiveStream {
 
     /// The room left and what this app sent stopped: the stream ended, or this app left it.
     private func stopMedia() {
+        stopReading()
         releaseAudio()
         let room = self.room
         let video = localVideo
@@ -716,6 +882,8 @@ public final class LiveStream {
         published = []
         camera = false
         microphone = false
+        if sharingScreen { stopBroadcast() }
+        sharingScreen = false
         media = .off
         Task {
             try? await video?.stop()
@@ -727,6 +895,7 @@ public final class LiveStream {
     /// The room dropped this app: joined again while the stream is live, as the web's player does.
     func roomDropped(_ dropped: LiveKit.Room) {
         guard room === dropped else { return }
+        stopReading()
         room = nil
         releaseAudio()
         roomWatcher = nil
@@ -740,7 +909,7 @@ public final class LiveStream {
         }
         media = .reconnecting
         refreshTiles()
-        if role == .viewer { watch(after: 2) }
+        if video && role == .viewer { watch(after: 2) }
     }
 
     /// The stage again, from the room: whoever sends in it, the host first.
@@ -770,10 +939,10 @@ public final class LiveStream {
                 ))
             }
         }
-        if sends, camera || microphone {
+        if sends, camera || microphone || sharingScreen {
             next.append(LiveStreamTile(
                 identity: "local", user: nil, name: "", avatar: nil, role: onStage ? .guest : role, local: true,
-                camera: camera, screen: false, microphone: microphone, speaking: false, encoder: false
+                camera: camera, screen: sharingScreen, microphone: microphone, speaking: false, encoder: false
             ))
         }
         tiles = next.sorted { ($0.role == .host ? 0 : 1) < ($1.role == .host ? 0 : 1) }
@@ -798,15 +967,142 @@ public final class LiveStream {
     /// A tile's picture: its shared screen, else its camera; this app's own camera for its own tile.
     func videoTrack(of tile: LiveStreamTile?) -> VideoTrack? {
         guard let tile else { return nil }
-        if tile.local { return camera ? localVideo : nil }
+        if tile.local {
+            let screen = sharingScreen ? room?.localParticipant.trackPublications.values.first { $0.source == .screenShareVideo }?.track as? VideoTrack : nil
+            return screen ?? (camera ? localVideo : nil)
+        }
+        return picture(of: tile)?.track as? VideoTrack
+    }
+
+    private func publications(of tile: LiveStreamTile) -> [TrackPublication] {
         let participant = room?.remoteParticipants.values.first { $0.identity?.stringValue == tile.identity }
-        let publications: [TrackPublication] = participant.map { Array($0.trackPublications.values) } ?? []
-        let screen = publications.first { $0.source == .screenShareVideo && !$0.isMuted }?.track as? VideoTrack
-        return screen ?? publications.first { $0.source == .camera && !$0.isMuted }?.track as? VideoTrack
+        return participant.map { Array($0.trackPublications.values) } ?? []
+    }
+
+    /// The publication of someone else's picture: their shared screen, else their camera.
+    private func picture(of tile: LiveStreamTile) -> TrackPublication? {
+        let publications = publications(of: tile)
+        return publications.first { $0.source == .screenShareVideo && !$0.isMuted } ?? publications.first { $0.source == .camera && !$0.isMuted }
+    }
+
+    private func layers(of tile: LiveStreamTile?) -> [LiveStreamLayer] {
+        guard let tile, !tile.local, let publication = picture(of: tile), let size = publication.dimensions else { return [] }
+        return LiveStreamPicture.layers(width: Int(size.width), height: Int(size.height), simulcast: publication.isSimulcasted)
+    }
+
+    /// The layers of the main picture a viewer may choose, the best first, each with its size: what `setQuality` chooses
+    /// from. None above 720p, which comes only on `auto`, to a view big enough for it. None before the picture arrives, and
+    /// for a host's own. Their sizes are worked out from the picture's: the largest, then half and a quarter.
+    public func qualities() -> [LiveStreamLayer] {
+        LiveStreamPicture.choosable(layers(of: mainTile))
+    }
+
+    /// The picture's quality: one of the layers `qualities()` gives, whatever the size of the view, or `auto`, the default,
+    /// by its size. A layer above 720p chosen still gives 720p.
+    public func setQuality(_ quality: LiveStreamQuality) {
+        guard quality != self.quality else { return }
+        self.quality = quality
+        playback.note("quality", quality.rawValue)
+        changed()
+    }
+
+    /// How the stream plays here, to debug it: the picture and the sound that arrive, the media server and the way they
+    /// come, and the session so far (how long the picture took to start, stalls, reconnects), with the last things that
+    /// happened. Measured on this device once a second while the room is joined, and sent nowhere.
+    public func stats() -> LiveStreamStats {
+        playback.snapshot()
+    }
+
+    /// The layer a view showing this tile asks for: nil on `auto`.
+    func chosenLayer(of tile: LiveStreamTile?) -> LiveStreamLayer? {
+        LiveStreamPicture.chosen(quality, in: layers(of: tile))
+    }
+
+    private func startReading() {
+        reading?.cancel()
+        reading = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard !Task.isCancelled, let self else { return }
+                await self.readPlayback()
+            }
+        }
+    }
+
+    private func stopReading() {
+        reading?.cancel()
+        reading = nil
+        statisticsAsked = []
+        playback.left()
+    }
+
+    /// One reading a second of the main picture and its sound, whose counters the room client gathers once asked.
+    private func readPlayback() async {
+        guard room != nil else { return }
+        let tile = mainTile
+        let publication = tile.flatMap { $0.local ? nil : picture(of: $0) }
+        let track = publication?.track
+        let sound = tile.flatMap { $0.local ? nil : publications(of: $0).first { $0.source == .microphone && !$0.isMuted }?.track }
+        for asked in [track, sound].compactMap({ $0 }) where statisticsAsked.insert(ObjectIdentifier(asked)).inserted {
+            await asked.set(reportStatistics: true)
+        }
+        #if canImport(UIKit)
+        let shown = !views.allObjects.isEmpty
+        #else
+        let shown = false
+        #endif
+        let videoStats = track?.statistics
+        let audioStats = sound?.statistics
+        playback.read(
+            video: videoStats.flatMap(Self.rtp),
+            audio: audioStats.flatMap(Self.rtp),
+            layers: layers(of: tile),
+            transport: (videoStats ?? audioStats).map(Self.transport),
+            pictured: shown && track != nil
+        )
+    }
+
+    private static func rtp(_ stats: TrackStatistics) -> LiveStreamRtp? {
+        guard let inbound = stats.inboundRtpStream.first else { return nil }
+        return LiveStreamRtp(
+            bytes: inbound.bytesReceived ?? 0,
+            frames: inbound.framesDecoded ?? 0,
+            lost: inbound.packetsLost ?? 0,
+            received: inbound.packetsReceived ?? 0,
+            bufferDelay: inbound.jitterBufferDelay ?? 0,
+            emitted: inbound.jitterBufferEmittedCount ?? 0,
+            concealed: inbound.concealedSamples ?? 0,
+            samples: inbound.totalSamplesReceived ?? 0,
+            freezes: inbound.freezeCount ?? 0,
+            frozen: inbound.totalFreezesDuration ?? 0,
+            nacks: inbound.nackCount ?? 0,
+            plis: inbound.pliCount ?? 0,
+            dropped: inbound.framesDropped ?? 0,
+            width: inbound.frameWidth ?? 0,
+            height: inbound.frameHeight ?? 0,
+            fps: inbound.framesPerSecond ?? 0,
+            jitter: inbound.jitter ?? 0,
+            codec: stats.codec.first { $0.id == inbound.codecId }?.mimeType,
+            decoder: inbound.decoderImplementation,
+            hardware: inbound.powerEfficientDecoder
+        )
+    }
+
+    private static func transport(_ stats: TrackStatistics) -> LiveStreamStats.Transport {
+        let selected = stats.transportStats?.selectedCandidatePairId
+        let pair = stats.iceCandidatePair.first { $0.id == selected } ?? stats.iceCandidatePair.first { $0.nominated == true }
+        let local = stats.localIceCandidate
+        return LiveStreamStats.Transport(
+            protocol: local?.protocol,
+            relayed: local?.candidateType.map { $0 == .relay },
+            relayProtocol: local?.relayProtocol?.rawValue,
+            rttMs: pair?.currentRoundTripTime.map { $0 * 1000 }
+        )
     }
 
     #if canImport(UIKit)
     func show(in view: LiveStreamVideoView) {
+        watch()
         views.add(view)
         view.draw(self)
     }
@@ -857,17 +1153,73 @@ final class LiveStreamRoomWatcher: NSObject, RoomDelegate, @unchecked Sendable {
     func room(_ room: LiveKit.Room, didDisconnectWithError error: LiveKitError?) {
         Task { @MainActor [weak self] in self?.stream?.roomDropped(room) }
     }
+
+    func room(_ room: LiveKit.Room, participant: LocalParticipant, didPublishTrack publication: LocalTrackPublication) {
+        guard publication.source == .screenShareVideo else { return }
+        Task { @MainActor [weak self] in self?.stream?.screenPublished(true) }
+    }
+
+    func room(_ room: LiveKit.Room, participant: LocalParticipant, didUnpublishTrack publication: LocalTrackPublication) {
+        guard publication.source == .screenShareVideo else { return }
+        Task { @MainActor [weak self] in self?.stream?.screenPublished(false) }
+    }
+
+    func roomIsReconnecting(_ room: LiveKit.Room) {
+        Task { @MainActor [weak self] in self?.stream?.playback.reconnecting() }
+    }
+
+    func roomDidReconnect(_ room: LiveKit.Room) {
+        Task { @MainActor [weak self] in self?.stream?.playback.reconnected() }
+    }
 }
 
 extension RealtimeCalls {
     /**
      The live stream `name`, as the app's server's `streams()` rule lets this user in: a host, a guest or a viewer.
      A viewer of a live stream sees its picture at once in a `LiveStreamVideoView`. Throws its code: `forbidden` (the
-     rule said no), `not_included` (the app's plan doesn't stream), `banned`, `no_hours` …
+     rule said no), `not_included` (the app's plan doesn't stream), `banned`, `no_hours` … `video: false` for an app
+     that shows only the chat or the stream's details: the picture is fetched once something wants it (`watch()`, or a
+     `LiveStreamVideoView`).
      */
     @MainActor
-    public func stream(_ name: String) async throws -> LiveStream {
-        let stream = LiveStream(owner: self, name: name)
+    public func stream(_ name: String, video: Bool = true) async throws -> LiveStream {
+        let stream = LiveStream(owner: self, name: name, video: video)
+        try await stream.join()
+        return stream
+    }
+
+    /**
+     Joins the live stream in a token from the app's own server (`streamToken( user, name, options )` there), which decided
+     who this user is in it. A token lasts ten minutes, so `getToken` gets one from the app's route, and it is asked again as
+     each runs out, when the route may say no. Throws its code: `bad_token` for what isn't a token, or what the app's
+     function threw. `video: false` for an app that shows only the chat or the stream's details.
+     */
+    @MainActor
+    public func joinStream(getToken: @escaping () async throws -> String, video: Bool = true) async throws -> LiveStream {
+        try await intoStream(first: try await getToken(), again: getToken, video: video)
+    }
+
+    /// Joins the live stream in one token from the app's own server, for a screen that won't outlast it. Throws `expired`
+    /// when it would need another, which also ends a stream it has joined, and `bad_token` for what isn't a token.
+    @MainActor
+    public func joinStream(_ token: String, video: Bool = true) async throws -> LiveStream {
+        try await intoStream(first: token, again: nil, video: video)
+    }
+
+    /// The first token read for the stream it names and spent on the join, then a new one each time a grant runs out.
+    @MainActor
+    private func intoStream(first: String, again: (() async throws -> String)?, video: Bool) async throws -> LiveStream {
+        guard let made = CallTokens.stream(first) else { throw CallError("bad_token") }
+        var given: String? = made.token
+        let stream = LiveStream(owner: self, name: made.name, video: video) {
+            if let token = given {
+                given = nil
+                return token
+            }
+            guard let again else { throw CallError("expired") }
+            guard let next = CallTokens.stream(try await again()) else { throw CallError("bad_token") }
+            return next.token
+        }
         try await stream.join()
         return stream
     }

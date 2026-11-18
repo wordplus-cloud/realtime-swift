@@ -3,7 +3,8 @@ import Foundation
 /// The app's one connection to the realtime servers, as the browser's connector keeps
 /// it: straight to a node when it knows one, else the realtime server (the load balancer); to another node at a
 /// `migrate`, make before break, its rooms joined there before the switch; and again after a drop, from the first node
-/// that hasn't expired.
+/// that hasn't expired. On one namespace of the realtime server, `/channels` unless the app names another: the server
+/// sends `migrate` and `nodes` in every namespace, so all of this is the same on each.
 final class Connection: @unchecked Sendable {
     enum State: String, Sendable {
         case connecting, connected, disconnected, closed
@@ -11,6 +12,8 @@ final class Connection: @unchecked Sendable {
 
     let server: URL
     private let path: String
+    /// The namespace every socket of this connection opens, the first, after a drop and at a move alike.
+    let namespace: String
     private let auth: JSONValue
     private let queue: DispatchQueue
     private let store: NodeStore
@@ -30,9 +33,10 @@ final class Connection: @unchecked Sendable {
     private var scheduled: (reason: String, item: DispatchWorkItem)?
     private var closed = false
 
-    init(server: URL, path: String, auth: JSONValue, queue: DispatchQueue, store: NodeStore = UserDefaultsNodeStore()) {
+    init(server: URL, path: String, namespace: String = RealtimeOptions.channels, auth: JSONValue, queue: DispatchQueue, store: NodeStore = UserDefaultsNodeStore()) {
         self.server = server
         self.path = path
+        self.namespace = namespace
         self.auth = auth
         self.queue = queue
         self.store = store
@@ -67,7 +71,7 @@ final class Connection: @unchecked Sendable {
         guard !closed, let target = targets.first else { return }
         setState(.connecting, nil)
         let atServer = target == server
-        let socket = SocketIO(base: target, path: path, namespace: "/channels", auth: auth, queue: queue) { [weak self] socket, event in
+        let socket = SocketIO(base: target, path: path, namespace: namespace, auth: auth, queue: queue) { [weak self] socket, event in
             self?.socketEvent(socket, event, rest: Array(targets.dropFirst()))
         }
         current = socket
@@ -148,7 +152,7 @@ final class Connection: @unchecked Sendable {
         guard !closed, !moving, let old = current else { return }
         moving = true
         var switched = false
-        let next = SocketIO(base: target, path: path, namespace: "/channels", auth: auth, queue: queue) { [weak self] socket, event in
+        let next = SocketIO(base: target, path: path, namespace: namespace, auth: auth, queue: queue) { [weak self] socket, event in
             guard let self else { return }
             switch event {
             case .connected:

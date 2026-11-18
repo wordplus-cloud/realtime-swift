@@ -47,6 +47,10 @@ protocol SignalClientDelegate: AnyObject, Sendable {
     func signalClient(_ signalClient: SignalClient, didUpdateSubscribedAudioCodecs codecs: [Livekit_SubscribedAudioCodec], forTrackSid sid: String) async
     /// WordPlus Mesh (1.0.7): how often the node asks for the reports, ms (0: none).
     func signalClient(_ signalClient: SignalClient, didReceiveMeshReportPace every: Int) async
+    /// WordPlus Mesh (1.0.10): the client's settings on a running call, their JSON as the node sent it.
+    func signalClient(_ signalClient: SignalClient, didReceiveMeshSettings settings: Data) async
+    /// WordPlus Mesh (1.0.13): the tracks it subscribes to that stopped reaching its node, their whole list.
+    func signalClient(_ signalClient: SignalClient, didReceiveMeshSourcesDry dry: Set<String>) async
 }
 
 /// WordPlus Mesh (1.0.7): the mesh's messages are the room's alone; any other delegate (upstream's test doubles among
@@ -55,4 +59,6 @@ extension SignalClientDelegate {
     func signalClient(_: SignalClient, didReceiveMeshRegions _: [RegionInfo]) async {}
     func signalClient(_: SignalClient, didUpdateSubscribedAudioCodecs _: [Livekit_SubscribedAudioCodec], forTrackSid _: String) async {}
     func signalClient(_: SignalClient, didReceiveMeshReportPace _: Int) async {}
+    func signalClient(_: SignalClient, didReceiveMeshSettings _: Data) async {}
+    func signalClient(_: SignalClient, didReceiveMeshSourcesDry _: Set<String>) async {}
 }

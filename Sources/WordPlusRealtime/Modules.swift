@@ -8,7 +8,7 @@ import Foundation
 /// A socket the connection holds, or the one a move is about to switch to.
 @_spi(WordPlusModules)
 public struct ModuleSocket {
-    let socket: SocketIO
+    let socket: RoomSocket
 
     public var isConnected: Bool { socket.isConnected }
 
@@ -37,6 +37,10 @@ extension Realtime {
 
     /// The realtime server the app connects to (`https://ws.wordplus.cloud`), whose cloud a live stream joins.
     public var serverURL: URL { options.server }
+
+    /// The namespace the connection opens (`RealtimeOptions.namespace`): a module whose requests are `/channels`' own
+    /// holds nothing on another.
+    public var namespace: String { options.namespace }
 
     /// The socket the connection holds now, when it is connected. On the module queue.
     public var currentSocket: ModuleSocket? {

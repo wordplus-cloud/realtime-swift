@@ -40,26 +40,46 @@ extension LKRTCRtpSender: Loggable {
         let encodings = _parameters.encodings
 
         var didUpdate = false
+        var trimmedTo: String?
 
         // For SVC mode...
         if let firstEncoding = encodings.first,
            ScalabilityMode.fromString(firstEncoding.scalabilityMode) != nil
         {
-            let _enabled = qualities.highest != .off
+            let highest = qualities.highest
+            let _enabled = highest != .off
             if firstEncoding.isActive != _enabled {
                 firstEncoding.isActive = _enabled
                 didUpdate = true
             }
+            // WordPlus Mesh (1.0.11): the sizes up to the largest asked while camera.svcTrim is on, whole again once
+            // off (MeshSvcTrim); a stream turned off keeps its sizes, so it comes back on in one change
+            if _enabled, encodings.count == 1,
+               let plan = MeshSvcTrim.encoding(for: self, current: firstEncoding, highest: highest.rawValue)
+            {
+                if firstEncoding.scalabilityMode != plan.mode {
+                    firstEncoding.scalabilityMode = plan.mode
+                    trimmedTo = plan.mode
+                    didUpdate = true
+                }
+                if firstEncoding.scaleResolutionDownBy?.doubleValue != plan.scale {
+                    firstEncoding.scaleResolutionDownBy = plan.scale.map { NSNumber(value: $0) }
+                    didUpdate = true
+                }
+            }
         } else {
             // For Simulcast...
+            // WordPlus Mesh (1.0.10): a layer the camera's live caps turned off stays off (MeshCaps)
+            let cappedOff = MeshCappedLayers.off(self)
             for e in qualities {
                 guard let rid = e.quality.asRID else { continue }
                 guard let encodingforRID = encodings.first(where: { $0.rid == rid }) else { continue }
 
-                if encodingforRID.isActive != e.enabled {
+                let enabled = e.enabled && !cappedOff.contains(rid)
+                if encodingforRID.isActive != enabled {
                     didUpdate = true
-                    encodingforRID.isActive = e.enabled
-                    log("Setting layer \(e.quality) to \(e.enabled)", .info)
+                    encodingforRID.isActive = enabled
+                    log("Setting layer \(e.quality) to \(enabled)", .info)
                 }
             }
 
@@ -78,6 +98,11 @@ extension LKRTCRtpSender: Loggable {
 
         if didUpdate {
             parameters = _parameters
+            // WordPlus Mesh (1.0.11): a WebRTC that keeps its mode sends this camera whole from then on
+            if let trimmedTo, !MeshSvcTrim.check(self, asked: trimmedTo) {
+                log("WebRTC kept its SVC mode for \(trimmedTo): the camera goes out whole", .warning)
+                _set(subscribedQualities: qualities)
+            }
         }
     }
 }

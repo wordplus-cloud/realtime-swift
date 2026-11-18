@@ -3,7 +3,7 @@ import UIKit
 
 /// Every state of the call screen with no call: calling,
 /// ringing, connecting, a call by voice and by video, the microphone and camera off, the other side lost, this side
-/// reconnecting, and a group call by video and by voice, each in light and dark and right to left. The app's pieces
+/// reconnecting, a group call being joined, and a group call by video and by voice, each in light and dark and right to left. The app's pieces
 /// (`CallScreen.shared.pieces`) and look (`configure`) are drawn as in a call, and an app that copied the screen
 /// (`swift package wordplus-ui add`) has this file in its copy, so the preview draws the copy.
 ///
@@ -15,10 +15,10 @@ import UIKit
 public final class CallScreenPreview: UIViewController, UITableViewDataSource, UITableViewDelegate {
     /// A state the screen can be in.
     public enum Shown: String, CaseIterable, Sendable {
-        case calling, ringing, connecting, voice, video, off, peerLost, reconnecting, group, groupVoice, optimizing
+        case calling, ringing, connecting, voice, video, off, peerLost, reconnecting, groupJoining, group, groupVoice, optimizing, addPerson, groupWaiting, recording
 
         /// A group call, whose grid the screen draws.
-        var isGroup: Bool { self == .group || self == .groupVoice || self == .optimizing }
+        var isGroup: Bool { self == .groupJoining || self == .group || self == .groupVoice || self == .optimizing || self == .groupWaiting || self == .recording }
 
         public var title: String {
             switch self {
@@ -30,9 +30,13 @@ public final class CallScreenPreview: UIViewController, UITableViewDataSource, U
             case .off: return "Microphone and camera off"
             case .peerLost: return "The other side lost"
             case .reconnecting: return "This side reconnecting"
+            case .groupJoining: return "Group call being joined"
             case .group: return "Group call by video"
             case .groupVoice: return "Group call by voice"
             case .optimizing: return "A camera changing codec"
+            case .addPerson: return "Add Person"
+            case .groupWaiting: return "Group call waiting for a place"
+            case .recording: return "Group call being recorded"
             }
         }
     }
@@ -40,7 +44,7 @@ public final class CallScreenPreview: UIViewController, UITableViewDataSource, U
     private let shown: Shown?
     private var dark = false
     private var rightToLeft = false
-    private var screen: BmCallsScreen?
+    private var screen: CallsScreen?
 
     /// The list of states, or one state alone.
     public init( _ shown: Shown? = nil ) {
@@ -119,7 +123,7 @@ public final class CallScreenPreview: UIViewController, UITableViewDataSource, U
     private func draw( _ shown: Shown ) {
         // The screen's look and the app's pieces are installed with the call screen.
         _ = CallScreen.shared
-        let screen = BmCallsScreen()
+        let screen = CallsScreen()
         screen.canShareScreen = false
         addChild( screen )
         screen.view.frame = view.bounds
@@ -132,8 +136,41 @@ public final class CallScreenPreview: UIViewController, UITableViewDataSource, U
         let group = shown.isGroup
         let video = shown != .voice && shown != .groupVoice
         screen.show( name: group ? "Daily meeting" : "Ann", avatar: "", video: video )
+        CallsAddPersonStore.current = shown == .addPerson ? Self.addPerson : nil
         screen.apply( state: Self.state( shown ) )
-        if group { screen.setRoster( Self.people( optimizing: shown == .optimizing ) ) }
+        // A group call being joined has this side alone, as a host draws it until the room reports anyone.
+        if group { screen.setRoster( shown == .groupJoining || shown == .groupWaiting ? Array( Self.people().prefix( 1 ) ) : Self.people( optimizing: shown == .optimizing ) ) }
+        // REC stands in the bar a roster brings, as a call's next state draws it.
+        if shown == .recording { screen.apply( state: Self.state( shown ) ) }
+        if shown == .addPerson { screen.showAddPerson() }
+    }
+
+    public override func viewWillDisappear( _ animated: Bool ) {
+        super.viewWillDisappear( animated )
+        if shown == .addPerson { CallsAddPersonStore.current = nil }
+        // No call's window from a preview.
+        if shown != nil { CallsPip.shared.detach() }
+    }
+
+    /// Whom Add Person offers with no call: someone not rung yet, someone ringing, someone who was busy.
+    static var addPerson: CallsAddPerson {
+        CallsAddPerson(
+            people: { done in
+                done( [
+                    .init( id: "43", name: "Dana", avatar: "" ),
+                    .init( id: "44", name: "Eli", avatar: "" ),
+                    .init( id: "45", name: "Finn", avatar: "" ),
+                ] )
+            },
+            add: { _, done in done( nil ) },
+            rings: {
+                [
+                    .init( id: "ring-44", to: "44", state: "ringing", canCancel: true ),
+                    .init( id: "ring-45", to: "45", state: "busy", canCancel: false ),
+                ]
+            },
+            cancel: { _, done in done( nil ) }
+        )
     }
 
     /// The state as the call screen hands it to the screen in a call (CallScreen.state).
@@ -142,7 +179,7 @@ public final class CallScreenPreview: UIViewController, UITableViewDataSource, U
         switch shown {
         case .calling: phase = "ringing_out"
         case .ringing: phase = "ringing_in"
-        case .connecting: phase = "connecting"
+        case .connecting, .groupJoining, .groupWaiting: phase = "connecting"
         case .peerLost, .reconnecting: phase = "reconnecting"
         default: phase = "in_progress"
         }
@@ -160,6 +197,10 @@ public final class CallScreenPreview: UIViewController, UITableViewDataSource, U
             "trouble": trouble,
             "type": video ? "video" : "audio",
             "group": group,
+            "waiting": shown == .groupWaiting,
+            "recording": shown == .recording
+                ? [ "state": "on", "id": "preview", "since": Int( Date().timeIntervalSince1970 ) - 65, "can": false, "tell": "notice" ] as [ String: Any ]
+                : NSNull(),
             "peer": [ "camera": false, "microphone": !off, "screen": false, "known": phase == "in_progress" || phase == "reconnecting" ],
             "local": [ "muted": off, "camera": false, "screen": false, "front": true, "route": "" ],
             "callMode": group ? "participatory" : NSNull(),
@@ -174,9 +215,9 @@ public final class CallScreenPreview: UIViewController, UITableViewDataSource, U
 
     /// A group call's people with no pictures: this side, someone speaking, someone muted, someone else. With
     /// `optimizing`, the one speaking is changing their camera's codec, under the tile's placeholder.
-    static func people( optimizing: Bool = false ) -> [ BmCallsRoomParticipant ] {
-        func person( _ identity: String, _ name: String, local: Bool = false, speaking: Bool = false, muted: Bool = false ) -> BmCallsRoomParticipant {
-            BmCallsRoomParticipant(
+    static func people( optimizing: Bool = false ) -> [ CallsRoomParticipant ] {
+        func person( _ identity: String, _ name: String, local: Bool = false, speaking: Bool = false, muted: Bool = false ) -> CallsRoomParticipant {
+            CallsRoomParticipant(
                 identity: identity, name: name, avatar: "", isLocal: local, video: nil, screen: nil,
                 speaking: speaking, audioLevel: speaking ? 0.6 : 0, muted: muted, micMuted: false, handRaised: false,
                 isPinned: false, canPublish: true, canAdmin: false, mode: "participant", lost: false

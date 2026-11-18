@@ -19,7 +19,15 @@ struct CallEncodingShape {
 enum CallShapes {
     static let viewSteps = [ 180, 360, 540, 720, 1080, 1440, 2160 ]
 
-    static let cameraMaxBitrate = 4_000_000
+    /// A camera's ceiling at full size. On a direct path nothing between the
+    /// two sides is ours, so it sits well above what a camera needs and the
+    /// bandwidth estimate the two keep between them decides. Through a relay
+    /// every bit is our TURN server's traffic, so there it stays at 4 Mbps, as
+    /// it does until the first candidate pair is known. Leaving it out would be
+    /// no "unlimited": libwebrtc then holds a camera to 2.5 Mbps above 960×540
+    /// and 2 Mbps at or below.
+    static let cameraDirectMaxBitrate = 10_000_000
+    static let cameraRelayMaxBitrate = 4_000_000
     static let microphoneMaxBitrate = 64_000
     static let screenAudioMaxBitrate = 128_000
 
@@ -71,16 +79,17 @@ enum CallShapes {
     }
 
     /// The camera at the rung the other side asked for; full size keeps the
-    /// capture's own frame rate and the camera ceiling.
-    static func camera(wanted: Int?, captureHeight: Int) -> CallEncodingShape {
+    /// capture's own frame rate and the path's ceiling (`cameraDirectMaxBitrate`
+    /// or `cameraRelayMaxBitrate`). The rungs sit under both.
+    static func camera(wanted: Int?, captureHeight: Int, ceiling: Int) -> CallEncodingShape {
         if wanted == 0 {
-            return CallEncodingShape(active: false, maxBitrate: cameraMaxBitrate, scale: 1, maxFramerate: nil)
+            return CallEncodingShape(active: false, maxBitrate: ceiling, scale: 1, maxFramerate: nil)
         }
 
         let full = viewSteps[viewSteps.count - 1]
 
         guard let wanted = wanted, wanted < full, let rung = cameraRungs.first(where: { $0.height >= wanted }) else {
-            return CallEncodingShape(active: true, maxBitrate: cameraMaxBitrate, scale: 1, maxFramerate: nil)
+            return CallEncodingShape(active: true, maxBitrate: ceiling, scale: 1, maxFramerate: nil)
         }
 
         return CallEncodingShape(

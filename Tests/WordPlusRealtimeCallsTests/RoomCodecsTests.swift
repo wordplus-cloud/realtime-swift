@@ -2,7 +2,7 @@ import XCTest
 @testable import WordPlusRealtimeCalls
 
 /// The codec a room's camera goes out in and what goes behind it (CallCodecs.roomPublishCodec, roomBackupCodec), as
-/// the browser's rule picks them (the realtime client's calls/room-publish.ts) and Better Messages' app does: the media
+/// the browser's rule picks them (the realtime client's calls/room-publish.ts): the media
 /// server's policy first choice first, where this device encodes it, else H.264 from hardware with VP8 behind it.
 final class RoomCodecsTests: XCTestCase {
     private func caps(_ encoders: [String: (ok: Bool, hw: Bool)]) -> CallCodecCaps {

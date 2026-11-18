@@ -71,6 +71,8 @@ enum MeshHealth {
         var pub: Path?
         var sub: Path?
         var machine: Machine?
+        /// 1.0.10: the settings revision the client runs (`MeshSettings.rev`), in every report once it has settings
+        var cfg: Int64?
 
         var isEmpty: Bool { self == Report() }
     }

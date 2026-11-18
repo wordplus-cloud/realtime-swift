@@ -36,10 +36,14 @@ public enum MeshHardwareDrops {
     public static let didFind = Notification.Name("WordPlusMeshHardwareDrops")
 
     /// The codecs ("h264", "h265") this device saw its hardware encoder drop a camera's frames of in the last month.
-    public static func codecs(now: Date = Date(), defaults: UserDefaults = .standard) -> [String] {
+    /// 1.0.10: as long as the settings say (`tune.rememberDropsDays`, 30 where they say nothing; 0 remembers none), and
+    /// none seen before `tune.forgetBefore` (Unix ms), which measures every device again from then.
+    public static func codecs(now: Date = Date(), defaults: UserDefaults = .standard, settings: MeshSettings = .none) -> [String] {
         let seen = defaults.dictionary(forKey: defaultsKey) as? [String: Double] ?? [:]
+        let keep = settings.number("tune.rememberDropsDays").map { $0 * 24 * 3600 } ?? rememberFor
+        let since = (settings.number("tune.forgetBefore") ?? 0) / 1000
         return seen.filter { codec, at in
-            codec != "vp8" && now.timeIntervalSince1970 - at >= 0 && now.timeIntervalSince1970 - at < rememberFor
+            codec != "vp8" && now.timeIntervalSince1970 - at >= 0 && now.timeIntervalSince1970 - at < keep && at >= since
         }.keys.sorted()
     }
 
@@ -60,21 +64,59 @@ public enum MeshHardwareDrops {
 
 /// The rule, as encoder-watch.ts has it: over the last `readings` readings (30 s), each of them a hardware encoder's
 /// (`hardwareReading`): the camera goes out in H.264 or H.265 from a layer sent in hardware, its source gives at least
-/// `minCaptured` frames a second, the device names nothing that limits a layer, the hardware takes at most `maxEncodeMs`
-/// a frame (not a slow device), and a hardware layer sends at least `minSent` of a target of `minTarget` or more (an
-/// encoder cut off by a path gone down sends nothing and reports no target); and the layer that keeps the most has
-/// encoded `share` or less of the frames its source gave in all. A software encoder short of bits drops its own layer's
-/// frames alone, and a dim room's camera gives fewer frames, which every layer sends.
+/// `minCaptured` frames a second, the device names nothing that limits a layer, the hardware keeps up with its source
+/// (`slowMs`: at most `maxEncodeMs` a frame, or `keepUpShare` of the time between two of its source's frames where
+/// that is longer, so not a slow device), and a hardware layer sends at least `minSent` of a target of `minTarget` or
+/// more (an encoder cut off by a path gone down sends nothing and reports no target); and the layer that keeps the most
+/// has encoded `share` or less of the frames its source gave in all. A software encoder short of bits drops its own
+/// layer's frames alone, and a dim room's camera gives fewer frames, which every layer sends.
 enum HardwareDropRule {
     static let readEvery: TimeInterval = 5
     static let readings = 6
     // the readings of a camera's first 10 s, left out: its encoder starting sends a frame or two of them
     static let warmup = 2
     static let share = 0.7
-    static let minCaptured = 10.0
+    // 10 before 1.0.15, as realtime-client before 1.0.85: a dim room's camera giving 9-10 frames a second was never
+    // judged, and at 5 a second 30 s is still 150 frames to judge
+    static let minCaptured = 5.0
     static let maxEncodeMs = 25.0
+    // past `maxEncodeMs` a frame's encoding still keeps up while it takes no more than this share of the time between
+    // the source's frames (1.0.15, realtime-client 1.0.85's HARDWARE_KEEP_UP_SHARE): 27 ms at 30 a second, 80 at 10
+    static let keepUpShare = 0.8
     static let minTarget = 100_000.0
     static let minSent = 0.25
+    // the watch ends after this long without a camera, until the next one is published (1.0.10)
+    static let idleEnd: TimeInterval = 10 * 60
+
+    /// The rule's numbers (1.0.10): the settings' (`watch.everyMs`, `watch.warmups`, `watch.dropShare`,
+    /// `watch.minCapturedFps`, `watch.maxEncodeMs`, `watch.minTargetKbps`, `watch.minSent`, `watch.idleEndMin`, and
+    /// `tune.dropWatchS` over the readings' pace for their count), the constants above where they say nothing.
+    struct Tune: Equatable {
+        var idleEnd = HardwareDropRule.idleEnd
+        var readEvery = HardwareDropRule.readEvery
+        var readings = HardwareDropRule.readings
+        var warmup = HardwareDropRule.warmup
+        var share = HardwareDropRule.share
+        var minCaptured = HardwareDropRule.minCaptured
+        var maxEncodeMs = HardwareDropRule.maxEncodeMs
+        var minTarget = HardwareDropRule.minTarget
+        var minSent = HardwareDropRule.minSent
+
+        init() {}
+
+        init(_ settings: MeshSettings) {
+            readEvery = settings.number("watch.everyMs").map { $0 / 1000 } ?? HardwareDropRule.readEvery
+            let window = settings.number("tune.dropWatchS") ?? HardwareDropRule.readEvery * Double(HardwareDropRule.readings)
+            readings = max(1, Int((window / readEvery).rounded()))
+            warmup = settings.int("watch.warmups") ?? HardwareDropRule.warmup
+            share = settings.number("watch.dropShare") ?? HardwareDropRule.share
+            minCaptured = settings.number("watch.minCapturedFps") ?? HardwareDropRule.minCaptured
+            maxEncodeMs = settings.number("watch.maxEncodeMs") ?? HardwareDropRule.maxEncodeMs
+            minTarget = settings.number("watch.minTargetKbps").map { $0 * 1000 } ?? HardwareDropRule.minTarget
+            minSent = settings.number("watch.minSent") ?? HardwareDropRule.minSent
+            idleEnd = settings.number("watch.idleEndMin").map { $0 * 60 } ?? HardwareDropRule.idleEnd
+        }
+    }
 
     /// One layer between two readings.
     struct Layer: Equatable {
@@ -102,28 +144,36 @@ enum HardwareDropRule {
         var at: Double // ms
     }
 
+    /// The longest a hardware encoder may take a frame and still be keeping up with a source giving `captured` frames a
+    /// second (1.0.15, encoder-watch.ts's hardwareSlowMs): `maxEncodeMs`, or `keepUpShare` of the time between two
+    /// frames where that is longer.
+    static func slowMs(captured: Double, tune: Tune = Tune()) -> Double {
+        captured > 0 ? max(tune.maxEncodeMs, keepUpShare * 1000 / captured) : tune.maxEncodeMs
+    }
+
     /// A reading of a hardware encoder that nothing the device names holds back: the frames a second of the layer that
     /// keeps the most, and its source's; nil for any other.
-    static func hardwareReading(_ r: Reading) -> (best: Double, captured: Double)? {
-        guard r.codec == "h264" || r.codec == "h265", r.captured >= minCaptured else { return nil }
+    static func hardwareReading(_ r: Reading, tune: Tune = Tune()) -> (best: Double, captured: Double)? {
+        guard r.codec == "h264" || r.codec == "h265", r.captured >= tune.minCaptured else { return nil }
         let sent = r.layers.filter(\.active)
         guard sent.contains(where: \.hardware) else { return nil }
-        guard sent.contains(where: { $0.hardware && ($0.target ?? 0) >= minTarget && $0.sentBps >= ($0.target ?? 0) * minSent }) else {
+        guard sent.contains(where: { $0.hardware && ($0.target ?? 0) >= tune.minTarget && $0.sentBps >= ($0.target ?? 0) * tune.minSent }) else {
             return nil
         }
-        if sent.contains(where: { ($0.limit != "none" && !$0.limit.isEmpty) || ($0.hardware && ($0.encodeMs ?? 0) > maxEncodeMs) }) {
+        let slow = slowMs(captured: r.captured, tune: tune)
+        if sent.contains(where: { ($0.limit != "none" && !$0.limit.isEmpty) || ($0.hardware && ($0.encodeMs ?? 0) > slow) }) {
             return nil
         }
         return (sent.map(\.fps).max() ?? 0, r.captured)
     }
 
     /// Whether readings, the last `readings` of them, are a hardware encoder taking the whole camera's frames off.
-    static func dropsFrames(_ list: [Reading]) -> Bool {
-        guard list.count >= readings else { return false }
-        let read = list.suffix(readings).map(hardwareReading)
+    static func dropsFrames(_ list: [Reading], tune: Tune = Tune()) -> Bool {
+        guard list.count >= tune.readings else { return false }
+        let read = list.suffix(tune.readings).map { hardwareReading($0, tune: tune) }
         guard read.allSatisfy({ $0 != nil }) else { return false }
         let kept = read.reduce(0) { $0 + $1!.best }, given = read.reduce(0) { $0 + $1!.captured }
-        return kept <= given * share
+        return kept <= given * tune.share
     }
 
     /// A camera sender's reading from its stats against the counts of the one before (nil the first time). rids: its
@@ -173,7 +223,8 @@ enum HardwareDropRule {
 /// Watches the room's published camera (its primary codec's sender, not a backup's) while connected, on any server: a
 /// reading every `readEvery`, and once its hardware is seen dropping frames, remembers the codec and tells
 /// (`MeshHardwareDrops.didFind`). A new sender, a camera muted or gone, or a path that went down starts the readings
-/// over; a sender found dropping isn't read again.
+/// over; a sender found dropping isn't read again. 1.0.10: after `watch.idleEndMin` without a camera it ends, as the
+/// web's encoder watch does, and a camera published again starts it (`LocalParticipant`'s publish).
 final class MeshHardwareDropWatch: @unchecked Sendable, Loggable {
     private struct State {
         var task: Task<Void, Never>?
@@ -183,6 +234,26 @@ final class MeshHardwareDropWatch: @unchecked Sendable, Loggable {
         var warmup = HardwareDropRule.warmup
         var last: [HardwareDropRule.Reading] = []
         var found: Set<String> = []
+        /// since when no camera was there to read (1.0.10)
+        var idleSince: Date?
+    }
+
+    var running: Bool { _state.read { $0.task != nil } }
+
+    /// No camera to read (none, muted, or its source stopped): the readings start over, and once that has lasted the
+    /// settings' `watch.idleEndMin` the watch ends until the next camera.
+    func idle(tune: HardwareDropRule.Tune, now: Date = Date()) {
+        over(nil, tune: tune)
+        let ended: Bool = _state.mutate {
+            let since = $0.idleSince ?? now
+            $0.idleSince = since
+            guard $0.task != nil, now.timeIntervalSince(since) >= tune.idleEnd else { return false }
+            $0.task?.cancel()
+            $0.task = nil
+            $0.idleSince = nil
+            return true
+        }
+        if ended { log("no camera for \(Int(tune.idleEnd / 60)) min: the hardware-drop watch ends until the next one") }
     }
 
     private let _state = StateSync(State())
@@ -192,7 +263,9 @@ final class MeshHardwareDropWatch: @unchecked Sendable, Loggable {
             guard $0.task == nil else { return }
             $0.task = Task { [weak self, weak room] in
                 while !Task.isCancelled {
-                    try? await Task.sleep(nanoseconds: UInt64(HardwareDropRule.readEvery * 1_000_000_000))
+                    // 1.0.10: at the settings' pace (`watch.everyMs`)
+                    let every = room.map { HardwareDropRule.Tune($0.meshSettings).readEvery } ?? HardwareDropRule.readEvery
+                    try? await Task.sleep(nanoseconds: UInt64(every * 1_000_000_000))
                     guard let self, let room, !Task.isCancelled else { return }
                     await self.read(room)
                 }
@@ -207,31 +280,34 @@ final class MeshHardwareDropWatch: @unchecked Sendable, Loggable {
         }
     }
 
-    private func over(_ watched: String?) {
+    private func over(_ watched: String?, tune: HardwareDropRule.Tune = HardwareDropRule.Tune()) {
         _state.mutate {
             $0.watched = watched
             $0.counts = nil
-            $0.warmup = HardwareDropRule.warmup
+            $0.warmup = tune.warmup
             $0.last = []
         }
     }
 
     func read(_ room: Room) async {
+        // 1.0.10: the rule's numbers from the room's settings, as they are at this reading
+        let tune = HardwareDropRule.Tune(room.meshSettings)
         let camera = room.localParticipant.localVideoTracks.compactMap { $0.track as? LocalVideoTrack }.first { $0.source == .camera }
         let (transport, sender) = camera?._state.read { ($0.transport, $0.rtpSender) } ?? (nil, nil)
         guard let camera, let transport, let sender, !camera.isMuted else {
-            return over(nil)
+            return idle(tune: tune)
         }
         // 1.0.7: upstream 2.18's WebRTC objects are read on its RTC executor
         let mediaTrack = camera.mediaTrack
         guard await RTC.run({ mediaTrack.raw.readyState == .live }) else {
-            return over(nil)
+            return idle(tune: tune)
         }
+        _state.mutate { $0.idleSince = nil }
         let key = sender.senderId
         if _state.read({ $0.found.contains(key) }) { return }
-        if _state.read({ $0.watched }) != key { over(key) }
+        if _state.read({ $0.watched }) != key { over(key, tune: tune) }
         // a reading across a path gone down reads the frames the path took, not the encoder's
-        guard await transport.isConnected else { return over(key) }
+        guard await transport.isConnected else { return over(key, tune: tune) }
 
         // 1.0.7: its part of the publisher's shared reading (MeshStatsHub), with the encoders' reports; its own reading
         // where the part can't be told
@@ -258,8 +334,8 @@ final class MeshHardwareDropWatch: @unchecked Sendable, Loggable {
                 return (false, nil)
             }
             $0.last.append(reading)
-            if $0.last.count > HardwareDropRule.readings { $0.last.removeFirst() }
-            guard HardwareDropRule.dropsFrames($0.last), let codec = reading.codec else { return (false, nil) }
+            if $0.last.count > tune.readings { $0.last.removeFirst($0.last.count - tune.readings) }
+            guard HardwareDropRule.dropsFrames($0.last, tune: tune), let codec = reading.codec else { return (false, nil) }
             $0.found.insert(key)
             return (true, codec)
         }

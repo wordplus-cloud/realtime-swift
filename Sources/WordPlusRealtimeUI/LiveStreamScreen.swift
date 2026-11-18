@@ -5,7 +5,9 @@ import WordPlusRealtimeCalls
 /**
  A live stream drawn ready for its viewers, as the web player draws it: the picture, Live and how many watch over it, the
  stream's title, the chat with a field to write in, and a heart for reactions, which float up the picture as everyone
- sends them. Optional, as the module is: an app that draws its own uses `LiveStream` and `LiveStreamVideoView` alone.
+ sends them. A signed-in viewer asks to come on stage from here, answers the invitation, and once on it has their camera,
+ their microphone and a way off. Optional, as the module is: an app that draws its own uses `LiveStream` and
+ `LiveStreamVideoView` alone.
  The host goes live from the studio on the web, or with the stream's own calls (`preview()`, `goLive()`).
 
  ```swift
@@ -20,8 +22,9 @@ public final class LiveStreamScreen: UIViewController, UITableViewDataSource, UI
     /// The screen's words and its colour.
     public struct Appearance {
         /// Its strings in the user's language, by key: `live`, `watching` (`%d` the count), `starts_soon`, `ended`,
-        /// `say_something`, `send`, `read_only`, `pinned`, `react`, `close`, `not_sent` (`%@` the code). The English is
-        /// the default for any left out.
+        /// `say_something`, `send`, `read_only`, `pinned`, `react`, `close`, `not_sent` (`%@` the code), `ask_stage`,
+        /// `lower_hand`, `invited_title`, `invited_text`, `not_now`, `join_stage`, `leave_stage`, `camera`, `microphone`,
+        /// `stage_failed` (`%@` the code). The English is the default for any left out.
         public var strings: [String: String]
         /// The send button's and the field's colour.
         public var accent: UIColor
@@ -44,6 +47,16 @@ public final class LiveStreamScreen: UIViewController, UITableViewDataSource, UI
         "react": "Send a heart",
         "close": "Close",
         "not_sent": "Not sent (%@)",
+        "ask_stage": "Ask to join on stage",
+        "lower_hand": "Lower hand",
+        "invited_title": "The host invites you on stage",
+        "invited_text": "Your camera and microphone will be live for everyone watching.",
+        "not_now": "Not now",
+        "join_stage": "Join stage",
+        "leave_stage": "Leave stage",
+        "camera": "Camera",
+        "microphone": "Microphone",
+        "stage_failed": "You could not join the stage (%@)",
     ]
 
     public let stream: LiveStream
@@ -68,6 +81,21 @@ public final class LiveStreamScreen: UIViewController, UITableViewDataSource, UI
     let send = UIButton(type: .system)
     let heart = UIButton(type: .system)
     let failure = UILabel()
+    /// What a viewer does about the stage, under the title: asks, or once on it, their camera, microphone and a way off.
+    let stageRow = UIStackView()
+    let hand = UIButton(configuration: .tinted())
+    let cameraButton = UIButton(configuration: .tinted())
+    let microphoneButton = UIButton(configuration: .tinted())
+    let leaveStage = UIButton(configuration: .tinted())
+    /// The host asks them on. A card rather than an alert, so that the picture and the chat go on beside it.
+    let invitation = UIStackView()
+    let invitedTitle = UILabel()
+    let invitedText = UILabel()
+    let notNow = UIButton(configuration: .tinted())
+    let joinStage = UIButton(configuration: .filled())
+    /// This guest's own camera, in a corner of the picture.
+    let own = LiveStreamVideoView()
+    private var acting = false
     private let floats = UIView()
     private var shown: [LiveStreamMessage] = []
     private var sending = false
@@ -95,6 +123,7 @@ public final class LiveStreamScreen: UIViewController, UITableViewDataSource, UI
         build()
         styled()
         picture.show(stream)
+        own.show(stream, tile: "local")
         stream.onChange { [weak self] in self?.render() }
         stream.onReactions { [weak self] counts in
             guard let self else { return }
@@ -176,12 +205,14 @@ public final class LiveStreamScreen: UIViewController, UITableViewDataSource, UI
         let composer = UIStackView(arrangedSubviews: [field, heart, send])
         composer.spacing = 8
         composer.alignment = .center
-        let below = UIStackView(arrangedSubviews: [titleLabel, pinned, table, failure, composer])
+        buildStage()
+        let below = UIStackView(arrangedSubviews: [titleLabel, stageRow, invitation, pinned, table, failure, composer])
         below.axis = .vertical
         below.spacing = 8
 
-        for v in [stage, picture, note, badge, viewers, close, floats, below] as [UIView] { v.translatesAutoresizingMaskIntoConstraints = false }
+        for v in [stage, picture, own, note, badge, viewers, close, floats, below] as [UIView] { v.translatesAutoresizingMaskIntoConstraints = false }
         stage.addSubview(picture)
+        stage.addSubview(own)
         stage.addSubview(note)
         stage.addSubview(floats)
         stage.addSubview(badge)
@@ -203,6 +234,10 @@ public final class LiveStreamScreen: UIViewController, UITableViewDataSource, UI
             picture.bottomAnchor.constraint(equalTo: stage.bottomAnchor),
             picture.leadingAnchor.constraint(equalTo: stage.leadingAnchor),
             picture.trailingAnchor.constraint(equalTo: stage.trailingAnchor),
+            own.bottomAnchor.constraint(equalTo: stage.bottomAnchor, constant: -8),
+            own.trailingAnchor.constraint(equalTo: safe.trailingAnchor, constant: -8),
+            own.widthAnchor.constraint(equalTo: stage.widthAnchor, multiplier: 0.25),
+            own.heightAnchor.constraint(equalTo: own.widthAnchor, multiplier: 4 / 3),
             floats.topAnchor.constraint(equalTo: stage.topAnchor),
             floats.bottomAnchor.constraint(equalTo: stage.bottomAnchor),
             floats.leadingAnchor.constraint(equalTo: stage.leadingAnchor),
@@ -228,6 +263,52 @@ public final class LiveStreamScreen: UIViewController, UITableViewDataSource, UI
         ])
     }
 
+    /// The pieces of the stage, drawn as the buttons of the web player are: a pill with its icon, tinted while it is on.
+    private func buildStage() {
+        func pill(_ button: UIButton, id: String, action: Selector) {
+            button.configuration?.cornerStyle = .capsule
+            button.configuration?.buttonSize = .small
+            button.configuration?.imagePadding = 6
+            button.accessibilityIdentifier = id
+            button.addTarget(self, action: action, for: .touchUpInside)
+        }
+        pill(hand, id: "stream-hand", action: #selector(handPressed))
+        pill(cameraButton, id: "stream-camera", action: #selector(cameraPressed))
+        pill(microphoneButton, id: "stream-microphone", action: #selector(microphonePressed))
+        pill(leaveStage, id: "stream-leave-stage", action: #selector(leaveStagePressed))
+        leaveStage.configuration?.baseForegroundColor = .systemRed
+        leaveStage.configuration?.baseBackgroundColor = .systemRed
+        pill(notNow, id: "stream-not-now", action: #selector(notNowPressed))
+        pill(joinStage, id: "stream-join-stage", action: #selector(joinPressed))
+
+        stageRow.spacing = 8
+        stageRow.alignment = .center
+        for button in [hand, cameraButton, microphoneButton, leaveStage] { stageRow.addArrangedSubview(button) }
+        stageRow.addArrangedSubview(UIView())
+        stageRow.accessibilityIdentifier = "stream-stage"
+
+        invitedTitle.font = .preferredFont(forTextStyle: .subheadline).withWeight(.semibold)
+        invitedTitle.numberOfLines = 0
+        invitedTitle.accessibilityIdentifier = "stream-invited"
+        invitedText.font = .preferredFont(forTextStyle: .footnote)
+        invitedText.textColor = .secondaryLabel
+        invitedText.numberOfLines = 0
+        let answers = UIStackView(arrangedSubviews: [notNow, joinStage, UIView()])
+        answers.spacing = 8
+        invitation.axis = .vertical
+        invitation.spacing = 6
+        invitation.isLayoutMarginsRelativeArrangement = true
+        invitation.layoutMargins = UIEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
+        invitation.backgroundColor = .secondarySystemBackground
+        invitation.layer.cornerRadius = 10
+        for view in [invitedTitle, invitedText, answers] as [UIView] { invitation.addArrangedSubview(view) }
+
+        own.fills = true
+        own.clipsToBounds = true
+        own.layer.cornerRadius = 8
+        own.accessibilityIdentifier = "stream-own"
+    }
+
     private func styled() {
         badge.text = text("live").uppercased()
         field.placeholder = text("say_something")
@@ -236,6 +317,15 @@ public final class LiveStreamScreen: UIViewController, UITableViewDataSource, UI
         send.accessibilityLabel = text("send")
         heart.accessibilityLabel = text("react")
         close.accessibilityLabel = text("close")
+        invitedTitle.text = text("invited_title")
+        invitedText.text = text("invited_text")
+        notNow.configuration?.title = text("not_now")
+        joinStage.configuration?.title = text("join_stage")
+        joinStage.configuration?.baseBackgroundColor = appearance.accent
+        leaveStage.configuration?.title = text("leave_stage")
+        // Their icons alone: with its words each, three pills do not fit the width of a phone.
+        cameraButton.accessibilityLabel = text("camera")
+        microphoneButton.accessibilityLabel = text("microphone")
         render()
     }
 
@@ -255,6 +345,7 @@ public final class LiveStreamScreen: UIViewController, UITableViewDataSource, UI
         note.isHidden = note.text == nil
         picture.accessibilityValue = picture.showsPicture ? "picture" : "none"
         heart.isHidden = !(live && stream.reactionsOn)
+        renderStage()
         let writes = stream.canWrite
         field.isEnabled = writes && !sending
         send.isEnabled = writes && !sending
@@ -270,6 +361,27 @@ public final class LiveStreamScreen: UIViewController, UITableViewDataSource, UI
             table.reloadData()
             if !shown.isEmpty { table.scrollToRow(at: IndexPath(row: shown.count - 1, section: 0), at: .bottom, animated: false) }
         }
+    }
+
+    /// As the web has it (realtime-ui streams/controls.tsx): on stage their devices and a way off, else the asking.
+    private func renderStage() {
+        let ended = stream.state == .ended
+        let on = stream.onStage && !ended
+        hand.isHidden = on || ended || stream.invited || !stream.canAskStage
+        cameraButton.isHidden = !on
+        microphoneButton.isHidden = !on
+        leaveStage.isHidden = !on
+        stageRow.isHidden = hand.isHidden && !on
+        hand.configuration?.title = stream.handRaised ? text("lower_hand") : text("ask_stage")
+        hand.configuration?.image = UIImage(systemName: stream.handRaised ? "hand.raised.fill" : "hand.raised")
+        hand.accessibilityValue = stream.handRaised ? "up" : "down"
+        cameraButton.configuration?.image = UIImage(systemName: stream.camera ? "video.fill" : "video.slash")
+        cameraButton.accessibilityValue = stream.camera ? "on" : "off"
+        microphoneButton.configuration?.image = UIImage(systemName: stream.microphone ? "mic.fill" : "mic.slash")
+        microphoneButton.accessibilityValue = stream.microphone ? "on" : "off"
+        invitation.isHidden = !stream.invited || on || ended
+        for button in [hand, cameraButton, microphoneButton, leaveStage, notNow, joinStage] { button.isEnabled = !acting }
+        own.isHidden = !(on && stream.camera)
     }
 
     private func line(_ message: LiveStreamMessage, prefix: String = "") -> NSAttributedString {
@@ -325,6 +437,51 @@ public final class LiveStreamScreen: UIViewController, UITableViewDataSource, UI
         }
     }
 
+    /// Something done about the stage, one at a time, and what the cloud or the device refused said under the chat.
+    private func act(_ work: @escaping () async throws -> Void) {
+        guard !acting else { return }
+        acting = true
+        failure.isHidden = true
+        render()
+        Task { @MainActor in
+            do {
+                try await work()
+            } catch {
+                failure.text = String(format: text("stage_failed"), (error as? CallError)?.code ?? "\(error)")
+                failure.isHidden = false
+            }
+            acting = false
+            render()
+        }
+    }
+
+    @objc func handPressed() {
+        let up = !stream.handRaised
+        act { [stream] in try await stream.hand(up) }
+    }
+
+    @objc func joinPressed() {
+        act { [stream] in try await stream.joinStage() }
+    }
+
+    @objc func notNowPressed() {
+        stream.declineStage()
+    }
+
+    @objc func cameraPressed() {
+        let on = !stream.camera
+        act { [stream] in try await stream.setCamera(on) }
+    }
+
+    @objc func microphonePressed() {
+        let on = !stream.microphone
+        act { [stream] in try await stream.setMicrophone(on) }
+    }
+
+    @objc func leaveStagePressed() {
+        stream.leaveStage()
+    }
+
     @objc private func hearted() {
         stream.react(.heart)
         float(LiveStreamReaction.heart.rawValue)
@@ -350,6 +507,12 @@ public final class LiveStreamScreen: UIViewController, UITableViewDataSource, UI
             image.frame.origin.x += CGFloat.random(in: -20...8)
             image.alpha = 0
         }, completion: { _ in image.removeFromSuperview() })
+    }
+}
+
+private extension UIFont {
+    func withWeight(_ weight: UIFont.Weight) -> UIFont {
+        UIFont.systemFont(ofSize: pointSize, weight: weight)
     }
 }
 

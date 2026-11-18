@@ -375,7 +375,23 @@ private struct ShowCard: View {
         .fullScreenCover(isPresented: Binding(get: { shop.show != nil }, set: { if !$0 { shop.leaveShow() } })) {
             if let show = shop.show {
                 ShowScreen(stream: show, close: { shop.leaveShow() }).ignoresSafeArea()
+                    .overlay(alignment: .topLeading) { ShowPlaying(stream: show) }
             }
+        }
+    }
+}
+
+/// What the proof reads off the show: whether `stats()` says the picture arrives, and how long it took to start.
+private struct ShowPlaying: View {
+    let stream: LiveStream
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { _ in
+            let stats = stream.stats()
+            Color.clear.frame(width: 1, height: 1)
+                .accessibilityElement()
+                .accessibilityIdentifier("stream-stats")
+                .accessibilityValue((stats.video?.height ?? 0) > 0 && stats.session.startupMs != nil ? "playing" : "starting")
         }
     }
 }

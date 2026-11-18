@@ -139,6 +139,22 @@ public class LocalAudioTrack: Track, LocalTrackProtocol, AudioTrackProtocol, @un
         return result
     }
 
+    /// WordPlus Mesh (1.0.12; a browser's product sets it on the sender itself, as `watchRoomMic` in
+    /// @wordplus/realtime-client does): what this track may spend from now on, in bits per second, as a product's
+    /// microphone ceiling on a slow upload asks. It renegotiates nothing, and the track and whether it is sent stay as
+    /// they are. On upstream 2.18's RTC executor, where its WebRTC objects are read and written.
+    public func setMeshMaxBitrate(_ bitrate: Int) async {
+        guard let sender = _state.read({ $0.rtpSender }) else { return }
+        await RTC.run {
+            let parameters = sender.raw.parameters
+            guard !parameters.encodings.isEmpty, parameters.encodings.contains(where: { $0.maxBitrateBps?.intValue != bitrate }) else { return }
+            for encoding in parameters.encodings {
+                encoding.maxBitrateBps = NSNumber(value: bitrate)
+            }
+            sender.raw.parameters = parameters
+        }
+    }
+
     // MARK: - Internal
 
     override func startCapture() async throws {

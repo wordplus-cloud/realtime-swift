@@ -31,6 +31,25 @@ The simulator has no camera: try video calls on a device.
 - **A call going on** when the user leaves the app keeps its sound with the **Audio, AirPlay, and Picture in Picture** background mode (`UIBackgroundModes`: `audio`), which also lets the call screen picture in picture show it. iOS stops the camera of an app in the background unless Apple grants it the multitasking camera access entitlement.
 - **Calls ring a closed or suspended app** with `SystemCalls`, through a VoIP push and CallKit (below).
 
+## Sharing the screen
+
+iOS captures a whole screen only from a broadcast extension, in a process of its own. An app that never shares adds nothing, and its call screen shows no button. To share:
+
+1. **In Xcode, add a target:** File, New, Target, **Broadcast Upload Extension**, with no UI extension. Name its bundle id the id of the app with `.broadcast` after it, say `com.acme.shop.broadcast`, and give it your deployment target.
+2. **Link it** to the `WordPlusRTC` product of the `WordPlusRealtime` package (General, Frameworks and Libraries), and replace all of its `SampleHandler.swift` with:
+
+   ```swift
+   import LiveKit
+
+   class SampleHandler: LKSampleHandler {}
+   ```
+
+3. **On both targets,** in Signing & Capabilities, add **App Groups** with the one group `group.` and the bundle id of the app, say `group.com.acme.shop`.
+
+`ScreenShare.isAvailable` then turns true on a phone, the call screen shows its button, and `setScreenShare` works. A bundle id or a group of another shape goes in the `Info.plist` of the app, as `RTCScreenSharingExtension` and `RTCAppGroupIdentifier`.
+
+**What only a real iPhone can confirm.** A simulator has no broadcast extension and no system picker, so the tests of the SDK run all around it: the button, the switch by `ScreenShare.isAvailable`, the refusals before a call is up, and the ends of a call. Try this on a phone before you ship: the picker comes up, the share reaches the other side, the red bar stops it, and it stops with the call. `onScreenShare` should say each of them.
+
 ## Push and CallKit
 
 What a call ringing a locked phone and a closed app needs ([calls](calls.md#ringing-a-locked-phone)):
@@ -45,7 +64,8 @@ What a call ringing a locked phone and a closed app needs ([calls](calls.md#ring
 
 ## Privacy
 
-- **The privacy manifests:** `WordPlusRealtime` and `WordPlusRealtimeCalls` each bring their own, which declares UserDefaults (reason `CA92.1`: the connection keeps the realtime servers it reached, the calls a codec a peer failed on) and no tracking. LiveKit, under the calls, brings its own.
+- **The privacy manifests:** `WordPlusRealtime` and `WordPlusRealtimeCalls` each bring their own, which declares UserDefaults (reason `CA92.1`: the connection keeps the realtime servers it reached, the calls a codec a peer failed on and the random id `SystemCalls` names the phone by) and no tracking. LiveKit, under the calls, brings its own.
+- **The Keychain** holds the three newest day keys once the app's calls hold their line, so a closed app shows the name of a caller ([where the keys are kept](encryption.md#where-the-keys-are-kept)).
 - **Your App Store privacy details** describe what your app collects, as for any of its features: the SDK sends WordPlus Cloud the user id, the rooms they join, and the data your app sends, sealed with keys WordPlus Cloud does not hold. The history of a room keeps that sealed data for as long as its rule says.
 
 ## Encryption

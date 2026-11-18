@@ -33,6 +33,15 @@ public final class Realtime: @unchecked Sendable {
     private var waiting: [(labels: [String], run: () -> Void)] = []
     private var resolving = false
     private var renewal: DispatchWorkItem?
+    private var identityRenewal: DispatchWorkItem?
+    private var closed = false
+    /// Whether the server takes several rooms in one request: a server from before it answers `bad_request`, and the app
+    /// goes on one room a request.
+    private(set) var many = true
+    /// The rooms joined and left in this moment, which go together.
+    private var joining: [Room] = []
+    private var leaving: [String] = []
+    private var flushDue = false
     /// What this app answers the asks of its server with, by event (`answer`).
     private var answerers: [String: Answerer] = [:]
     /// What the SDK's other modules hear and hold (Modules.swift).
@@ -45,7 +54,7 @@ public final class Realtime: @unchecked Sendable {
         keyring = options.keyring ?? Keyring()
         keyring.add(options.keys)
         identity = options.identity
-        connection = Connection(server: options.server, path: options.path, auth: ["site": .string(options.app), "rt": 3], queue: queue, store: options.nodeStore ?? UserDefaultsNodeStore())
+        connection = Connection(server: options.server, path: options.path, namespace: options.namespace, auth: options.handshake, queue: queue, store: options.nodeStore ?? UserDefaultsNodeStore())
         online = Online(self)
 
         connection.onEvent = { [weak self] name, data in self?.event(name, data) }
@@ -63,12 +72,15 @@ public final class Realtime: @unchecked Sendable {
             guard let self else { return done(false) }
             self.holdAll(on: socket, done)
         }
+        queue.async { [weak self] in self?.scheduleIdentity() }
     }
 
-    /// Connects to the realtime servers, and keeps the connection: through drops, and from node to node.
+    /// Connects to the realtime servers, and keeps the connection: through drops, and from node to node. On `/channels`
+    /// with no keys or identity given, the keys route is asked for them first; on another namespace the handshake says who
+    /// the user is, and nothing is asked first.
     public func connect() {
         queue.async { [self] in
-            if identity == nil, options.keys.isEmpty {
+            if identity == nil, options.keys.isEmpty, options.namespace == RealtimeOptions.channels {
                 askKeys([]) { self.connection.start() }
             } else {
                 connection.start()
@@ -79,7 +91,9 @@ public final class Realtime: @unchecked Sendable {
     /// Leaves every room, and closes the connection.
     public func close() {
         queue.async { [self] in
+            closed = true
             renewal?.cancel()
+            identityRenewal?.cancel()
             rooms.values.forEach { $0.ended() }
             rooms.removeAll()
             connection.close()
@@ -117,6 +131,12 @@ public final class Realtime: @unchecked Sendable {
         listeners.add(event, handler)
     }
 
+    /// As `on`, for the next one only.
+    @discardableResult
+    public func once(_ event: String, _ handler: @escaping (JSONValue, EventMeta) -> Void) -> Listener {
+        listeners.once(event, handler)
+    }
+
     /// Answers what the server of the app asks this user (`user( id ).ask( event, data )`): `handler( data, meta )`
     /// returns the reply, sealed with the key of the user when the app holds it. One answer an event, nil takes it away.
     /// A handler that throws does not answer.
@@ -127,6 +147,11 @@ public final class Realtime: @unchecked Sendable {
     public func off(_ listener: Listener) {
         listeners.remove(listener)
         stateListeners.remove(listener)
+    }
+
+    /// Takes every handler of an event off.
+    public func off(_ event: String) {
+        listeners.remove(event: event)
     }
 
     /// What the app's server sends this user, as an async sequence.
@@ -144,14 +169,29 @@ public final class Realtime: @unchecked Sendable {
             if let room = rooms[name] { return room }
             let room = Room(owner: self, name: name)
             rooms[name] = room
-            if let socket = connection.current, socket.isConnected { joinOne(room, on: socket) { _ in } }
+            if socketForEmit()?.isConnected == true {
+                joining.append(room)
+                flushSoon()
+            }
             return room
         }
+    }
+
+    /// A room of this user and `other`: `{pair}` in the name is the two ids in order, so both of them name the same room,
+    /// `join("chat:{pair}", with: "34")`. Throws `no_identity` where the app's server named no user.
+    @discardableResult
+    public func join(_ name: String, with other: String) throws -> Room {
+        join(try RoomName.named(name, me: user, id: other))
     }
 
     /// A room this app joined, or nil.
     public func room(_ name: String) -> Room? {
         queue.sync { rooms[name] }
+    }
+
+    /// The room `join(_:with:)` joined, or nil.
+    public func room(_ name: String, with other: String) throws -> Room? {
+        room(try RoomName.named(name, me: user, id: other))
     }
 
     /// Leaves a room.
@@ -160,8 +200,14 @@ public final class Realtime: @unchecked Sendable {
             guard let room = rooms.removeValue(forKey: name) else { return }
             tokens[name] = nil
             room.ended()
-            connection.current?.emit("leave", ["tab": .string(tab), "room": .string(name)])
+            leaving.append(name)
+            flushSoon()
         }
+    }
+
+    /// Leaves the room `join(_:with:)` joined.
+    public func leave(_ name: String, with other: String) throws {
+        leave(try RoomName.named(name, me: user, id: other))
     }
 
     /// Users of the app from its directory, by id, opened: those it holds, as `[id: { user_id, name, avatar, … }]`.
@@ -183,7 +229,7 @@ public final class Realtime: @unchecked Sendable {
     // MARK: - On the queue
 
     func request(_ event: String, _ payload: [String: JSONValue], timeout: TimeInterval = 8) async throws -> JSONValue {
-        guard let socket = queue.sync(execute: { connection.current }), socket.isConnected else { throw RealtimeError("offline") }
+        guard let socket = queue.sync(execute: { socketForEmit() }), socket.isConnected else { throw RealtimeError("offline") }
         var body = payload
         body["tab"] = .string(tab)
         var reply = await socket.emit(event, .object(body), timeout: timeout)
@@ -199,17 +245,15 @@ public final class Realtime: @unchecked Sendable {
     }
 
     /// Everything held again on a socket: the identity first, every room from the last event it had, the watches.
-    private func holdAll(on socket: SocketIO, _ done: @escaping (Bool) -> Void) {
+    func holdAll(on socket: RoomSocket, _ done: @escaping (Bool) -> Void) {
         let group = DispatchGroup()
         var ok = true
         group.enter()
         identify(on: socket) { group.leave() }
-        for room in rooms.values {
-            group.enter()
-            joinOne(room, on: socket) { joined in
-                if !joined { ok = false }
-                group.leave()
-            }
+        group.enter()
+        joinMany(Array(rooms.values), on: socket) { joined in
+            if !joined { ok = false }
+            group.leave()
         }
         group.enter()
         online.again(on: socket) { group.leave() }
@@ -222,7 +266,7 @@ public final class Realtime: @unchecked Sendable {
 
     /// Tells the socket who the user is. An identity refused as `expired` (signed before the server of the app
     /// disconnected the user, or run out) is asked for again, once.
-    private func identify(on socket: SocketIO, renew: Bool = true, _ done: @escaping () -> Void) {
+    private func identify(on socket: RoomSocket, renew: Bool = true, _ done: @escaping () -> Void) {
         guard let token = identity?.token else { return done() }
         socket.emit("identify", ["tab": .string(tab), "token": .string(token)]) { [self] reply in
             if reply?["error"]?.string == "expired", renew, identity?.token == token {
@@ -265,7 +309,7 @@ public final class Realtime: @unchecked Sendable {
     }
 
     /// Joins a room on a socket with its token, from the last kept event it had; true when it is in.
-    func joinOne(_ room: Room, on socket: SocketIO, retry: Bool = true, _ done: @escaping (Bool) -> Void) {
+    func joinOne(_ room: Room, on socket: RoomSocket, retry: Bool = true, _ done: @escaping (Bool) -> Void) {
         tokenFor(room.name) { [self] token in
             guard rooms[room.name] === room else { return done(true) }
             guard let token else {
@@ -275,40 +319,156 @@ public final class Realtime: @unchecked Sendable {
             var payload: [String: JSONValue] = ["tab": .string(tab), "room": .string(room.name), "token": .string(token)]
             if let since = room.lastId { payload["since"] = .string(since) }
             socket.emit("join", .object(payload)) { [self] reply in
-                guard rooms[room.name] === room else { return done(true) }
-                guard let reply else { return done(false) }
-                if reply["ok"]?.bool == true {
-                    let members = reply["members"]
-                    let missed = reply["missed"]?.array ?? []
-                    inOrder([members?["list"] ?? .null] + missed.map { $0["data"] ?? .null }) { [self] in
-                        guard rooms[room.name] === room else { return }
-                        let list = (members?["list"]?.array ?? []).compactMap { m -> (String, JSONValue)? in
-                            guard let id = m["id"]?.id else { return nil }
-                            return (id, openInfo(m["info"] ?? .null))
-                        }
-                        room.joined(members: members == nil ? nil : list, count: reply["count"]?.int)
-                        for e in missed { deliver(e, room: room.name, replayed: true) }
-                        if reply["gap"]?.bool == true { room.fire("error", ["code": "gap"], EventMeta()) }
-                    }
-                    done(true)
-                } else if reply["error"]?.string == "expired", retry {
-                    tokens[room.name] = nil
-                    joinOne(room, on: socket, retry: false, done)
-                } else {
-                    room.failed(reply["error"]?.string ?? "server")
-                    done(true)
-                }
+                guard let reply else { return done(rooms[room.name] !== room) }
+                joined(room, reply, on: socket, retry: retry, done)
             }
         }
     }
 
-    private func tokenFor(_ name: String, _ done: @escaping (String?) -> Void) {
+    /// A room's answer to its join, alone or among others; true when it is in, or it is done with.
+    private func joined(_ room: Room, _ reply: JSONValue, on socket: RoomSocket, retry: Bool, _ done: @escaping (Bool) -> Void) {
+        guard rooms[room.name] === room else { return done(true) }
+        if reply["ok"]?.bool == true {
+            let members = reply["members"]
+            let missed = reply["missed"]?.array ?? []
+            inOrder([members?["list"] ?? .null] + missed.map { $0["data"] ?? .null }) { [self] in
+                guard rooms[room.name] === room else { return }
+                let list = (members?["list"]?.array ?? []).compactMap { m -> (String, JSONValue)? in
+                    guard let id = m["id"]?.id else { return nil }
+                    return (id, openInfo(m["info"] ?? .null))
+                }
+                room.joined(members: members == nil ? nil : list, count: reply["count"]?.int)
+                for e in missed { deliver(e, room: room.name, replayed: true) }
+                if reply["gap"]?.bool == true { room.fire("error", ["code": "gap"], EventMeta()) }
+            }
+            done(true)
+        } else if reply["error"]?.string == "expired", retry {
+            tokens[room.name] = nil
+            joinOne(room, on: socket, retry: false, done)
+        } else {
+            room.failed(reply["error"]?.string ?? "server")
+            done(true)
+        }
+    }
+
+    /// The most rooms one `join` names, as the realtime server takes them.
+    static let joinMax = 100
+
+    /// How long the rooms joined and left in one moment wait for each other: an app's `join`s one after the other reach
+    /// this queue apart, where a page's run in one turn of its loop.
+    static var togetherAfter: TimeInterval = 0.01
+
+    private func flushSoon() {
+        guard !flushDue else { return }
+        flushDue = true
+        queue.asyncAfter(deadline: .now() + Realtime.togetherAfter) { [weak self] in self?.flushRooms() }
+    }
+
+    /// The rooms left then the rooms joined in this moment, on the socket the connection has now. With none, a connect
+    /// joins what is held then.
+    private func flushRooms() {
+        flushDue = false
+        let left = leaving, wanted = joining
+        leaving = []
+        joining = []
+        guard let socket = socketForEmit(), socket.isConnected else { return }
+        leaveMany(left, on: socket)
+        var seen = Set<ObjectIdentifier>()
+        joinMany(wanted.filter { rooms[$0.name] === $0 && seen.insert(ObjectIdentifier($0)).inserted }, on: socket) { _ in }
+    }
+
+    /// Rooms in one `join`: each token once, each room naming its own by index, each answered as its own join. True when
+    /// every room had its answer: a move holds its new socket by this, and a socket that stops answering fails it.
+    func joinMany(_ list: [Room], on socket: RoomSocket, _ done: @escaping (Bool) -> Void) {
+        if list.count > Realtime.joinMax {
+            let parts = stride(from: 0, to: list.count, by: Realtime.joinMax).map { Array(list[$0 ..< min($0 + Realtime.joinMax, list.count)]) }
+            let one = Realtime.allOf(parts.count, done)
+            parts.forEach { joinMany($0, on: socket, one) }
+            return
+        }
+        if list.count < 2 || !many { return joinEach(list, on: socket, done) }
+
+        var found: [String: String] = [:]
+        var left = list.count
+        for room in list {
+            tokenFor(room.name) { [self] token in
+                found[room.name] = token
+                left -= 1
+                if left == 0 { joinAsked(list, tokens: found, on: socket, done) }
+            }
+        }
+    }
+
+    private func joinAsked(_ list: [Room], tokens found: [String: String], on socket: RoomSocket, _ done: @escaping (Bool) -> Void) {
+        var sent: [String] = []
+        var asked: [JSONValue] = []
+        var going: [Room] = []
+        for room in list where rooms[room.name] === room {
+            guard let token = found[room.name] else {
+                if room.stateOnQueue != .failed { room.failed(room.denied ?? "auth_failed") }
+                continue
+            }
+            let index = sent.firstIndex(of: token) ?? sent.count
+            if index == sent.count { sent.append(token) }
+            var entry: [String: JSONValue] = ["room": .string(room.name), "t": .number(Double(index))]
+            if let since = room.lastId { entry["since"] = .string(since) }
+            asked.append(.object(entry))
+            going.append(room)
+        }
+        if going.count < 2 { return joinEach(going, on: socket, done) }
+
+        socket.emit("join", ["tab": .string(tab), "tokens": .array(sent.map(JSONValue.string)), "rooms": .array(asked)]) { [self] reply in
+            // A server from before this has no `room` to read.
+            if reply?["error"]?.string == "bad_request", reply?["rooms"] == nil {
+                many = false
+                return joinEach(going, on: socket, done)
+            }
+            guard let reply else { return done(false) }
+            let told = reply["ok"]?.bool == true
+            let one = Realtime.allOf(going.count, done)
+            for room in going { joined(room, told ? reply["rooms"]?[room.name] ?? .null : reply, on: socket, retry: true, one) }
+        }
+    }
+
+    private func joinEach(_ list: [Room], on socket: RoomSocket, _ done: @escaping (Bool) -> Void) {
+        guard !list.isEmpty else { return done(true) }
+        let one = Realtime.allOf(list.count, done)
+        list.forEach { joinOne($0, on: socket, one) }
+    }
+
+    /// `done` once `count` have answered: true when all said true. On the queue.
+    private static func allOf(_ count: Int, _ done: @escaping (Bool) -> Void) -> (Bool) -> Void {
+        var left = count, ok = true
+        return { joined in
+            if !joined { ok = false }
+            left -= 1
+            if left == 0 { done(ok) }
+        }
+    }
+
+    /// Rooms in one `leave`, a server from before it taking them one by one.
+    func leaveMany(_ names: [String], on socket: RoomSocket) {
+        let each = { [self] in names.forEach { socket.emit("leave", ["tab": .string(tab), "room": .string($0)]) } }
+        guard names.count > 1, many else { return each() }
+        socket.emit("leave", ["tab": .string(tab), "rooms": .array(names.map(JSONValue.string))]) { [self] reply in
+            guard reply?["error"]?.string == "bad_request" else { return }
+            many = false
+            each()
+        }
+    }
+
+    func tokenFor(_ name: String, _ done: @escaping (String?) -> Void) {
         let now = Date().timeIntervalSince1970
         if let held = tokens[name], held.exp - now > 60 { return done(held.token) }
         if let open = options.grants.first(where: { $0.exp - now > 60 && $0.rooms.contains { Realtime.patternMatches($0, name) } }) { return done(open.token) }
+        requestToken(name) { [weak self] in done(self?.tokens[name]?.token) }
+    }
+
+    /// Asks the app's server for a room's token, in one request with every other room asked for in the same moment.
+    private func requestToken(_ name: String, _ done: @escaping () -> Void) {
         let first = pendingAuth.isEmpty
         pendingAuth.append(name)
-        authWaiters.append { [weak self] in done(self?.tokens[name]?.token) }
+        authWaiters.append(done)
         if first { queue.async { self.flushAuth() } }
     }
 
@@ -343,11 +503,18 @@ public final class Realtime: @unchecked Sendable {
         guard let first = held.values.map(\.exp).min() else { return }
         let item = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            for name in held.keys where self.rooms[name] != nil { self.tokenFor(name) { _ in } }
+            // Asked of the route, not taken from the tokens kept, which are still good then: their answer schedules the next.
+            for name in held.keys where self.rooms[name] != nil { self.requestToken(name) {} }
         }
         renewal = item
-        queue.asyncAfter(deadline: .now() + max(30, first - 600 - Date().timeIntervalSince1970), execute: item)
+        queue.asyncAfter(deadline: .now() + max(Realtime.renewFloor, first - Realtime.renewBefore - Date().timeIntervalSince1970), execute: item)
     }
+
+    /// How long before a room's token or the identity runs out it is asked for again, as the browser's rooms() asks.
+    static let renewBefore: TimeInterval = 600
+
+    /// The least a renewal waits, so a token that came near its end isn't asked for again and again. Tests shorten it.
+    static var renewFloor: TimeInterval = 30
 
     /// The keys route: keys asked for that the user may have, or with none their own keys and identity.
     func askKeys(_ labels: [String], renew: Bool = true, _ done: @escaping () -> Void) {
@@ -355,10 +522,21 @@ public final class Realtime: @unchecked Sendable {
             keyring.add(answer?["keys"]?.array?.compactMap(\.string) ?? [])
             if let token = answer?["identity"]?["token"]?.string, token != identity?.token {
                 identity = Identity(token: token, exp: answer?["identity"]?["exp"]?.number ?? 0)
+                scheduleIdentity()
                 if let socket = connection.current, socket.isConnected { identify(on: socket, renew: renew) {} }
             }
             done()
         }
+    }
+
+    /// The identity asked for again before it runs out, so an app open for days stays known. One with no end is left.
+    private func scheduleIdentity() {
+        identityRenewal?.cancel()
+        identityRenewal = nil
+        guard let exp = identity?.exp, exp > 0, !closed else { return }
+        let item = DispatchWorkItem { [weak self] in self?.askKeys([]) {} }
+        identityRenewal = item
+        queue.asyncAfter(deadline: .now() + max(Realtime.renewFloor, exp - Realtime.renewBefore - Date().timeIntervalSince1970), execute: item)
     }
 
     /// A POST to one of the app's routes, its JSON answer on the queue (nil when it failed).
@@ -374,6 +552,7 @@ public final class Realtime: @unchecked Sendable {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         for (name, value) in options.headers() { request.setValue(value, forHTTPHeaderField: name) }
         request.httpBody = try? JSONValue.object(body).encoded()
+        if let sign = options.request { request = sign(request) }
         URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             let answer = data.flatMap { String(data: $0, encoding: .utf8) }.flatMap(JSONValue.parse)
@@ -407,7 +586,7 @@ public final class Realtime: @unchecked Sendable {
         }
     }
 
-    private func event(_ name: String, _ data: JSONValue) {
+    func event(_ name: String, _ data: JSONValue) {
         switch name {
         case "e": deliver(data, room: data["room"]?.string ?? "", replayed: false)
         case "join":
@@ -485,9 +664,12 @@ public final class Realtime: @unchecked Sendable {
         }
     }
 
-    func socketForEmit() -> SocketIO? {
-        connection.current
+    func socketForEmit() -> RoomSocket? {
+        socketAsked ?? connection.current
     }
+
+    /// A socket in place of the connection's, for the tests.
+    var socketAsked: RoomSocket?
 
     /// A pattern of a public grant, as the realtime server matches it: each `{part}` one or more characters other
     /// than `:` and `.`.
@@ -536,8 +718,23 @@ public struct RealtimeOptions: @unchecked Sendable {
     public var callbackQueue: DispatchQueue
     public var keyring: Keyring?
     var nodeStore: NodeStore?
+    /// Each request to the app's routes as it goes, its body set: for an app whose server knows its users by a signature of
+    /// every request rather than a header (the WordPlus app signs each with the phone's key). Nil sends them as they are.
+    public var request: (@Sendable (URLRequest) -> URLRequest)?
+    /// The namespace of the realtime server the connection opens: `/channels`, this SDK's own, unless the app speaks
+    /// another product's protocol, such as Better Messages' on `/` (`P2PCallTransport` carries its calls). Reconnecting,
+    /// moving to another node and the nodes kept between launches work the same on every namespace, as the realtime
+    /// server sends `migrate` and `nodes` in each. Rooms, presence and the SDK's own calls are `/channels`' protocol.
+    public var namespace: String
+    /// The handshake of a namespace other than `/channels`, such as Better Messages' `["sid": site, "uid": user, "sk":
+    /// key, "v": version]`. Nil sends this SDK's own, `["site": app, "rt": 3]`. An object without `rt` is sent with
+    /// `"rt": 1`, which tells the realtime server that this connection moves between nodes.
+    public var auth: JSONValue?
 
-    public init(app: String, endpoint: URL, routes: [String: URL] = [:], headers: @escaping @Sendable () -> [String: String] = { [:] }, server: URL = URL(string: "https://ws.wordplus.cloud")!, path: String = "/websocket", keys: [String] = [], identity: Identity? = nil, grants: [PublicGrant] = [], callbackQueue: DispatchQueue = .main, keyring: Keyring? = nil) {
+    /// The SDK's own namespace, which a connection opens unless its options name another.
+    public static let channels = "/channels"
+
+    public init(app: String, endpoint: URL, routes: [String: URL] = [:], headers: @escaping @Sendable () -> [String: String] = { [:] }, server: URL = URL(string: "https://ws.wordplus.cloud")!, path: String = "/websocket", keys: [String] = [], identity: Identity? = nil, grants: [PublicGrant] = [], callbackQueue: DispatchQueue = .main, keyring: Keyring? = nil, namespace: String = RealtimeOptions.channels, auth: JSONValue? = nil) {
         self.app = app
         self.endpoint = endpoint
         self.routes = routes
@@ -549,6 +746,16 @@ public struct RealtimeOptions: @unchecked Sendable {
         self.grants = grants
         self.callbackQueue = callbackQueue
         self.keyring = keyring
+        self.namespace = namespace
+        self.auth = auth
+    }
+
+    /// What the connection's handshake sends: `auth` with `rt` in it, or this SDK's own.
+    var handshake: JSONValue {
+        guard let auth else { return ["site": .string(app), "rt": 3] }
+        guard case var .object(fields) = auth else { return auth }
+        if fields["rt"] == nil { fields["rt"] = 1 }
+        return .object(fields)
     }
 
     /// From the server package's config() answer (`realtime` in the API demo's sign-in), its routes resolved
@@ -635,20 +842,24 @@ public struct Listener: Hashable, Sendable {
 }
 
 final class Listeners<Value>: @unchecked Sendable {
-    private var byEvent: [String: [(UUID, (Value) -> Void)]] = [:]
+    private var byEvent: [String: [(id: UUID, once: Bool, fn: (Value) -> Void)]] = [:]
     private var any: [(UUID, (String, Value) -> Void)] = []
     private let lock = NSLock()
 
-    func add(_ event: String, _ fn: @escaping (Value) -> Void) -> Listener {
+    func add(_ event: String, once: Bool = false, _ fn: @escaping (Value) -> Void) -> Listener {
         let id = UUID()
         lock.lock()
-        byEvent[event, default: []].append((id, fn))
+        byEvent[event, default: []].append((id, once, fn))
         lock.unlock()
         return Listener(id: id, event: event)
     }
 
     func add(_ event: String, _ fn: @escaping (JSONValue, EventMeta) -> Void) -> Listener where Value == (JSONValue, EventMeta) {
         add(event) { (pair: Value) in fn(pair.0, pair.1) }
+    }
+
+    func once(_ event: String, _ fn: @escaping (JSONValue, EventMeta) -> Void) -> Listener where Value == (JSONValue, EventMeta) {
+        add(event, once: true) { (pair: Value) in fn(pair.0, pair.1) }
     }
 
     func add(_ event: String, _ fn: @escaping (ConnectionState, String?) -> Void) -> Listener where Value == (ConnectionState, String?) {
@@ -665,20 +876,28 @@ final class Listeners<Value>: @unchecked Sendable {
 
     func remove(_ listener: Listener) {
         lock.lock()
-        byEvent[listener.event]?.removeAll { $0.0 == listener.id }
+        byEvent[listener.event]?.removeAll { $0.id == listener.id }
         any.removeAll { $0.0 == listener.id }
+        lock.unlock()
+    }
+
+    func remove(event: String) {
+        lock.lock()
+        byEvent[event] = nil
         lock.unlock()
     }
 
     func fire(_ event: String, _ value: Value, on queue: DispatchQueue, any fireAny: Bool = false) {
         lock.lock()
         let list = byEvent[event] ?? []
+        // Off here, not as it runs: two fired before the first runs reach it once.
+        byEvent[event]?.removeAll { $0.once }
         let anyList = fireAny ? any : []
         lock.unlock()
         guard !list.isEmpty || !anyList.isEmpty else { return }
         queue.async {
             for (_, fn) in anyList { fn(event, value) }
-            for (_, fn) in list { fn(value) }
+            for entry in list { entry.fn(value) }
         }
     }
 

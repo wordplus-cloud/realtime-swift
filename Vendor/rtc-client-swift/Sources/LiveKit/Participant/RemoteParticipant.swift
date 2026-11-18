@@ -28,9 +28,30 @@ public class RemoteParticipant: Participant, @unchecked Sendable {
         _state.dataTracks.reduce(into: [:]) { $0[$1.name] = $1 }
     }
 
+    /// WordPlus Mesh (1.0.14): whether this person's first info has been read, what they join with being no change.
+    private let _joined = StateSync(false)
+
     init(info: Livekit_ParticipantInfo, room: Room, connectionState: ConnectionState) {
         super.init(room: room, sid: Participant.Sid(from: info.sid), identity: Participant.Identity(from: info.identity))
         set(info: info, connectionState: connectionState)
+        _joined.mutate { $0 = true }
+    }
+
+    /// WordPlus Mesh (1.0.14): what someone else may do, told as it changes, as a browser's client tells it. Stock tells
+    /// it of the local participant alone, so an app only learned that a host let someone speak once they sent something.
+    override func set(permissions newValue: ParticipantPermissions) -> Bool {
+        let didUpdate = super.set(permissions: newValue)
+
+        if didUpdate, _joined.read({ $0 }), let room = _room {
+            delegates.notify(label: { "participant.didUpdatePermissions: \(newValue)" }) {
+                $0.participant?(self, didUpdatePermissions: newValue)
+            }
+            room.delegates.notify(label: { "room.didUpdatePermissions: \(newValue)" }) {
+                $0.room?(room, participant: self, didUpdatePermissions: newValue)
+            }
+        }
+
+        return didUpdate
     }
 
     /// Adds the track, returning `false` if this exact track is already attached. Identity-based

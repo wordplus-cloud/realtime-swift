@@ -136,6 +136,36 @@ final class LiveTests: XCTestCase {
         }
     }
 
+    func testJoinsSeveralRoomsInOneRequestLeavesThemAndJoinsThemAgain() async throws {
+        let ben = try await signIn(42)
+        let names = [try XCTUnwrap(ben.shop["rooms"]?["order"]?.string), try XCTUnwrap(ben.shop["rooms"]?["chat"]?.string), "shop"]
+        let deadline = Date().addingTimeInterval(15)
+        while ben.rt.state != .connected, Date() < deadline { try await Task.sleep(nanoseconds: 50_000_000) }
+        XCTAssertEqual(ben.rt.state, .connected)
+
+        // In one moment, on the connection as it is up: a real server takes them in one request, each answered.
+        let rooms = names.map { ben.rt.join($0) }
+        for room in rooms { try await room.ready() }
+        XCTAssertTrue(ben.rt.queue.sync { ben.rt.many }, "the server answered bad_request to several rooms")
+
+        // Left in one moment, and joined again in one.
+        names.forEach { ben.rt.leave($0) }
+        let again = names.map { ben.rt.join($0) }
+        for room in again { try await room.ready() }
+        XCTAssertTrue(ben.rt.queue.sync { ben.rt.many }, "the server answered bad_request to several rooms")
+
+        // What goes to one of them comes, so it is in that room for real.
+        let order = try XCTUnwrap(ben.rt.room(names[0]))
+        let heard = expectation(description: "updated")
+        order.on("updated") { data, _ in
+            if data["status"]?.string == "shipped" { heard.fulfill() }
+        }
+        let ann = try await signIn(34)
+        let status = try await post("orders/1042/status", ["status": "shipped"], as: ann)
+        XCTAssertEqual(status, 200)
+        await fulfillment(of: [heard], timeout: 8)
+    }
+
     func testListsWhoIsInTheShopAndWhoIsOnline() async throws {
         let ben = try await signIn(42)
         let shop = ben.rt.join("shop")

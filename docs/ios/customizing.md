@@ -7,21 +7,21 @@ The call screen (`WordPlusRealtimeUI`) is the Better Messages native one. Your a
 ```swift
 CallScreen.shared.configure( .init(
     strings: [ "end_call": "Hang up", "calling": "Ringing…" ],
-    tokens: [ "--bm-color-accent": "37, 99, 235" ],     // red, green, blue, or a hex value
-    tokensDark: [ "--bm-color-accent": "96, 165, 250" ]
+    tokens: [ "--wplus-color-accent": "37, 99, 235" ],     // red, green, blue, or a hex value
+    tokensDark: [ "--wplus-color-accent": "96, 165, 250" ]
 ) )
 ```
 
 | Token | What it colours |
 |---|---|
-| `--bm-color-accent`, `--bm-color-text-on-accent` | a control that is on, and what is drawn on it |
-| `--bm-color-success`, `--bm-color-recording`, `--bm-color-warning`, `--bm-color-online` | answering, hanging up and a microphone off, a warning, the online dot |
-| `--bm-call-canvas` | the stage, near-black unless you set it: a camera picture is seen against it |
-| `--bm-call-tile` | the tiles of a group call |
-| `--bm-call-btn` | each control in the dock |
-| `--bm-call-dock` | the glass behind the dock |
+| `--wplus-color-accent`, `--wplus-color-text-on-accent` | a control that is on, and what is drawn on it |
+| `--wplus-color-success`, `--wplus-color-recording`, `--wplus-color-warning`, `--wplus-color-online` | answering, hanging up and a microphone off, a warning, the online dot |
+| `--wplus-call-canvas` | the stage, near-black unless you set it: a camera picture is seen against it |
+| `--wplus-call-tile` | the tiles of a group call |
+| `--wplus-call-btn` | each control in the dock |
+| `--wplus-call-dock` | the glass behind the dock |
 
-The same names as the web call screen, so one palette serves both.
+The same names as the web call screen, so one palette serves both. Their names before, `--bm-…`, still work.
 
 ## 2. A piece of your own
 
@@ -40,7 +40,7 @@ CallScreen.shared.pieces = .init(
     // Your own view while a call rings in, full screen: answer() shows the call on our screen.
     ringing: { ring in RingView( name: ring.name, answer: ring.answer, decline: ring.decline ) },
     // A view over the tile of each person in a group call, such as a badge: the same view again stays.
-    tile: { person in person.handRaised ? HandBadge() : nil },
+    tile: { person in person.isMe ? youBadge : nil },
     // A view over a call between two, under the dock.
     stage: { state in nil }
 )
@@ -48,11 +48,13 @@ CallScreen.shared.pieces = .init(
 
 | Piece | What it is |
 |---|---|
-| `controls` | the dock buttons: ours are `answer`, `settings`, `flip`, `camera`, `mute`, `speaker`, `pip`, `share`, `hand`, `people` and `end`. `CallControl( id:label:icon:latched:action: )` adds yours, drawn as ours are (`icon` a path in a 24-point grid, as the Lucide icons are) |
+| `controls` | the dock buttons. Ours, by id, as the screen shows them: `answer` (a call ringing in), `flip` (while the camera is on), `camera`, `mute`, `speaker` (once the call is answered), `share` (once the call is up, where the app has the extension for [sharing the screen](calls.md#sharing-the-screen)), `add` (once the call is up, with `CallScreen.shared.addPerson` on, [Add Person](calls.md#on-the-call-screen)), `pip` (picture in picture: in a video call between two with a picture to show, in a group call by video, and in a group call by voice while someone else shares a screen), `host` (Host Controls, for a moderator in a group call) and `end`. The dock also shows `settings`, a gear, once the call is up, which opens Device Settings (the camera, the microphone and the speaker, with a test of each): `ours.filter { $0.id != "settings" }` takes it away. `CallControl( id:label:icon:latched:action: )` adds yours, drawn as ours are (`icon` a path in a 24-point grid, as the Lucide icons are) |
 | `status` | the line under the name: `state.phase` is `ringing_out`, `ringing_in`, `connecting`, `in_progress` or `reconnecting`, `state.seconds` how long the call has been on |
 | `ringing` | your own view for a call ringing in |
-| `tile` | a view over the tile of someone in a group call |
+| `tile` | a view over the tile of someone in a group call. `person` has `identity`, `name`, `avatar`, `isMe`, `speaking` and `muted` |
 | `stage` | a view over a call between two |
+
+The dock has no raise hand button: a group call of the SDK has no way to send one, on the web either. A listener asks through a room of yours ([speakers and listeners](calls.md#speakers-and-listeners)), and a control of your own in `controls` can send it.
 
 ## 3. The code itself
 
@@ -79,9 +81,9 @@ swift run --package-path "$PKG" wordplus-ui add --project . --target Shop
 
 `diff`, `update` and `accept` take the same flags.
 
-- **Where it goes:** the target `WordPlusUI/` folder: `BmCallsScreen.swift` (the call), `BmCallsGrid.swift` (the grid of a group call), `BmCallsPanel.swift`, `BmCallsPip.swift` and the rest, `CallScreen.swift`, which drives them from the calls, and `CallScreenPreview.swift` ([checking a change](#checking-a-change)).
+- **Where it goes:** the target `WordPlusUI/` folder: `CallsScreen.swift` (the call), `CallsGrid.swift` (the grid of a group call), `CallsPanel.swift`, `CallsPip.swift` and the rest, `CallScreen.swift`, which drives them from the calls, and `CallScreenPreview.swift` ([checking a change](#checking-a-change)).
 - **Its tests** go into your unit test target, under `WordPlusUITests/`. Without one, they wait in a `WordPlusUITests/` folder until you add a unit test target hosted by the app.
-- **Then, in the target:** take `WordPlusRealtimeUI` out of its dependencies, since your copy is the screen now. Add `LiveKit` (this package's room client) and `LiveKitWebRTC` (webrtc-xcframework), which the screen draws with. `CallScreen.shared.attach( rt.calls )` works as before.
+- **Then, in the target:** take `WordPlusRealtimeUI` out of its dependencies, since your copy is the screen now. Add `WordPlusRTC` (this package's room client) and `LiveKitWebRTC` (webrtc-xcframework), which the screen draws with. `CallScreen.shared.attach( rt.calls )` works as before.
 - **Your own screen, from scratch:** `GroupVideoView` draws the camera or shared screen of someone in a group call (`show( person.identity, of: call )`), or your own camera (`showOwn( of: call )`). `CallVideoView` does the same in a call between two.
 
 ### When ours changes
@@ -97,7 +99,7 @@ Nothing changes your copy by itself.
 
 ## Checking a change
 
-- **Every state, with no call:** `CallScreenPreview` draws the screen calling, ringing in, connecting, in a call by voice and by video, with the microphone and camera off, with the other side lost, reconnecting, and in a group call by video and by voice. Its Dark and RTL buttons switch the look. It draws your pieces and your look, and your copy once you have one.
+- **Every state, with no call:** `CallScreenPreview` draws the screen calling, ringing in, connecting, in a call by voice and by video, with the microphone and camera off, with the other side lost, reconnecting, in a group call by video and by voice, and with Add Person open. Its Dark and RTL buttons switch the look. It draws your pieces and your look, and your copy once you have one.
 
   ```swift
   window.rootViewController = UINavigationController( rootViewController: CallScreenPreview() )   // the list of states

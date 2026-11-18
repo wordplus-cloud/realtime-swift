@@ -6,7 +6,7 @@ import LiveKit
 /// A camera changing codec (CameraSwitch, GroupCall), as the web's call screen holds it: the word puts it up, the old
 /// camera's frames and going don't end it, a new camera's first frame does, after `ready` any camera's next frame
 /// does, the camera turned off does, and the media server's failsafe does, counted from the move's first word.
-/// `GroupPerson.optimizing` says it until a new camera arrives. The same rules as Better Messages' app.
+/// `GroupPerson.optimizing` says it until a new camera arrives.
 @MainActor
 final class CameraSwitchTests: XCTestCase {
     private let start = Date( timeIntervalSince1970: 1_000 )

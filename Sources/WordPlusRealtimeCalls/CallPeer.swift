@@ -103,6 +103,10 @@ struct CallPeerStats {
     var videoEncoder: String? = nil
     var videoDecoder: String? = nil
     var counters = CallPeerCounters()
+    /// The microphone's level as the call sends it, 0…1 (the audio
+    /// media-source's `audioLevel`), nil where the report has none: the meter
+    /// of a device check for a live microphone.
+    var microphoneLevel: Double? = nil
 }
 
 protocol CallPeerDelegate: AnyObject {
@@ -161,21 +165,44 @@ final class CallPeer: NSObject {
     /// the room for good.
     ///
     /// None of it runs while a restart could not be negotiated: this side's
-    /// socket down, or the relay having said the other side's is. A deadline
-    /// that runs out then proves nothing about the path, so escalation waits,
-    /// for up to `signalingHoldMax`, and starts over with a fresh budget once
-    /// both sides can be reached. A hold that runs out is spent until then,
+    /// socket down or answering nothing, or the relay having said the other
+    /// side's is gone. A deadline that runs out then proves nothing about the
+    /// path, so escalation waits, for up to `signalingHoldMax`, and starts
+    /// over with a fresh budget once both sides can be reached — at most
+    /// `holdRefreshes` times until the connection has been healthy again, so
+    /// a socket that keeps stalling and coming back cannot hold a dead call
+    /// out of the room for ever. A hold that runs out is spent until then,
     /// and the ladder runs as though there had been none. A connection that
     /// has carried media for `healthyReset` since its last trouble has its
     /// restarts back, so every incident in a long call gets the whole trial.
-    /// The numbers are the web's.
+    ///
+    /// After a first connection both sides see the same trouble at about the
+    /// same moment, and the impolite one restarts first. The polite one waits
+    /// `politeRestartDelay`, and twice its own latest round trip to the relay
+    /// on top (`politeRestartMax` in all), for that restart to arrive, takes
+    /// it as its own attempt when it does, and at an attempt's deadline waits
+    /// as long for the other side's next. It waited a second and a half, so
+    /// on a slow socket the two restarted into each other and the polite side
+    /// spent an attempt on an offer it then rolled back (31 Oct 2026). The
+    /// numbers are the web's.
     private enum Constants {
         static let maxRestarts = 2
+        /// Refused answers rolled back and restarted over before an answer
+        /// applies again (`recoverRefusedAnswer`).
+        static let answerRecoveries = 2
+        /// A restart whose negotiation has not begun this long after
+        /// `restartIce()`, with nothing in the way, is offered by the peer
+        /// itself: until it is, every offer from the other side counts as a
+        /// collision (`restartPending`).
+        static let restartPendingMax: TimeInterval = 2
         static let restartDeadline: TimeInterval = 8
         static let disconnectGrace: TimeInterval = 1
-        static let politeRestartDelay: TimeInterval = 1.5
+        static let politeRestartDelay: TimeInterval = 3
+        static let politeRestartMax: TimeInterval = 6
+        static let politeUnreachableDelay: TimeInterval = 1.5
         static let healthyReset: TimeInterval = 30
         static let signalingHoldMax: TimeInterval = 60
+        static let holdRefreshes = 2
         static let renewPoliteDelay: TimeInterval = 10
         static let statsInterval: TimeInterval = 2
         static let privateHold: TimeInterval = 2
@@ -212,8 +239,32 @@ final class CallPeer: NSObject {
         /// gets, and one that has not by `connectDeadline` — both of them run
         /// out — is given up for the room. It was fourteen seconds, which left
         /// a relay allocation over TCP on 443 through a slow network six.
+        ///
+        /// Both clocks start once this side holds both descriptions, not when
+        /// the peer is made: before that ICE has nothing to check. On a call
+        /// whose caller heard the relay five seconds late (ppl.travel, 30 Oct
+        /// 2026) the callee's eight seconds ran out a moment after its answer
+        /// went, and the two sides restarted over each other until the call
+        /// went to the room. A negotiation that never completes is given
+        /// `negotiateDeadline` from the peer's birth, and once the other side
+        /// has spoken, `negotiateIdle` from the last word it said, up to
+        /// `negotiateMax` from the birth: a side still at work on the call is
+        /// a slow one, not a gone one (31 Oct 2026, a callee
+        /// gave up on a caller whose offer came nine seconds after the call
+        /// had gone to the room). Before a first connection the impolite side
+        /// alone restarts when its clock runs out; either side restarts when
+        /// its own ICE fails, and a restart the other side made is this side's
+        /// attempt too.
         static let connectRelayAt: TimeInterval = 8
         static let connectDeadline: TimeInterval = connectRelayAt + Double(maxRestarts) * restartDeadline + 2
+        static let negotiateDeadline: TimeInterval = connectDeadline
+        static let negotiateIdle: TimeInterval = negotiateDeadline
+        static let negotiateMax: TimeInterval = 2 * negotiateDeadline
+        /// An attempt's deadline counts from its own answer, so a restart over
+        /// a slow trip gets its whole `restartDeadline` of checks; an answer
+        /// that has not come by `restartDeadline + answerWait` is the attempt
+        /// failed.
+        static let answerWait: TimeInterval = 8
 
         /// When a negotiated codec is declared dead, and how fast.
         ///
@@ -324,6 +375,14 @@ final class CallPeer: NSObject {
     private var started = false
     private var makingOffer = false
     private var ignoreOffer = false
+    /// From this side's `restartIce()` until the offer it calls for is being
+    /// made (`requestIceRestart`): an offer from the other side meanwhile is a
+    /// collision, because libwebrtc answers it with the new credentials.
+    private var restartPending = false
+    private var restartPendingAt = Date.distantPast
+    /// Refused answers rolled back and restarted over since the last answer
+    /// that applied (`recoverRefusedAnswer`).
+    private var answerRecoveries = 0
     private var restartCount = 0
     private var restartsTotal = 0
     private var restartWork: DispatchWorkItem?
@@ -355,7 +414,23 @@ final class CallPeer: NSObject {
     /// asks on every stats tick, and the tick after the release used to hold
     /// again and cancel the restart the release had just started.
     private var holdSpent = false
+    /// How many times a release has given the restarts back since the
+    /// connection was last healthy (`holdRefreshes`), and when the last was.
+    private var holdRefreshCount = 0
+    private var lastReleaseAt: Date?
+    /// When the other side last said anything, of any kind (`heardFromPeer`).
+    private var peerHeardAt: Date?
+    /// The latest round trips to the relay and back, the longest, as the
+    /// engine last read it from the signaling (`setSignalRoundTrip`).
+    private var signalRoundTrip: TimeInterval = 0
+    /// What a polite wait for the other side's restart does when it ends, so
+    /// a restart that arrives in it can end it early (`endRestartWait`).
+    private var restartWaitRun: (() -> Void)?
     private let connectStartedAt = Date()
+    /// When this side first held both descriptions (the connect clocks start
+    /// then), and when it last did, which an attempt's deadline counts from.
+    private var negotiatedAt: Date?
+    private var stableAt: Date?
     /// The call's own transport policy, which a restart that is not over the
     /// relay alone goes back to.
     private var basePolicy: LKRTCIceTransportPolicy = .all
@@ -363,10 +438,13 @@ final class CallPeer: NSObject {
     /// deadline, and the second undid the first.
     private var restarting = false
     private var lastOfferAt: Date?
+    /// When the other side last offered new ICE credentials: a restart of its.
+    private var lastRestartOfferAt: Date?
     private var lastSilentNotice: [CallSource: Date] = [:]
     private var failed = false
     private var refreshWatch: [CallSource: RefreshWatch] = [:]
     private var lastOutbound: [CallSource: OutboundVideo] = [:]
+    private let micCeiling = CallMicCeiling()
 
     /// What the last stats line said, so the trace holds a whole call: the poll
     /// is every two seconds and only a change of state or half a minute is
@@ -388,6 +466,11 @@ final class CallPeer: NSObject {
     /// Which of the other side's video sources a picture is expected from:
     /// announced on, and not paused by a wish of this side's own.
     private var expectedVideo: Set<CallSource> = []
+    /// Which of the other side's sounds are on, for what a quality reading
+    /// says this side plays; and the readings, from the stats passes this
+    /// peer makes anyway (`CallQuality.swift`).
+    private var expectedAudio: Set<CallSource> = []
+    private let quality = CallQualityWatch()
     /// Decoded-frame progress per expected source, whether the sender has
     /// already been asked for a fresh picture in the current silence, and
     /// what the stream had delivered when it was asked.
@@ -403,6 +486,9 @@ final class CallPeer: NSObject {
 
     private(set) var connection: CallConnection = .connecting
     private(set) var stats = CallPeerStats()
+    /// Whether the pair in use goes through a relay on either side, from the
+    /// stats passes; nil until one names a pair. It picks the camera's ceiling.
+    private var relayed: Bool?
 
     init?(polite: Bool,
           factory: LKRTCPeerConnectionFactory,
@@ -477,7 +563,10 @@ final class CallPeer: NSObject {
         }
 
         startStatsLoop()
-        armConnectDeadline()
+
+        // The connect clocks start with the negotiation (startConnectClock);
+        // until then only a negotiation that never completes is given up.
+        armConnectFailure(after: Constants.negotiateDeadline)
     }
 
     /// One line for the call's trace: never SDP, addresses or names.
@@ -508,11 +597,16 @@ final class CallPeer: NSObject {
     /// this the call sits on screen showing nothing, for as long as the person
     /// is willing to look at it, and the server is never told to move it.
     ///
-    /// A connection that has not come up in `connectRelayAt` is tried over
-    /// the relay alone before it is given up on: a path that ICE cannot find
-    /// in eight seconds is not going to be found, and a relay allocation
-    /// takes one or two.
-    private func armConnectDeadline() {
+    /// A connection that has not come up `connectRelayAt` after the
+    /// negotiation is tried over the relay alone before it is given up on: a
+    /// path that ICE cannot find in eight seconds of checks is not going to
+    /// be found, and a relay allocation takes one or two. The impolite side
+    /// restarts; the polite one keeps every candidate and answers it.
+    private func startConnectClock() {
+        guard !closed, !everConnected else { return }
+
+        connectRelayWork?.cancel()
+
         // A hold lets both of these go by: the ladder starts over when it
         // lifts (`releaseHold`).
         let relay = DispatchWorkItem { [weak self] in
@@ -522,7 +616,13 @@ final class CallPeer: NSObject {
 
             guard !self.closed, !self.everConnected, self.heldSince == nil, !self.restarting, self.restartDeadlineWork == nil else { return }
 
-            self.trace("no connection after \(Int(Constants.connectRelayAt * 1000))ms, trying the relay alone")
+            // Its own ICE failing is what makes the polite side restart.
+            if self.polite {
+                self.trace("no connection \(Int(Constants.connectRelayAt * 1000))ms after the negotiation: the other side restarts over the relay alone, this side answers")
+                return
+            }
+
+            self.trace("no connection \(Int(Constants.connectRelayAt * 1000))ms after the negotiation, trying the relay alone")
             self.restart(force: true, why: "no connection", relay: true)
         }
 
@@ -531,6 +631,22 @@ final class CallPeer: NSObject {
         queue.asyncAfter(deadline: .now() + Constants.connectRelayAt, execute: relay)
 
         armConnectFailure(after: Constants.connectDeadline)
+    }
+
+    /// Both descriptions held: the first time, the connect clocks start;
+    /// every time, an attempt in flight counts its deadline from here.
+    private func noteStable() {
+        guard !closed, let pc = pc, pc.signalingState == .stable, pc.localDescription != nil, pc.remoteDescription != nil else { return }
+
+        let now = Date()
+
+        stableAt = now
+
+        guard negotiatedAt == nil else { return }
+
+        negotiatedAt = now
+        trace("negotiated \(Int(now.timeIntervalSince(connectStartedAt) * 1000))ms after the peer was made: the connect clock starts")
+        startConnectClock()
     }
 
     private func armConnectFailure(after delay: TimeInterval) {
@@ -543,7 +659,30 @@ final class CallPeer: NSObject {
 
             guard !self.closed, !self.everConnected, self.heldSince == nil else { return }
 
-            self.fail("ice_failed", why: "no connection after \(Int(Date().timeIntervalSince(self.connectStartedAt) * 1000))ms")
+            // An attempt in flight is judged by its own deadline, which counts
+            // from its answer: the restarts are few, so this ends.
+            if self.restarting || self.restartDeadlineWork != nil {
+                self.armConnectFailure(after: Constants.restartDeadline)
+                return
+            }
+
+            let now = Date()
+            let since = Int(now.timeIntervalSince(self.connectStartedAt) * 1000)
+
+            // No offer and answer yet, from a side that has spoken lately: it
+            // is slow, not gone, and the room would wait for it as well.
+            if self.negotiatedAt == nil, let heard = self.peerHeardAt,
+               let more = CallPeer.negotiationGrace(sinceBirth: now.timeIntervalSince(self.connectStartedAt), sinceHeard: now.timeIntervalSince(heard)) {
+                self.trace("the offer and answer were not exchanged in \(since)ms, but the other side spoke \(Int(now.timeIntervalSince(heard) * 1000))ms ago: waiting up to \(Int(more * 1000))ms more")
+                self.armConnectFailure(after: more)
+                return
+            }
+
+            if let negotiated = self.negotiatedAt {
+                self.fail("ice_failed", why: "no connection \(Int(Date().timeIntervalSince(negotiated) * 1000))ms after the negotiation, \(since)ms after the peer was made")
+            } else {
+                self.fail("ice_failed", why: "the offer and answer were not exchanged in \(since)ms")
+            }
         }
 
         connectDeadlineWork = work
@@ -556,6 +695,47 @@ final class CallPeer: NSObject {
         connectDeadlineWork = nil
         connectRelayWork?.cancel()
         connectRelayWork = nil
+    }
+
+    /// Told by the engine of every signal the other side sends this peer,
+    /// whatever its kind.
+    func heardFromPeer() {
+        let at = Date()
+
+        queue.async { [weak self] in self?.peerHeardAt = at }
+    }
+
+    /// The longest of the latest round trips to the relay and back, in
+    /// seconds, told by the engine on every stats tick.
+    func setSignalRoundTrip(_ seconds: TimeInterval) {
+        queue.async { [weak self] in
+            self?.signalRoundTrip = seconds.isFinite ? max(0, seconds) : 0
+        }
+    }
+
+    /// How long the polite side gives the other side's restart to arrive
+    /// before it makes its own (`politeRestartDelay`).
+    /// With the hold spent, one side cannot be reached and no restart of the
+    /// other side's can arrive: the moment it always had, for a glare alone.
+    private func politeWait() -> TimeInterval {
+        holdSpent ? Constants.politeUnreachableDelay : CallPeer.politeWait(roundTrip: signalRoundTrip)
+    }
+
+    /// The polite side's wait on a socket whose latest round trips took
+    /// `roundTrip` seconds at the longest.
+    static func politeWait(roundTrip: TimeInterval) -> TimeInterval {
+        min(Constants.politeRestartMax, Constants.politeRestartDelay + 2 * (roundTrip.isFinite ? max(0, roundTrip) : 0))
+    }
+
+    /// How much longer a negotiation that has not completed is waited for,
+    /// its peer made `sinceBirth` seconds ago and the other side last heard
+    /// `sinceHeard` ago; nil when it is given up.
+    static func negotiationGrace(sinceBirth: TimeInterval, sinceHeard: TimeInterval?) -> TimeInterval? {
+        guard let heard = sinceHeard else { return nil }
+
+        let more = min(Constants.negotiateIdle - heard, Constants.negotiateMax - sinceBirth)
+
+        return more > 0.25 ? more : nil
     }
 
     /// The relay's copy of the other side's latest counters, from the reply
@@ -624,7 +804,7 @@ final class CallPeer: NSObject {
             if source.isVideo {
                 encoding.maxBitrateBps = NSNumber(value: source == .screenShare
                     ? CallShapes.screenCeiling(1080)
-                    : CallShapes.cameraMaxBitrate)
+                    : CallShapes.cameraRelayMaxBitrate)
             } else {
                 encoding.maxBitrateBps = NSNumber(value: CallShapes.audioCeiling(source))
             }
@@ -647,6 +827,8 @@ final class CallPeer: NSObject {
                     to: transceiver,
                     factory: factory
                 )
+            } else if source == .microphone, CallCodecs.applyRed(to: transceiver, factory: factory) {
+                trace("microphone offers RED first")
             }
         }
     }
@@ -679,12 +861,10 @@ final class CallPeer: NSObject {
 
             transceiver.sender.track = track
 
-            // Shaped whether the track came or went: a track taken away
-            // makes the encoding inactive for the pause, and its coming back
-            // is then a change libwebrtc acts on.
-            if source.isVideo {
-                self.applyWanted(source)
-            }
+            // Shaped whether the track came or went, audio as well as video:
+            // a track taken away makes the encoding inactive for the pause,
+            // and its coming back is then a change libwebrtc acts on.
+            self.applyWanted(source)
         }
     }
 
@@ -780,6 +960,65 @@ final class CallPeer: NSObject {
         }
     }
 
+    /// Which of the other side's sounds are on, for the quality readings.
+    func setExpectedAudio(_ sources: Set<CallSource>) {
+        queue.async { [weak self] in
+            self?.expectedAudio = sources
+        }
+    }
+
+    /// What changed here since the last quality reading, with the device's
+    /// own (`CallHealthWatch`); nil before the connection has had two stats
+    /// passes. Read on the peer's queue, where the passes land.
+    func qualityReading(health: [String: Any]) -> [String: Any]? {
+        queue.sync { quality.reading(health: health) }
+    }
+
+    /// Whether redundant audio (RED, RFC 2198) leads the microphone's codecs
+    /// each way. What a sender sends is the first of its negotiated codecs;
+    /// the stats name a RED stream after the Opus inside it, so the
+    /// parameters are what say.
+    func redState() -> [String: Bool]? {
+        queue.sync {
+            guard let transceiver = transceivers[.microphone] else { return nil }
+
+            let leads: ([LKRTCRtpCodecParameters]) -> Bool = { $0.first?.name.lowercased() == "red" }
+
+            return [ "send": leads(transceiver.sender.parameters.codecs), "recv": leads(transceiver.receiver.parameters.codecs) ]
+        }
+    }
+
+    /// Which sources a quality reading speaks of at this stats pass: this
+    /// side's that are live, switched on and not paused for the other side
+    /// drawing none of them, and the other side's that are on and shown here;
+    /// each stats entry's source as the pass itself finds it.
+    private func qualityScope(_ report: LKRTCStatisticsReport) -> CallQualityScope {
+        var sending: Set<CallSource> = []
+
+        for source in CallSource.allCases {
+            guard let track = localTracks[source], track.isEnabled, track.readyState == .live else { continue }
+
+            if source.isVideo, wanted[source] == 0 { continue }
+
+            sending.insert(source)
+        }
+
+        return CallQualityScope(
+            sending: sending,
+            playing: expectedVideo.union(expectedAudio),
+            outbound: { [sourceOfMid, localTracks] values in
+                let trackId = (values["mediaSourceId"] as? String).flatMap { report.statistics[$0]?.values["trackIdentifier"] as? String }
+
+                return sourceOfMid[values["mid"] as? String ?? ""] ?? localTracks.first { trackId != nil && $0.value.trackId == trackId }?.key
+            },
+            inbound: { [sourceOfMid, remoteTracks] values in
+                let trackId = values["trackIdentifier"] as? String
+
+                return sourceOfMid[values["mid"] as? String ?? ""] ?? remoteTracks.first { trackId != nil && $0.value.trackId == trackId }?.key
+            }
+        )
+    }
+
     private var isConnected: Bool {
         guard let pc = pc else { return false }
 
@@ -792,6 +1031,17 @@ final class CallPeer: NSObject {
         return pc.localDescription != nil && pc.remoteDescription != nil
     }
 
+    /// The microphone's ceiling on a slow upload (CallMicCeiling), from this tick's estimate and whether any video went
+    /// out since the last.
+    private func reviewMicCeiling(_ now: Date, _ estimate: Int?, _ outbound: [CallSource: OutboundVideo]) {
+        let videoSending = outbound.contains { $0.value.encoded > (lastOutbound[$0.key]?.encoded ?? 0) }
+
+        guard micCeiling.review(now: now, estimate: estimate, videoSending: videoSending) else { return }
+
+        trace("microphone ceiling \(CallPeer.kbps(micCeiling.bitrate)): bwe out=\(CallPeer.kbps(estimate))\(videoSending ? "" : ", no video going out")")
+        applyWanted(.microphone)
+    }
+
     private func applyWanted(_ source: CallSource) {
         guard !closed, negotiated, let transceiver = transceivers[source] else { return }
 
@@ -801,11 +1051,19 @@ final class CallPeer: NSObject {
         guard let encoding = params.encodings.first else { return }
 
         if !source.isVideo {
-            let ceiling = CallShapes.audioCeiling(source)
+            // An audio source with no track is an inactive encoding too: it
+            // sends nothing either way, but an active one still weighs on the
+            // sender's bandwidth. Measured 4 Nov 2026 on the browsers' engine,
+            // Chrome 156 through a shaped upload: the shared screen's empty
+            // sender held a slow upload's estimate at 262 kbps and the
+            // camera's target at 30 (realtime-client, calls/README.md).
+            let ceiling = source == .microphone ? micCeiling.bitrate : CallShapes.audioCeiling(source)
+            let hasTrack = sender.track != nil
 
-            if encoding.maxBitrateBps?.intValue == ceiling { return }
+            if encoding.maxBitrateBps?.intValue == ceiling, encoding.isActive == hasTrack { return }
 
             encoding.maxBitrateBps = NSNumber(value: ceiling)
+            encoding.isActive = hasTrack
             sender.parameters = params
 
             return
@@ -819,7 +1077,8 @@ final class CallPeer: NSObject {
 
         let shape = source == .screenShare
             ? CallShapes.screen(wanted: want, captureHeight: capture, fast: fast)
-            : CallShapes.camera(wanted: want, captureHeight: capture)
+            : CallShapes.camera(wanted: want, captureHeight: capture,
+                                ceiling: relayed == false ? CallShapes.cameraDirectMaxBitrate : CallShapes.cameraRelayMaxBitrate)
 
         // A source with no track is an inactive encoding, not an idle active
         // one. The pause is then a real allocation change held for as long as
@@ -902,9 +1161,15 @@ final class CallPeer: NSObject {
         guard !closed, let pc = pc else { return }
 
         // The polite side never opens: it answers what it is offered.
-        if polite && pc.remoteDescription == nil { return }
+        if polite && pc.remoteDescription == nil {
+            restartPending = false
+            return
+        }
 
         makingOffer = true
+        // This offer is the one a pending restart called for: libwebrtc puts
+        // the new credentials in it.
+        restartPending = false
 
         pc.offer(for: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)) { [weak self] offer, error in
             guard let self = self else { return }
@@ -965,6 +1230,20 @@ final class CallPeer: NSObject {
         }
     }
 
+    /// A description's ICE username fragment (the first section's: the call
+    /// is bundled), which an ICE restart changes.
+    static func iceUfrag(_ sdp: String) -> String? {
+        // `isNewline`: SDP ends its lines in "\r\n", which Swift reads as one
+        // character, neither "\r" nor "\n".
+        for line in sdp.split(whereSeparator: { $0.isNewline }) where line.hasPrefix("a=ice-ufrag:") {
+            let value = line.dropFirst("a=ice-ufrag:".count).trimmingCharacters(in: .whitespaces)
+
+            return value.isEmpty ? nil : value
+        }
+
+        return nil
+    }
+
     /// Signals are handled one at a time and in order: negotiation depends on
     /// it, and a candidate applied before its description is a candidate lost.
     func handleSignal(_ body: [String: Any]) {
@@ -982,7 +1261,14 @@ final class CallPeer: NSObject {
                   let sdp = description["sdp"] as? String else { return }
 
             let type = CallPeer.type(of: typeName)
-            let collision = type == .offer && (makingOffer || pc.signalingState != .stable)
+            // A restart of this side's still waiting for its offer counts as
+            // an offer of its own: libwebrtc answers with new ICE credentials
+            // whenever a restart is pending, and Firefox refuses such an
+            // answer to an offer that did not restart ICE, left holding its
+            // own offer with the call's media stopped. The impolite side's
+            // restart goes first, and the polite side's offer is made again
+            // after it.
+            let collision = type == .offer && (makingOffer || pc.signalingState != .stable || restartPending)
 
             ignoreOffer = !polite && collision
 
@@ -991,6 +1277,13 @@ final class CallPeer: NSObject {
             if let mids = body["mids"] as? [String: String] {
                 applyRemoteMids(mids)
             }
+
+            // An offer over a description already held, with ICE credentials
+            // of its own, is the other side's ICE restart.
+            let heldUfrag = pc.remoteDescription.flatMap { CallPeer.iceUfrag($0.sdp) }
+            let restarted = type == .offer && heldUfrag != nil && CallPeer.iceUfrag(sdp) != heldUfrag
+
+            if restarted { lastRestartOfferAt = Date() }
 
             // Lines for payload types the description does not declare go
             // first, whatever else happens to it: libwebrtc refuses a
@@ -1031,7 +1324,14 @@ final class CallPeer: NSObject {
                 _ = group.wait(timeout: .now() + 10)
             }
 
+            if !applied, type == .answer, !closed {
+                recoverRefusedAnswer(pc)
+                return
+            }
+
             guard applied, !closed else { return }
+
+            if type == .answer { answerRecoveries = 0 }
 
             flushCandidates()
 
@@ -1044,6 +1344,25 @@ final class CallPeer: NSObject {
 
                 adoptOfferedSections()
                 answer()
+
+                // The other side's ICE restart, answered before a first
+                // connection: this side's attempt too, watched from now, so
+                // its own connect clock does not restart over it. Either side
+                // may make it, the one whose own ICE failed: a callee whose
+                // caller heard the relay late answered at once and checked
+                // alone until it gave up, and only its own offer has the two
+                // sides start their checks together.
+                if restarted, !everConnected, !isConnected, heldSince == nil, !closed, !failed {
+                    if restartDeadlineWork != nil {
+                        watchAttempt("the other side's restart", giveUp: nil)
+                    } else if !takeOtherAttempt() {
+                        trace("the other side restarted once more than this side counts: its deadline ends it")
+                    }
+                } else if restarted, polite, !closed, !failed {
+                    // After a first connection: a polite wait for this very
+                    // restart ends now, so its deadline counts from this answer.
+                    endRestartWait()
+                }
             }
 
             return
@@ -1167,6 +1486,8 @@ final class CallPeer: NSObject {
                     to: transceiver,
                     factory: factory
                 )
+            } else if picked == .microphone, CallCodecs.applyRed(to: transceiver, factory: factory) {
+                trace("microphone answers RED first")
             }
 
             if let track = localTracks[picked] {
@@ -1306,30 +1627,87 @@ final class CallPeer: NSObject {
     private func clearRestartTimers() {
         restartWork?.cancel()
         restartWork = nil
+        restartWaitRun = nil
         restartDeadlineWork?.cancel()
         restartDeadlineWork = nil
     }
 
-    /// A restart the ICE state asked for. The polite side waits a moment
-    /// longer so the two do not restart into each other. The first of an
-    /// incident goes out on every candidate, relay ones included, because the
-    /// usual cause is one side moving to another network, where a new direct
-    /// path is often there to be found; any after it go over the relay alone.
-    /// An attempt already in flight is left to its own deadline.
-    private func scheduleRestart(after delay: TimeInterval, why: String) {
-        guard restartWork == nil, !restarting, restartDeadlineWork == nil else { return }
-
-        let wait = polite ? delay + Constants.politeRestartDelay : delay
+    /// `run` after `delay` as the restart timer; a polite wait's `run` can be
+    /// ended early by a restart of the other side's (`endRestartWait`).
+    private func armRestartTimer(after delay: TimeInterval, politeWait: Bool, _ run: @escaping () -> Void) {
+        restartWork?.cancel()
 
         let work = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
 
             self.restartWork = nil
-            self.restart(force: false, why: why, relay: self.restartCount > 0)
+            self.restartWaitRun = nil
+            run()
         }
 
         restartWork = work
-        queue.asyncAfter(deadline: .now() + wait, execute: work)
+        restartWaitRun = politeWait ? run : nil
+        queue.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    /// A restart of the other side's arrived while the polite side waited
+    /// for one: the wait ends now, so the attempt's deadline counts from this
+    /// very answer rather than from the end of the wait.
+    private func endRestartWait() {
+        guard let work = restartWork, let run = restartWaitRun else { return }
+
+        work.cancel()
+        restartWork = nil
+        restartWaitRun = nil
+        run()
+    }
+
+    /// A restart the ICE state asked for. The polite side waits longer
+    /// (`politeWait`) so the two do not restart into each other, and an offer
+    /// that came in the wait is this side's attempt, watched rather than
+    /// restarted over (`takeOtherAttempt`) — and so is a restart of the other
+    /// side's that came in just before this side noticed the trouble: the
+    /// other side often notices first, and a restart made over it abandoned
+    /// the checks it had begun. The first of an incident goes out on every
+    /// candidate, relay ones included, because the usual cause is one side
+    /// moving to another network, where a new direct path is often there to
+    /// be found; any after it go over the relay alone. An attempt already in
+    /// flight is left to its own deadline.
+    private func scheduleRestart(after delay: TimeInterval, why: String) {
+        guard restartWork == nil, !restarting, restartDeadlineWork == nil else { return }
+
+        let startedAt = Date()
+        let politeWait = polite ? self.politeWait() : 0
+
+        armRestartTimer(after: delay + politeWait, politeWait: polite) { [weak self] in
+            guard let self = self else { return }
+
+            // The other side's restart, taken as this side's attempt when it
+            // arrived (before a first connection): its own deadline decides.
+            if self.restartDeadlineWork != nil { return }
+
+            let offered = (self.lastOfferAt.map { $0 >= startedAt } ?? false)
+                || (self.lastRestartOfferAt.map { $0 >= startedAt.addingTimeInterval(-politeWait) } ?? false)
+
+            if self.polite, offered, !self.isConnected, self.takeOtherAttempt() { return }
+
+            self.restart(force: false, why: why, relay: self.restartCount > 0)
+        }
+    }
+
+    /// The other side's restart taken as this side's attempt: counted, and
+    /// watched on the same deadline as a restart of its own. A spent budget
+    /// or a hold is decided the way it always was, by the restart this would
+    /// otherwise have made.
+    private func takeOtherAttempt(giveUp: String? = nil) -> Bool {
+        guard !closed, !failed, heldSince == nil, restartCount < Constants.maxRestarts else { return false }
+
+        restartCount += 1
+        troubleAt = Date()
+        trace("the other side restarted, this side answered and watches it (restart \(restartCount) of \(Constants.maxRestarts))")
+        watchAttempt("the other side's restart", giveUp: giveUp)
+
+        return true
     }
 
     /// Whether escalation is waiting for a restart to be negotiable again.
@@ -1339,8 +1717,9 @@ final class CallPeer: NSObject {
     }
 
     /// Told by the engine on every stats tick and whenever either side's
-    /// presence changes. While this side's socket is down, or the relay has
-    /// said the other side's is, no offer can reach the other side: a restart
+    /// presence changes. While this side's socket is down or answers nothing,
+    /// or the relay has said the other side's is gone, no offer can reach the
+    /// other side: a restart
     /// made then counted as a failed attempt, and a network change of ten
     /// seconds on one side ran the budget out and put the call in the room
     /// for good. Held, nothing escalates; released, the ladder starts over.
@@ -1401,14 +1780,27 @@ final class CallPeer: NSObject {
         holdWork = nil
 
         // What was tried while the other side could not hear it says nothing
-        // about the path, so the restarts are all there again.
-        restartCount = 0
-        trace("escalation released after \(String(format: "%.1f", heldFor))s: \(why)")
+        // about the path, so the restarts are all there again —
+        // `holdRefreshes` times until the connection has been healthy since. A
+        // socket that stalls and answers again every few seconds is held and
+        // released as often, and each release gave a dead call a new trial.
+        let refresh = holdRefreshCount < Constants.holdRefreshes
+
+        lastReleaseAt = Date()
+
+        if refresh {
+            holdRefreshCount += 1
+            restartCount = 0
+        }
+
+        trace("escalation released after \(String(format: "%.1f", heldFor))s: \(why)\(refresh ? "" : ", the restarts stay as they were: given back \(Constants.holdRefreshes) times since the connection was last healthy")")
 
         guard !closed, !failed else { return }
 
-        if !everConnected {
-            armConnectFailure(after: Double(Constants.maxRestarts) * Constants.restartDeadline + 2)
+        // A deadline that ran out during the hold waited for this (it ends
+        // nothing while held), so one is armed again either way.
+        if !everConnected, refresh || connectDeadlineWork == nil {
+            armConnectFailure(after: refresh ? Double(Constants.maxRestarts) * Constants.restartDeadline + 2 : Constants.restartDeadline)
         }
 
         if !isConnected {
@@ -1419,6 +1811,51 @@ final class CallPeer: NSObject {
     /// Fresh credentials inside a short budget, or the ones already held.
     /// Asking used to inherit the socket's full retry budget — twenty-four
     /// seconds inside a restart that was supposed to be the quick way out.
+    /// Every restart of this side's goes through here, on the queue the
+    /// signals are handled on, so it never lands while an offer of the other
+    /// side's is being answered (`restartPending`).
+    private func requestIceRestart(_ pc: LKRTCPeerConnection) {
+        restartPending = true
+        restartPendingAt = Date()
+        pc.restartIce()
+    }
+
+    /// An answer libwebrtc will not take leaves this side holding its own
+    /// offer, where no later negotiation can begin and the other side's
+    /// candidates name credentials it never applied. The offer is rolled back
+    /// and ICE restarted, and the answer to a restart may carry any
+    /// credentials. Twice at most until an answer applies, so two sides that
+    /// cannot agree do not go on forever.
+    private func recoverRefusedAnswer(_ pc: LKRTCPeerConnection) {
+        guard pc.signalingState == .haveLocalOffer else { return }
+
+        if answerRecoveries >= Constants.answerRecoveries {
+            trace("the answer was refused again, \(Constants.answerRecoveries) recoveries since the last one that applied: left to the attempt's deadline")
+            return
+        }
+
+        answerRecoveries += 1
+
+        let group = DispatchGroup()
+        var rolledBack = false
+
+        group.enter()
+        pc.setLocalDescription(LKRTCSessionDescription(type: .rollback, sdp: "")) { error in
+            rolledBack = error == nil
+            group.leave()
+        }
+        _ = group.wait(timeout: .now() + 10)
+
+        guard rolledBack, !closed else {
+            if !closed { trace("warn: could not roll back the offer whose answer was refused") }
+            return
+        }
+
+        trace("the answer was refused: this side's offer rolled back, ICE restarted so the next answer may carry new credentials")
+
+        requestIceRestart(pc)
+    }
+
     private func freshIceServers(_ done: @escaping ([LKRTCIceServer]) -> Void) {
         var settled = false
 
@@ -1512,7 +1949,7 @@ final class CallPeer: NSObject {
 
                 self.trace("ice restart #\(self.restartsTotal) (\(why)), \(self.restartCount) of \(Constants.maxRestarts)\(relay ? " over the relay alone" : " on every candidate") servers=\(servers.isEmpty ? "held" : "fresh")")
 
-                pc.restartIce()
+                self.requestIceRestart(pc)
 
                 self.watchAttempt("restart #\(self.restartsTotal)", giveUp: giveUp)
             }
@@ -1521,31 +1958,121 @@ final class CallPeer: NSObject {
 
     /// The deadline an attempt has to bring the media back. A connection
     /// still down is restarted again over the relay alone, and so is one that
-    /// came back carrying nothing; the restarts running out is the room.
+    /// came back carrying nothing; the restarts running out is the room. On
+    /// the polite side an offer that arrived after the answer the attempt's
+    /// checks counted from is the other side's next attempt, begun at its own
+    /// earlier deadline, and it is watched in turn rather than restarted
+    /// over; with none yet, the polite side waits for it (`awaitOtherAttempt`),
+    /// since the two deadlines run out at about the same moment and the
+    /// impolite side restarts at once. An offer that crossed this side's own
+    /// restart, and was answered in its place, is the same attempt, not a
+    /// next one.
     private func watchAttempt(_ what: String, giveUp: String?) {
-        restartDeadlineWork?.cancel()
+        armAttemptDeadline(what, giveUp: giveUp, startedAt: Date(), inboundThen: inboundPackets, extended: false, after: Constants.restartDeadline)
+    }
 
-        let startedAt = Date()
-        let inboundThen = inboundPackets
+    private func armAttemptDeadline(_ what: String, giveUp: String?, startedAt: Date, inboundThen: Int, extended: Bool, after delay: TimeInterval) {
+        restartDeadlineWork?.cancel()
 
         let deadline = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
 
             self.restartDeadlineWork = nil
 
-            guard !self.closed, !self.failed, self.heldSince == nil else { return }
+            guard !self.closed, !self.failed, self.heldSince == nil, let pc = self.pc else { return }
+
+            // A connection still down gets `restartDeadline` of checks from
+            // the attempt's own answer: over a slow trip the answer comes
+            // seconds after the offer, and the deadline used to run out on
+            // checks that had barely begun. No answer by `answerWait` more is
+            // the attempt failed. (One this side answered was answered as it
+            // began.)
+            let answeredAt: Date? = pc.signalingState == .stable ? max(self.stableAt ?? startedAt, startedAt) : nil
 
             if !self.isConnected {
-                self.restart(force: false, why: "\(what) did not connect in \(Int(Constants.restartDeadline * 1000))ms", relay: true, giveUp: giveUp)
-            } else if self.expectInbound && self.inboundPackets == inboundThen {
-                self.restart(force: true, why: "\(what) connected and brought nothing in \(Int(Constants.restartDeadline * 1000))ms", relay: true, giveUp: "path_dead")
-            } else {
+                let now = Date()
+                let left = answeredAt.map { Constants.restartDeadline - now.timeIntervalSince($0) }
+                    ?? (Constants.restartDeadline + Constants.answerWait - now.timeIntervalSince(startedAt))
+
+                if left > 0.25 {
+                    if !extended {
+                        if let answeredAt = answeredAt {
+                            self.trace("\(what) was answered \(Int(answeredAt.timeIntervalSince(startedAt) * 1000))ms after it began: its checks get \(Int(Constants.restartDeadline * 1000))ms from the answer")
+                        } else {
+                            self.trace("\(what) has no answer yet: waiting up to \(Int(Constants.answerWait * 1000))ms more")
+                        }
+                    }
+
+                    self.armAttemptDeadline(what, giveUp: giveUp, startedAt: startedAt, inboundThen: inboundThen, extended: true, after: left)
+                    return
+                }
+            }
+
+            let down = !self.isConnected
+
+            if !down, !(self.expectInbound && self.inboundPackets == inboundThen) {
                 self.trace("\(what) brought the media back in \(Int(Date().timeIntervalSince(startedAt) * 1000))ms")
+                return
+            }
+
+            let failedWhy = down
+                ? "\(what) did not connect in \(Int(Constants.restartDeadline * 1000))ms\(answeredAt != nil ? " from its answer" : ", and was never answered")"
+                : "\(what) connected and brought nothing in \(Int(Constants.restartDeadline * 1000))ms"
+
+            // (With the restarts run out there is nothing to wait for: the
+            // restart below gives the call up. Nor with the hold spent: no
+            // restart of the other side's can arrive.)
+            if self.polite {
+                let after = answeredAt ?? startedAt
+
+                if let offered = self.lastOfferAt, offered > after, self.takeOtherAttempt(giveUp: down ? giveUp : "path_dead") { return }
+
+                if self.restartCount < Constants.maxRestarts, !self.holdSpent {
+                    self.awaitOtherAttempt(failedWhy, giveUp: giveUp)
+                    return
+                }
+            }
+
+            if down {
+                self.restart(force: false, why: failedWhy, relay: true, giveUp: giveUp)
+            } else {
+                self.restart(force: true, why: failedWhy, relay: true, giveUp: "path_dead")
             }
         }
 
         restartDeadlineWork = deadline
-        queue.asyncAfter(deadline: .now() + Constants.restartDeadline, execute: deadline)
+        queue.asyncAfter(deadline: .now() + delay, execute: deadline)
+    }
+
+    /// The polite side's attempt is over and the media is not back: the
+    /// other side's next restart is due about now, so it is given
+    /// `politeWait` to arrive and taken as this side's attempt if it does.
+    /// Only if none does is the restart this side's own.
+    private func awaitOtherAttempt(_ why: String, giveUp: String?) {
+        let waitFrom = Date()
+        let wait = politeWait()
+        let inboundThen = inboundPackets
+
+        trace("\(why): waiting up to \(Int(wait * 1000))ms for the other side's next restart")
+
+        armRestartTimer(after: wait, politeWait: true) { [weak self] in
+            guard let self = self, !self.closed, !self.failed, self.heldSince == nil, !self.restarting, self.restartDeadlineWork == nil else { return }
+
+            let down = !self.isConnected
+
+            if !down, !self.expectInbound || self.inboundPackets != inboundThen {
+                self.trace("the media came back while this side waited for the other side's restart")
+                return
+            }
+
+            if let offered = self.lastOfferAt, offered >= waitFrom, self.takeOtherAttempt(giveUp: down ? giveUp : "path_dead") { return }
+
+            if down {
+                self.restart(force: false, why: "\(why), and no restart came from the other side", relay: true, giveUp: giveUp)
+            } else {
+                self.restart(force: true, why: "\(why), and no restart came from the other side", relay: true, giveUp: "path_dead")
+            }
+        }
     }
 
     /// New TURN credentials, before the ones the connection holds run out. An
@@ -1590,7 +2117,7 @@ final class CallPeer: NSObject {
                 self.restartsTotal += 1
                 self.trace("ice restart #\(self.restartsTotal) (the relay credentials are about to run out), not counted as an attempt")
 
-                pc.restartIce()
+                self.requestIceRestart(pc)
             }
         }
     }
@@ -1712,10 +2239,8 @@ final class CallPeer: NSObject {
 
         useRelayOnly()
 
-        let work = DispatchWorkItem { [weak self] in
+        armRestartTimer(after: politeWait(), politeWait: true) { [weak self] in
             guard let self = self else { return }
-
-            self.restartWork = nil
 
             guard !self.closed, !self.failed, self.heldSince == nil else { return }
 
@@ -1728,9 +2253,6 @@ final class CallPeer: NSObject {
 
             self.restart(force: true, why: "\(why), no restart came from the other side", relay: true, giveUp: "path_dead")
         }
-
-        restartWork = work
-        queue.asyncAfter(deadline: .now() + Constants.politeRestartDelay, execute: work)
     }
 
     // MARK: - Stats
@@ -1768,6 +2290,17 @@ final class CallPeer: NSObject {
     private func reviewCodecs(_ report: LKRTCStatisticsReport) {
         let now = Date()
 
+        // Nothing is encoded or decoded before the connection is up, whatever
+        // the codec, so no verdict comes before it has been up a stats tick;
+        // the clocks run as before. A callee whose caller heard the relay
+        // late (30 Oct 2026, in the browser engine) wrote off H264 and then
+        // VP9 while the two were still connecting, and each write-off's offer
+        // crossed the caller's restart. Clocks that started at the connection
+        // moved a real write-off seconds later, onto an ICE restart the other
+        // side was making: Chrome answered its offer with new ICE
+        // credentials, which Firefox refuses.
+        let judging = isConnected && (connectedAt.map { now.timeIntervalSince($0) >= Constants.statsInterval } ?? false)
+
         func watch(_ key: String, dead: Bool, ready: Bool, grace: TimeInterval) -> Bool {
             guard dead else {
                 codecWatch.removeValue(forKey: key)
@@ -1783,7 +2316,7 @@ final class CallPeer: NSObject {
                 return false
             }
 
-            return now.timeIntervalSince(since) > grace
+            return judging && now.timeIntervalSince(since) > grace
         }
 
         for (_, entry) in report.statistics {
@@ -1889,6 +2422,12 @@ final class CallPeer: NSObject {
     }
 
     private func readStats(_ report: LKRTCStatisticsReport) {
+        if restartPending, !makingOffer, let pc = pc, pc.signalingState == .stable,
+           Date().timeIntervalSince(restartPendingAt) > Constants.restartPendingMax {
+            trace("the restart's negotiation did not begin by itself, offering it")
+            negotiate()
+        }
+
         reviewCodecs(report)
 
         var bytesSent = 0
@@ -1957,6 +2496,11 @@ final class CallPeer: NSObject {
 
         for (_, entry) in report.statistics {
             let values = entry.values
+
+            if entry.type == "media-source", (values["kind"] as? String) == "audio",
+               let level = (values["audioLevel"] as? NSNumber)?.doubleValue {
+                stats.microphoneLevel = max(stats.microphoneLevel ?? 0, level)
+            }
 
             switch entry.type {
             case "outbound-rtp":
@@ -2067,32 +2611,36 @@ final class CallPeer: NSObject {
 
                 if at > counters.remoteAt { counters.remoteAt = at }
 
-            case "candidate-pair":
-                let state = values["state"] as? String
-                let selected = (values["selected"] as? NSNumber)?.boolValue ?? false
-                let nominated = (values["nominated"] as? NSNumber)?.boolValue ?? false
-
-                guard state == "succeeded", selected || nominated else { break }
-
-                if let value = values["currentRoundTripTime"] as? NSNumber { rtt = value.doubleValue }
-                if let value = values["availableOutgoingBitrate"] as? NSNumber { bweOut = value.intValue }
-                if let value = values["availableIncomingBitrate"] as? NSNumber { bweIn = value.intValue }
-
-                if let localId = values["localCandidateId"] as? String, let local = report.statistics[localId] {
-                    stats.candidateLocal = local.values["candidateType"] as? String
-                    stats.candidateProtocol = (local.values["relayProtocol"] as? String) ?? (local.values["protocol"] as? String)
-                }
-
-                if let remoteId = values["remoteCandidateId"] as? String, let remote = report.statistics[remoteId] {
-                    stats.candidateRemote = remote.values["candidateType"] as? String
-                }
-
             default:
                 break
             }
         }
 
+        // The pair in use, not any pair once nominated (CallPair).
+        let pairId = CallPair.selected(report.statistics.map { CallPair.Entry(id: $0.key, type: $0.value.type, values: $0.value.values) })
+
+        if let id = pairId, let values = report.statistics[id]?.values {
+            if let value = values["currentRoundTripTime"] as? NSNumber { rtt = value.doubleValue }
+            if let value = values["availableOutgoingBitrate"] as? NSNumber { bweOut = value.intValue }
+            if let value = values["availableIncomingBitrate"] as? NSNumber { bweIn = value.intValue }
+
+            if let localId = values["localCandidateId"] as? String, let local = report.statistics[localId] {
+                stats.candidateLocal = local.values["candidateType"] as? String
+                stats.candidateProtocol = (local.values["relayProtocol"] as? String) ?? (local.values["protocol"] as? String)
+            }
+
+            if let remoteId = values["remoteCandidateId"] as? String, let remote = report.statistics[remoteId] {
+                stats.candidateRemote = remote.values["candidateType"] as? String
+            }
+        }
+
         let now = Date()
+
+        // The same report, for the quality reading the next pulse may carry:
+        // only while connected, which is when there is a call to tell of.
+        if isConnected {
+            quality.tick(report, scope: qualityScope(report), at: now.timeIntervalSince1970 * 1000)
+        }
 
         // The other side's sender reports, one sample per report that
         // arrived, for judging a silence on what was sent during it.
@@ -2153,7 +2701,16 @@ final class CallPeer: NSObject {
             restartCount = 0
         }
 
+        // And a hold's release gives them back as often as ever again, once
+        // the connection has been as healthy since the last one.
+        if holdRefreshCount > 0, heldSince == nil, isConnected, inboundHealthy,
+           lastReleaseAt.map({ now.timeIntervalSince($0) >= Constants.healthyReset }) ?? true,
+           troubleAt.map({ now.timeIntervalSince($0) >= Constants.healthyReset }) ?? true {
+            holdRefreshCount = 0
+        }
+
         lastBweIn = bweIn
+        reviewMicCeiling(now, bweOut, outboundVideo)
         lastOutbound = outboundVideo
         reviewVideoSources(now, inboundVideo)
 
@@ -2213,6 +2770,19 @@ final class CallPeer: NSObject {
         }
 
         self.stats = stats
+
+        // The camera's ceiling follows the path: a relay on either side is our
+        // TURN server's traffic. A pass that names no pair (the path down for a
+        // moment) keeps what the last one said.
+        if stats.candidateLocal != nil || stats.candidateRemote != nil {
+            let isRelayed = stats.candidateLocal == "relay" || stats.candidateRemote == "relay"
+
+            if isRelayed != relayed {
+                relayed = isRelayed
+                trace("camera ceiling \((isRelayed ? CallShapes.cameraRelayMaxBitrate : CallShapes.cameraDirectMaxBitrate) / 1000)k: \(isRelayed ? "relayed" : "direct")")
+                applyWanted(.camera)
+            }
+        }
 
         // A call that reports nothing moving is a call nobody can hear, and on
         // this side the only place that said so was a statistics sheet nobody
@@ -2527,7 +3097,11 @@ extension CallPeer: LKRTCPeerConnectionDelegate {
         }
     }
 
-    func peerConnection(_ peerConnection: LKRTCPeerConnection, didChange stateChanged: LKRTCSignalingState) {}
+    func peerConnection(_ peerConnection: LKRTCPeerConnection, didChange stateChanged: LKRTCSignalingState) {
+        guard stateChanged == .stable else { return }
+
+        queue.async { [weak self] in self?.noteStable() }
+    }
     func peerConnection(_ peerConnection: LKRTCPeerConnection, didAdd stream: LKRTCMediaStream) {}
     func peerConnection(_ peerConnection: LKRTCPeerConnection, didRemove stream: LKRTCMediaStream) {}
     func peerConnection(_ peerConnection: LKRTCPeerConnection, didChange newState: LKRTCIceGatheringState) {}

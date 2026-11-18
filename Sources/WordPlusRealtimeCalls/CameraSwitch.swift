@@ -19,8 +19,7 @@ import Foundation
  A move is over at its `ready` or its failsafe: an `optimizing` said again before then starts nothing new, so a peer
  repeating itself can't keep the placeholder up. `GroupCall` keeps one per room and hears the frames itself, so a mark
  that has ended stays ended whatever a screen's renderer does next; the SDK's call screens draw the placeholder while
- it is up. `GroupPerson.optimizing` says it until a new camera of theirs arrives (`awaiting`). Better Messages' app runs
- the same machine (`BmCallsCameraSwitch`).
+ it is up. `GroupPerson.optimizing` says it until a new camera of theirs arrives (`awaiting`).
  */
 @_spi(WordPlusUI) public struct CameraSwitch: Sendable {
     public static let topic = "wp-camera"

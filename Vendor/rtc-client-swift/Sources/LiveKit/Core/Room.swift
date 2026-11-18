@@ -65,6 +65,51 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
     /// the product's codec rule to take as a preference. Nil from a node that sends none, and from any other server.
     public var meshCodecPolicy: MeshCodecPolicy? { _state.meshCodecPolicy }
 
+    /// WordPlus Mesh (1.0.10): the settings the node sent this client last (`MeshSettings`: each checked, every key's
+    /// default where the node set none), `MeshSettings.none` before any and from any other server. For the settings a
+    /// connect takes before it reaches a node, `MeshSettings.cached(for:)`.
+    public var meshSettings: MeshSettings { _state.meshSettings ?? .none }
+
+    /// WordPlus Mesh (1.0.10): hears the settings each time they change, with the keys whose value changed (each key's
+    /// class says when the product takes it, `MeshSettings.keyClass`). The room applies the live caps over its own
+    /// cameras itself (`MeshCaps`). Nil stops it.
+    public func setMeshSettingsHandler(_ handler: (@Sendable (MeshSettings, Set<String>) -> Void)?) {
+        _meshSettingsHandler.mutate { $0 = handler }
+    }
+
+    /// WordPlus Mesh (1.0.10): who hears the settings change, apart from the state a disconnect resets.
+    let _meshSettingsHandler = StateSync<(@Sendable (MeshSettings, Set<String>) -> Void)?>(nil)
+
+    /// WordPlus Mesh (1.0.13): the sids of the tracks this room subscribes to that have stopped reaching their node, as the
+    /// node last said. The node decides it, from what arrives of each track, so it says nothing of this client's own
+    /// connection. Forgotten while a connection is being restored, as the node says its list again on the one restored and
+    /// a new session starts with none. From any other server, always empty.
+    public var meshSourcesDry: Set<String> { _meshSourcesDry.read { $0 } }
+
+    /// WordPlus Mesh (1.0.13): hears `meshSourcesDry` each time it changes. Nil stops it.
+    public func setMeshSourcesDryHandler(_ handler: (@Sendable (Set<String>) -> Void)?) {
+        _meshSourcesDryHandler.mutate { $0 = handler }
+    }
+
+    let _meshSourcesDry = StateSync<Set<String>>([])
+    let _meshSourcesDryHandler = StateSync<(@Sendable (Set<String>) -> Void)?>(nil)
+
+    /// WordPlus Mesh (1.0.10): the product's own caps over its cameras (`setProductCameraCaps`), beside the server's.
+    let _productCameraCaps = StateSync(MeshCaps())
+
+    /// WordPlus Mesh (1.0.10): the caps the room holds its cameras to: its settings' live caps and the product's own,
+    /// the stricter of each.
+    public var cameraCaps: MeshCaps { meshSettings.cameraCaps.combined(with: _productCameraCaps.copy()) }
+
+    /// WordPlus Mesh (1.0.10): the product's own caps over its cameras, beside the settings' (`cameraCaps`), on the
+    /// running senders at once: a product holding a camera it encodes in software to the settings'
+    /// `camera.maxHeight.sw`, say. Empty: none of the product's.
+    public func setProductCameraCaps(_ caps: MeshCaps) async {
+        let before = cameraCaps
+        _productCameraCaps.mutate { $0 = caps }
+        if cameraCaps != before { await localParticipant.applyMeshCaps() }
+    }
+
     public var remoteParticipants: [Participant.Identity: RemoteParticipant] { _state.remoteParticipants }
 
     public var activeSpeakers: [Participant] { _state.activeSpeakers }
@@ -193,6 +238,9 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
 
         /// WordPlus Mesh (1.0.3): the codec policy the node sent with its join response.
         var meshCodecPolicy: MeshCodecPolicy?
+
+        /// WordPlus Mesh (1.0.10): the settings the node sent last, kept across a full reconnect
+        var meshSettings: MeshSettings?
 
         // Engine
         var providedUrl: URL?
@@ -630,6 +678,9 @@ extension Room {
     {
         log("withError: \(String(describing: disconnectError)), isFullReconnect: \(isFullReconnect)")
 
+        // WordPlus Mesh (1.0.13): a new session starts with no track stopped
+        takeMeshSourcesDry([])
+
         // Reap all in-flight RPCs with `recipientDisconnected` (1503). Runs before the
         // participant-state wipe so callers don't hang on the response timeout during
         // disconnect / full reconnect.
@@ -682,6 +733,7 @@ extension Room {
             $0 = isFullReconnect ? State(
                 connectOptions: $0.connectOptions,
                 roomOptions: $0.roomOptions,
+                meshSettings: $0.meshSettings,
                 providedUrl: $0.providedUrl,
                 connectedUrl: $0.connectedUrl,
                 token: $0.token,

@@ -19,7 +19,9 @@ let package = Package(
         // `swift run --package-path <this package> wordplus-ui add --project <folder> --target <App>`.
         .executable(name: "wordplus-ui", targets: ["WordPlusUITool"]),
         // The room client the calls run on, for an app that copied the call screen (`wordplus-ui add`), which draws
-        // with it.
+        // with it. Its module stays `LiveKit`, that being the vendored client's own name.
+        .library(name: "WordPlusRTC", targets: ["LiveKit"]),
+        // The same under the name it had first, for an app already linked to it.
         .library(name: "LiveKit", targets: ["LiveKit"]),
     ],
     dependencies: [

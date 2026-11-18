@@ -83,6 +83,8 @@ enum MeshEncoders {
         var queueMs: Double?
         var resent: Double?
         var huge: Int?
+        /// 1.0.11: the mode a camera in one SVC stream goes out in now (L2T3_KEY once trimmed to two sizes, MeshSvcTrim)
+        var svc: String?
     }
 
     /// The mode a capture was opened at: its size and the frames a second asked of the device.
@@ -562,7 +564,9 @@ final class MeshEncoderReporter: @unchecked Sendable, Loggable {
         var paths: [String: [MeshEncoders.Stat]] = [:]
         if let publisher = transport?.publisher { paths["pub"] = await stats.read(publisher) }
         if let subscriber = transport?.dedicatedSubscriber { paths["sub"] = await stats.read(subscriber) }
-        let device = health.reading(paths: paths)
+        var device = health.reading(paths: paths)
+        // 1.0.10: the settings revision it runs, so the node's live view says how far a revision has reached
+        device.cfg = room._state.read { $0.meshSettings?.rev }
 
         let sent = _state.read { $0.sent }
         let changed = encoders.json != sent && (!encoders.tracks.isEmpty || sent != nil) ? encoders.json : nil
@@ -594,7 +598,11 @@ final class MeshEncoderReporter: @unchecked Sendable, Loggable {
                 let key = sender.senderId
                 let read = MeshEncoders.outbound(of: entries ?? [], before: _state.read { $0.totals[key] })
                 _state.mutate { $0.totals[key] = read.totals }
-                if let report = MeshEncoders.codecReport(read.outbound, named: named) {
+                if var report = MeshEncoders.codecReport(read.outbound, named: named) {
+                    // 1.0.11: the mode a camera in one SVC stream goes out in now
+                    if named == nil, report.codec == "vp9" || report.codec == "av1" {
+                        report.svc = await RTC.run { MeshSvcTrim.sentMode(sender.raw) }
+                    }
                     codecs.append(report)
                 }
             }

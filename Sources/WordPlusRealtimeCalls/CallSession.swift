@@ -4,17 +4,26 @@ import LiveKitWebRTC
 /// A room on the mesh the relay hands a call to: its server (none means the relay's own) and a token for it.
 struct CallRoomTicket {
     let token: String
-    let server: String?
+    private(set) var server: String?
 
     init?(_ value: Any?) {
         guard let map = value as? [String: Any], let token = map["token"] as? String, !token.isEmpty else { return nil }
         self.token = token
-        server = map["server"] as? String
+        server = (map["server"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+    }
+
+    /// The same room, at `server` when the relay named none: Better Messages' relay hands over a room's token alone, as its
+    /// pages know their media server from the site, where the SDK's own names the mesh in it.
+    func at(_ server: String?) -> CallRoomTicket {
+        guard self.server == nil, let server, !server.isEmpty else { return self }
+        var ticket = self
+        ticket.server = server
+        return ticket
     }
 }
 
-/// One side of a call between two people, on the relay: the port of the web's `calls/session.ts` that Better Messages'
-/// browsers and the SDK's run, driving `CallPeer` (Better Messages' app's port of `peer.ts`) as the app's engine does.
+/// One side of a call between two people, on the relay: the port of the web's `calls/session.ts` that browsers run,
+/// driving `CallPeer` (the port of `peer.ts`).
 ///
 /// It joins the call (as its caller, that makes it ring), builds the direct connection once both sides are there,
 /// carries the sealed signals both ways, keeps the TURN credentials and the room token fresh, pulses the relay while the
@@ -59,6 +68,11 @@ final class CallSession: NSObject {
     private var renewWork: DispatchWorkItem?
     private var keepalive: Timer?
     private var pulseTicks = 0
+    /// How the call is going here, told on a pulse every `qualityEvery` ms as the relay's reply asks (`CallQuality.swift`);
+    /// the device's own part from the system's notifications, watched only once readings are asked.
+    private let health = CallHealthWatch()
+    private var qualityEvery: Double = 0
+    private var qualityAt: Double = 0
     private var reportedAt: Date?
     private var knownCodecs: (videoSend: String?, videoRecv: String?, audioSend: String?, audioRecv: String?) = (nil, nil, nil, nil)
     private var bytesSeen = (sent: 0, recv: 0)
@@ -97,12 +111,15 @@ final class CallSession: NSObject {
         guard !started, !ended else { return done(false) }
         started = true
         CallLog.setSink { [weak self] line in DispatchQueue.main.async { self?.trace(line) } }
-        // A socket that has just come back is not joined until the rejoin says so.
+        // A socket that has just come back is not joined until the rejoin says so. On the main queue, whichever the
+        // transport tells it on.
         stopReconnect = transport.onReconnect { [weak self] in
-            guard let self, !self.ended else { return }
-            self.joinedSocket = false
-            self.reviewHold()
-            if self.transport.connected { self.join(resume: true) { _ in } }
+            DispatchQueue.main.async {
+                guard let self, !self.ended else { return }
+                self.joinedSocket = false
+                self.reviewHold()
+                if self.transport.connected { self.join(resume: true) { _ in } }
+            }
         }
         join(resume: false, done)
     }
@@ -170,12 +187,29 @@ final class CallSession: NSObject {
     private func startKeepalive() {
         guard keepalive == nil, !ended else { return }
         keepalive = Timer.scheduledTimer(withTimeInterval: CallSession.keepaliveInterval, repeats: true) { [weak self] _ in self?.alive() }
+        // From the join on, ringing included: a caller whose connection moved while the other side was being rung
+        // would hear its `ready` where it no longer listens (`setupAliveEvery`).
+        setupAlive = Timer.scheduledTimer(withTimeInterval: CallSession.setupAliveEvery, repeats: true) { [weak self] _ in
+            guard let self, !self.ended, !self.handedOff, self.peer?.isUp != true, self.joinedSocket, self.signaling.connected,
+                  Date().timeIntervalSince(self.aliveAt ?? .distantPast) >= CallSession.setupAliveEvery else { return }
+            self.alive()
+        }
     }
+
+    /// While the direct path is not up, the session also checks in this often (`startKeepalive`): the relay answers
+    /// `not_joined` to a connection other than the one it joined on, and the session joins again, the relay replaying
+    /// what it missed. A connection that moved or came back without this side hearing of it left the relay sending the
+    /// call's signals where nobody read them, with nothing but the keepalive, once a minute, to say so (the web engine,
+    /// 31 Oct 2026). A connected call pulses every couple of seconds, which asks the same.
+    private static let setupAliveEvery: TimeInterval = 5
+    private var aliveAt: Date?
+    private var setupAlive: Timer?
 
     /// The reply says whether the relay lost this session (join again), the call ended while the socket was away, or
     /// the call moved to a room this side wasn't told of.
     private func alive() {
         guard !ended, signaling.connected else { return }
+        aliveAt = Date()
         signaling.alive { [weak self] reply in
             guard let self, !self.ended, let reply else { return }
             if (reply["ok"] as? Bool) != false {
@@ -323,6 +357,7 @@ final class CallSession: NSObject {
         let audio = remoteState["microphone"] == true || remoteState["screen_share_audio"] == true
         peer.setExpectInbound(audio || !video.isEmpty)
         peer.setExpectedVideo(video)
+        peer.setExpectedAudio(Set([CallSource.microphone, .screenShareAudio].filter { remoteState[$0.rawValue] == true }))
     }
 
     private func sendSignal(_ body: [String: Any], needsPeer: Bool = true) {
@@ -370,6 +405,10 @@ final class CallSession: NSObject {
             return
         }
 
+        // Any word from the other side, whatever it says, is the other side still at work on the call: a negotiation
+        // it is making is not given up on while it keeps speaking (CallPeer.heardFromPeer).
+        peer.heardFromPeer()
+
         switch body["kind"] as? String {
         case "state":
             remoteState = [:]
@@ -400,12 +439,20 @@ final class CallSession: NSObject {
 
     // MARK: - Holding off, renewing, pulsing
 
-    /// Whether a restart could reach the other side now; the peer holds its escalation while it couldn't.
+    /// Whether a restart could reach the other side now: joined on the connection this side has, that connection
+    /// answering, and the relay not having said the other side's is gone. The peer holds its escalation while it
+    /// couldn't. A connection that says it is connected and answers nothing is as good as down for an offer, which
+    /// waits in it: a restart made into one arrived half a minute late, over a connection that had come back by
+    /// itself meanwhile (the web engine, 31 Oct 2026).
     private func reviewHold() {
         guard let peer, !ended else { return }
         if !signaling.connected { joinedSocket = false }
+        peer.setSignalRoundTrip(signaling.roundTrip)
+        let stalled = joinedSocket ? signaling.stalledFor() : 0
         if !joinedSocket {
             peer.setSignalingHeld(true, why: "this side's realtime connection is down")
+        } else if stalled > 0 {
+            peer.setSignalingHeld(true, why: "this side's realtime connection has answered nothing for \(String(format: "%.1f", stalled))s")
         } else if peerLost {
             peer.setSignalingHeld(true, why: "the relay says the other side's connection is down")
         } else {
@@ -470,8 +517,22 @@ final class CallSession: NSObject {
         guard !ended, let peer, peer.isUp, signaling.connected else { return }
         pulseTicks += 1
         if pulseTicks % CallSession.stateResendTicks == 0 { sendState() }
-        signaling.pulse(peer.pulseBody()) { [weak self] reply in
+        // A quality reading when one is due: the window since the last one, which the peer keeps from its stats passes.
+        let now = Date().timeIntervalSince1970 * 1000
+        var quality: [String: Any]?
+        if qualityEvery > 0, now - qualityAt >= qualityEvery {
+            qualityAt = now
+            quality = peer.qualityReading(health: health.reading(at: now))
+        }
+        signaling.pulse(peer.pulseBody(), quality: quality) { [weak self] reply in
             guard let self, !self.ended, self.peer === peer, let reply else { return }
+            // How often the relay wants the readings, every reply: one before them says nothing and gets none.
+            let every = max(0, (reply["qms"] as? NSNumber)?.doubleValue ?? 0)
+            if (reply["ok"] as? Bool) != false, every != self.qualityEvery {
+                self.qualityEvery = every
+                self.qualityAt = now
+                if every > 0 { self.health.start() } else { self.health.stop() }
+            }
             guard (reply["ok"] as? Bool) != false else {
                 if (reply["error"] as? String) == "not_joined" { self.join(resume: true) { _ in } }
                 return
@@ -495,16 +556,18 @@ final class CallSession: NSObject {
         #else
         let platform = "macos"
         #endif
-        signaling.report([
+        let report: [String: Any] = [
             "browser": "app", "platform": platform, "client": platform,
             "path": stats.candidateLocal == "relay" || stats.candidateRemote == "relay" ? "relay" : "direct",
             "candidate": ["local": stats.candidateLocal ?? "", "remote": stats.candidateRemote ?? "", "protocol": stats.candidateProtocol ?? ""],
             "restarts": stats.restarts,
             "video": ["send": knownCodecs.videoSend ?? "", "recv": knownCodecs.videoRecv ?? ""],
-            "audio": ["send": knownCodecs.audioSend ?? "", "recv": knownCodecs.audioRecv ?? ""],
+            // `red`: whether redundant audio leads the microphone's codecs each way, which its codec name never says
+            "audio": ["send": knownCodecs.audioSend ?? "", "recv": knownCodecs.audioRecv ?? ""].merging(peer.flatMap { $0.redState() }.map { ["red": $0] } ?? [:]) { a, _ in a },
             "impl": ["enc": stats.videoEncoder ?? "", "dec": stats.videoDecoder ?? ""],
             "bytes": ["sent": bytesSeen.sent, "recv": bytesSeen.recv],
-        ])
+        ]
+        signaling.report(report.merging(CallClientInfo.report(media: CallMedia.shared, network: health.network)) { $1 })
     }
 
     // MARK: - The trace
@@ -571,12 +634,15 @@ final class CallSession: NSObject {
 
     private func teardown(keepListening: Bool = false) {
         ended = true
+        health.stop()
         stopReconnect?()
         stopReconnect = nil
         renewWork?.cancel()
         renewWork = nil
         keepalive?.invalidate()
         keepalive = nil
+        setupAlive?.invalidate()
+        setupAlive = nil
         peer?.close()
         peer = nil
         if !keepListening {

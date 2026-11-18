@@ -170,10 +170,17 @@ index 3f6adcc..5ed5e7d 100644
              let json = try JSONDecoder().decode(RegionSettingsJSON.self, from: data)
              let allRegions = (json.regions ?? []).compactMap { region in
 diff --git a/Sources/LiveKit/Core/Room+Engine.swift b/Sources/LiveKit/Core/Room+Engine.swift
-index 45229d0..440b1b5 100644
+index 45229d0..03e885c 100644
 --- a/Sources/LiveKit/Core/Room+Engine.swift
 +++ b/Sources/LiveKit/Core/Room+Engine.swift
-@@ -419,8 +419,11 @@ extension Room {
+@@ -414,13 +414,18 @@ extension Room {
+             $0.isReconnectingWithMode = .quick
+             $0.nextReconnectMode = nextReconnectMode
+         }
++        // WordPlus Mesh (1.0.13): the node says its list again on the connection restored
++        takeMeshSourcesDry([])
+ 
+         // quick connect sequence, does not update connection state
          @Sendable func quickReconnectSequence() async throws {
              log("[Connect] Starting .quick reconnect sequence...")
  
@@ -186,7 +193,7 @@ index 45229d0..440b1b5 100644
                                                                   token,
                                                                   connectOptions: _state.connectOptions,
                                                                   reconnectMode: _state.isReconnectingWithMode,
-@@ -464,6 +467,19 @@ extension Room {
+@@ -464,6 +469,19 @@ extension Room {
                      log("[Connect] Publisher transport failed to connect, error: \(error)", .error)
                      throw error
                  }
@@ -206,7 +213,33 @@ index 45229d0..440b1b5 100644
              }
  
              dataTracks?.handleReconnect(fullReconnect: false)
-@@ -548,6 +564,13 @@ extension Room {
+@@ -508,13 +526,19 @@ extension Room {
+         }
+ 
+         do {
+-            let reconnectTask = Task.retrying(totalAttempts: _state.connectOptions.reconnectAttempts,
++            // WordPlus Mesh (1.0.10): the waits the client's settings give (ConnectOptions.meshReconnectDelays), else the curve
++            let meshDelays = _state.connectOptions.meshReconnectDelays
++            let reconnectTask = Task.retrying(totalAttempts: meshDelays?.count ?? _state.connectOptions.reconnectAttempts,
+                                               retryDelay: { @Sendable attempt in
+-                                                  let delay = TimeInterval.computeReconnectDelay(forAttempt: attempt,
+-                                                                                                 baseDelay: self._state.connectOptions.reconnectAttemptDelay,
+-                                                                                                 maxDelay: self._state.connectOptions.reconnectMaxDelay,
+-                                                                                                 totalAttempts: self._state.connectOptions.reconnectAttempts,
+-                                                                                                 addJitter: true)
++                                                  let delay = if let meshDelays {
++                                                      Mesh.reconnectDelay(forAttempt: attempt, delays: meshDelays)
++                                                  } else {
++                                                      TimeInterval.computeReconnectDelay(forAttempt: attempt,
++                                                                                         baseDelay: self._state.connectOptions.reconnectAttemptDelay,
++                                                                                         maxDelay: self._state.connectOptions.reconnectMaxDelay,
++                                                                                         totalAttempts: self._state.connectOptions.reconnectAttempts,
++                                                                                         addJitter: true)
++                                                  }
+                                                   self.log("[Connect] Retry cycle waiting for \(String(format: "%.2f", delay)) seconds before attempt \(attempt + 1)")
+                                                   return delay
+                                               }) { currentAttempt, totalAttempts in
+@@ -548,6 +572,13 @@ extension Room {
                      }
                  } catch {
                      self.log("[Connect] Reconnect mode: \(mode) failed with error: \(error)", .error)
@@ -399,7 +432,7 @@ index 5c51061..735b0ed 100644
 +    }
  }
 diff --git a/Sources/LiveKit/Core/Room+SignalClientDelegate.swift b/Sources/LiveKit/Core/Room+SignalClientDelegate.swift
-index 7045d22..1e4efc2 100644
+index 7045d22..d7b8285 100644
 --- a/Sources/LiveKit/Core/Room+SignalClientDelegate.swift
 +++ b/Sources/LiveKit/Core/Room+SignalClientDelegate.swift
 @@ -117,6 +117,8 @@ extension Room: SignalClientDelegate {
@@ -430,17 +463,21 @@ index 7045d22..1e4efc2 100644
                      disconnectedParticipantIdentities.append(infoIdentity)
                  } else {
                      let isNewParticipant = $0.remoteParticipants[infoIdentity] == nil
-@@ -419,6 +426,9 @@ extension Room: SignalClientDelegate {
+@@ -419,6 +426,13 @@ extension Room: SignalClientDelegate {
      func signalClient(_: SignalClient, didReceiveEncodedResponse response: SignalClient.EncodedResponse) async {
          switch response {
          case let .join(encoded):
 +            // WordPlus Mesh (1.0.3, read here since 1.0.7): the node's codec policy, in a field LiveKit's JoinResponse
 +            // hasn't got, from the signal message's own bytes
 +            _state.mutate { $0.meshCodecPolicy = Mesh.codecPolicy(inSignalMessage: encoded) }
++            // WordPlus Mesh (1.0.10): the client's settings, in field 1002 of the join response
++            if let settings = Mesh.settingsJSON(inJoinMessage: encoded) {
++                await takeMeshSettings(settings)
++            }
              dataTracks?.handleJoinResponse(encoded)
          case let .participantUpdate(encoded):
              guard let identity = localParticipant.identity?.stringValue else { return }
-@@ -430,6 +440,27 @@ extension Room: SignalClientDelegate {
+@@ -430,6 +444,86 @@ extension Room: SignalClientDelegate {
          dataTracks?.handleSignalResponse(data)
      }
  
@@ -465,14 +502,73 @@ index 7045d22..1e4efc2 100644
 +        _meshEncoders.setPace(every)
 +    }
 +
++    /// WordPlus Mesh (1.0.10): the client's settings on a running call.
++    func signalClient(_: SignalClient, didReceiveMeshSettings settings: Data) async {
++        await takeMeshSettings(settings)
++    }
++
++    /// WordPlus Mesh (1.0.13): the tracks it subscribes to that stopped reaching its node.
++    func signalClient(_: SignalClient, didReceiveMeshSourcesDry dry: Set<String>) async {
++        takeMeshSourcesDry(dry)
++    }
++
++    /// Keeps what the node says of the tracks that stopped reaching it, telling the product only when that changed.
++    func takeMeshSourcesDry(_ dry: Set<String>) {
++        let changed = _meshSourcesDry.mutate { held -> Bool in
++            defer { held = dry }
++            return held != dry
++        }
++        if changed, let handler = _meshSourcesDryHandler.read({ $0 }) {
++            handler(dry)
++        }
++    }
++
++    /// Takes the settings a node sent, whole: keeps them for the next connect to this server, holds this room's cameras
++    /// to their live caps, starts the round-trip probe when they name nodes to measure, and tells the product what
++    /// changed.
++    func takeMeshSettings(_ data: Data) async {
++        guard let next = MeshSettings.parse(data) else {
++            log("settings from the server not read (\(data.count) bytes)", .warning)
++            return
++        }
++        let before = _state.mutate { state -> MeshSettings in
++            defer { state.meshSettings = next }
++            return state.meshSettings ?? .none
++        }
++        if let url = _state.providedUrl {
++            MeshSettings.keep(data, for: url)
++        }
++        let changed = next.changed(from: before)
++        log("settings rev \(next.rev), \(next.values.count) set, changed: \(changed.sorted())")
++        if next.cameraCaps != before.cameraCaps {
++            await localParticipant.applyMeshCaps()
++        }
++        // what the encoder of a running camera gives up first, live (`camera.degradation`)
++        if changed.contains("camera.degradation") {
++            await localParticipant.applyMeshDegradation()
++        }
++        // whether a camera in one SVC stream sends only the sizes its viewers ask for, live (`camera.svcTrim`)
++        if changed.contains("camera.svcTrim") {
++            await localParticipant.applyMeshSvcTrim()
++        }
++        // how often the connections' stats are read (`stats.everyMs`)
++        _meshEncoders.stats.setEvery(next.number("stats.everyMs").map { $0 / 1000 } ?? MeshStats.readEvery)
++        if next.bool("probe.enabled") == true, !next.probe.isEmpty {
++            await MeshProbe.shared.measure(next.probe, samples: next.int("probe.samples") ?? 3, cacheMinutes: next.int("probe.cacheMin") ?? 20)
++        }
++        if !changed.isEmpty || before.rev != next.rev, let handler = _meshSettingsHandler.read({ $0 }) {
++            handler(next, changed)
++        }
++    }
++
      func signalClient(_: SignalClient, didReceiveMediaSectionsRequirement requirement: Livekit_MediaSectionsRequirement) async {
          guard case let .publisherOnly(publisher) = _state.transport else { return }
  
 diff --git a/Sources/LiveKit/Core/Room.swift b/Sources/LiveKit/Core/Room.swift
-index c2c1197..8658f55 100644
+index c2c1197..175f1d4 100644
 --- a/Sources/LiveKit/Core/Room.swift
 +++ b/Sources/LiveKit/Core/Room.swift
-@@ -60,6 +60,11 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
+@@ -60,6 +60,56 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
      /// Region code the client is currently connected to.
      public var serverNodeId: String? { _state.serverInfo?.nodeID.nilIfEmpty }
  
@@ -481,20 +577,68 @@ index c2c1197..8658f55 100644
 +    /// the product's codec rule to take as a preference. Nil from a node that sends none, and from any other server.
 +    public var meshCodecPolicy: MeshCodecPolicy? { _state.meshCodecPolicy }
 +
++    /// WordPlus Mesh (1.0.10): the settings the node sent this client last (`MeshSettings`: each checked, every key's
++    /// default where the node set none), `MeshSettings.none` before any and from any other server. For the settings a
++    /// connect takes before it reaches a node, `MeshSettings.cached(for:)`.
++    public var meshSettings: MeshSettings { _state.meshSettings ?? .none }
++
++    /// WordPlus Mesh (1.0.10): hears the settings each time they change, with the keys whose value changed (each key's
++    /// class says when the product takes it, `MeshSettings.keyClass`). The room applies the live caps over its own
++    /// cameras itself (`MeshCaps`). Nil stops it.
++    public func setMeshSettingsHandler(_ handler: (@Sendable (MeshSettings, Set<String>) -> Void)?) {
++        _meshSettingsHandler.mutate { $0 = handler }
++    }
++
++    /// WordPlus Mesh (1.0.10): who hears the settings change, apart from the state a disconnect resets.
++    let _meshSettingsHandler = StateSync<(@Sendable (MeshSettings, Set<String>) -> Void)?>(nil)
++
++    /// WordPlus Mesh (1.0.13): the sids of the tracks this room subscribes to that have stopped reaching their node, as the
++    /// node last said. The node decides it, from what arrives of each track, so it says nothing of this client's own
++    /// connection. Forgotten while a connection is being restored, as the node says its list again on the one restored and
++    /// a new session starts with none. From any other server, always empty.
++    public var meshSourcesDry: Set<String> { _meshSourcesDry.read { $0 } }
++
++    /// WordPlus Mesh (1.0.13): hears `meshSourcesDry` each time it changes. Nil stops it.
++    public func setMeshSourcesDryHandler(_ handler: (@Sendable (Set<String>) -> Void)?) {
++        _meshSourcesDryHandler.mutate { $0 = handler }
++    }
++
++    let _meshSourcesDry = StateSync<Set<String>>([])
++    let _meshSourcesDryHandler = StateSync<(@Sendable (Set<String>) -> Void)?>(nil)
++
++    /// WordPlus Mesh (1.0.10): the product's own caps over its cameras (`setProductCameraCaps`), beside the server's.
++    let _productCameraCaps = StateSync(MeshCaps())
++
++    /// WordPlus Mesh (1.0.10): the caps the room holds its cameras to: its settings' live caps and the product's own,
++    /// the stricter of each.
++    public var cameraCaps: MeshCaps { meshSettings.cameraCaps.combined(with: _productCameraCaps.copy()) }
++
++    /// WordPlus Mesh (1.0.10): the product's own caps over its cameras, beside the settings' (`cameraCaps`), on the
++    /// running senders at once: a product holding a camera it encodes in software to the settings'
++    /// `camera.maxHeight.sw`, say. Empty: none of the product's.
++    public func setProductCameraCaps(_ caps: MeshCaps) async {
++        let before = cameraCaps
++        _productCameraCaps.mutate { $0 = caps }
++        if cameraCaps != before { await localParticipant.applyMeshCaps() }
++    }
++
      public var remoteParticipants: [Participant.Identity: RemoteParticipant] { _state.remoteParticipants }
  
      public var activeSpeakers: [Participant] { _state.activeSpeakers }
-@@ -186,6 +191,9 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
+@@ -186,6 +236,12 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
  
          var serverInfo: Livekit_ServerInfo?
  
 +        /// WordPlus Mesh (1.0.3): the codec policy the node sent with its join response.
 +        var meshCodecPolicy: MeshCodecPolicy?
 +
++        /// WordPlus Mesh (1.0.10): the settings the node sent last, kept across a full reconnect
++        var meshSettings: MeshSettings?
++
          // Engine
          var providedUrl: URL?
          var connectedUrl: URL?
-@@ -266,6 +274,12 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
+@@ -266,6 +322,12 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
  
      let _regionManager = StateSync<RegionManager?>(nil)
  
@@ -507,7 +651,7 @@ index c2c1197..8658f55 100644
      // MARK: Objective-C Support
  
      override public convenience init() {
-@@ -347,6 +361,22 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
+@@ -347,6 +409,22 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
                  log("connectionState: \(oldState.connectionState) -> \(newState.connectionState), reconnectMode: \(String(describing: newState.isReconnectingWithMode))")
              }
  
@@ -530,7 +674,7 @@ index c2c1197..8658f55 100644
              engine(self, didMutateState: newState, oldState: oldState)
  
              // execution control
-@@ -444,7 +474,9 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
+@@ -444,7 +522,9 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
                  if let preparedRegion {
                      nextUrl = preparedRegion.url
                      nextRegion = preparedRegion
@@ -541,7 +685,7 @@ index c2c1197..8658f55 100644
                      await regionManager.prepareSettingsFetch(token: token)
                  }
              }
-@@ -498,6 +530,8 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
+@@ -498,6 +578,8 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
                  $0.connectionState = .connected
              }
  
@@ -550,8 +694,26 @@ index c2c1197..8658f55 100644
              connectSpan?.end()
  
              // Publish mic if mic task was created
+@@ -596,6 +678,9 @@ extension Room {
+     {
+         log("withError: \(String(describing: disconnectError)), isFullReconnect: \(isFullReconnect)")
+ 
++        // WordPlus Mesh (1.0.13): a new session starts with no track stopped
++        takeMeshSourcesDry([])
++
+         // Reap all in-flight RPCs with `recipientDisconnected` (1503). Runs before the
+         // participant-state wipe so callers don't hang on the response timeout during
+         // disconnect / full reconnect.
+@@ -648,6 +733,7 @@ extension Room {
+             $0 = isFullReconnect ? State(
+                 connectOptions: $0.connectOptions,
+                 roomOptions: $0.roomOptions,
++                meshSettings: $0.meshSettings,
+                 providedUrl: $0.providedUrl,
+                 connectedUrl: $0.connectedUrl,
+                 token: $0.token,
 diff --git a/Sources/LiveKit/Core/SignalClient.swift b/Sources/LiveKit/Core/SignalClient.swift
-index 39dc0cc..db325b8 100644
+index 39dc0cc..89d1a0d 100644
 --- a/Sources/LiveKit/Core/SignalClient.swift
 +++ b/Sources/LiveKit/Core/SignalClient.swift
 @@ -190,9 +190,16 @@ actor SignalClient: Loggable {
@@ -587,7 +749,7 @@ index 39dc0cc..db325b8 100644
              }
          }
      }
-@@ -356,6 +365,22 @@ extension SignalClient {
+@@ -356,6 +365,38 @@ extension SignalClient {
              return
          }
  
@@ -607,10 +769,26 @@ index 39dc0cc..db325b8 100644
 +            return
 +        }
 +
++        // WordPlus Mesh (1.0.10): the client's settings on a running call, whenever they change (`Mesh.settingsField`),
++        // which nanopb would read as an empty message as well
++        if case let .data(data) = message, let settings = Mesh.settingsJSON(inSignalMessage: data) {
++            log("settings from the server: \(settings.count) bytes", .debug)
++            _delegate.notifyDetached { await $0.signalClient(self, didReceiveMeshSettings: settings) }
++            return
++        }
++
++        // WordPlus Mesh (1.0.13): the tracks it subscribes to that stopped reaching its node (`Mesh.sourcesDryField`),
++        // which nanopb would read as an empty message as well
++        if case let .data(data) = message, let dry = Mesh.sourcesDry(inSignalMessage: data) {
++            log("sources that stopped reaching the node: \(dry)", .debug)
++            _delegate.notifyDetached { await $0.signalClient(self, didReceiveMeshSourcesDry: dry) }
++            return
++        }
++
          guard case let .data(rawData) = message,
                let response = try? Livekit_SignalResponse(serializedBytes: rawData)
          else {
-@@ -520,6 +545,11 @@ private extension SignalClient {
+@@ -520,6 +561,11 @@ private extension SignalClient {
              // remote tracks, through participant updates.
              break
  
@@ -622,7 +800,20 @@ index 39dc0cc..db325b8 100644
          default:
              log("Unhandled signal message: \(message)", .warning)
          }
-@@ -597,6 +627,28 @@ extension SignalClient {
+@@ -530,8 +576,11 @@ private extension SignalClient {
+ 
+ extension SignalClient {
+     func resumeQueues() async {
+-        await _responseQueue.resume()
++        // WordPlus Mesh (1.0.14): requests first. An answer and its ICE candidates can't be queued (canBeQueued), so
++        // one made before this reached the requests was dropped, and the server, having no answer to its offer, let
++        // the connection fail some 15 seconds later, with nothing said. A queued offer answered quickly did that.
+         await _requestQueue.resume()
++        await _responseQueue.resume()
+     }
+ 
+     /// Whether `response` passes the gate armed by `cleanUp()`; a Join/ReconnectResponse opens it.
+@@ -597,6 +646,28 @@ extension SignalClient {
          return try await completer.wait()
      }
  
@@ -652,10 +843,63 @@ index 39dc0cc..db325b8 100644
          let r = Livekit_SignalRequest.with {
              $0.offer = offer.toPBType(offerId: offerId)
 diff --git a/Sources/LiveKit/Core/Transport.swift b/Sources/LiveKit/Core/Transport.swift
-index f2eebfc..ce47c19 100644
+index f2eebfc..6504ab3 100644
 --- a/Sources/LiveKit/Core/Transport.swift
 +++ b/Sources/LiveKit/Core/Transport.swift
-@@ -594,6 +594,28 @@ extension Transport {
+@@ -77,6 +77,10 @@ final class Transport: NSObject, Loggable {
+     /// is at best a no-op and at worst restarts a converged bandwidth estimator. A full
+     /// reconnect builds a new `Transport`, whose new estimator is seeded again.
+     private var _hasAppliedVideoStartBitrate = false
++    /// WordPlus Mesh (1.0.15): the ids of the audio senders the server may ask again for what their upload lost
++    /// (`AudioPublishOptions.resend`), recorded by ``addTransceiver(with:transceiverInit:startBitrateKbps:resendAudio:)``.
++    /// The offers sent list `nack` for their Opus; see ``listAudioNack(_:senderIds:)``.
++    private var _resendAudioSenderIds: Set<String> = []
+ 
+     // forbid direct access to PeerConnection; the box parks its blocking release on deinit
+     private let _pcBox: RTCBox<LKRTCPeerConnection>
+@@ -304,7 +308,7 @@ final class Transport: NSObject, Loggable {
+             if !_hasAppliedVideoStartBitrate, Self.carriesVideoStartBitrate(offer.sdp) {
+                 _hasAppliedVideoStartBitrate = true
+             }
+-            try await _onOffer(offer, _latestOfferId)
++            try await _onOffer(offerToSend(offer), _latestOfferId)
+         }
+ 
+         if signalingState == .haveLocalOffer, iceRestart, let sd = remoteDescription {
+@@ -416,6 +420,32 @@ extension Transport {
+         return document.write()
+     }
+ 
++    /// WordPlus Mesh (1.0.15): the SDP with `nack` listed for the Opus of each sending audio section whose `a=msid`
++    /// track id, which libwebrtc sets to the sender id, is one of `senderIds`, once each; the SDP itself where there
++    /// is nothing to add. rtc-client 1.0.27's `listAudioNack`.
++    nonisolated static func listAudioNack(_ sdp: String, senderIds: Set<String>) -> String {
++        guard !senderIds.isEmpty else { return sdp }
++        var document = SDP(parsing: sdp)
++        var listed = false
++        for index in document.mediaSections.indices {
++            let section = document.mediaSections[index]
++            guard section.mediaType == "audio",
++                  section.direction != .recvonly, section.direction != .inactive,
++                  let sender = section.msidTrackId, senderIds.contains(sender),
++                  let payload = section.payload(forCodec: "opus") else { continue }
++            if document.mediaSections[index].appendRtcpFeedback("nack", forPayload: payload) { listed = true }
++        }
++        return listed ? document.write() : sdp
++    }
++
++    /// WordPlus Mesh (1.0.15): the offer as it is sent, `nack` listed for the Opus of each audio sender the server
++    /// may ask again. Only what is sent says so: libwebrtc's sender takes it from the answer alone, and the
++    /// description it set stays the one it accepted, with nothing more for it to refuse.
++    func offerToSend(_ offer: LKRTCSessionDescription) -> LKRTCSessionDescription {
++        let sdp = Self.listAudioNack(offer.sdp, senderIds: _resendAudioSenderIds)
++        return sdp == offer.sdp ? offer : RTC.createSessionDescription(type: offer.type, sdp: sdp)
++    }
++
+     /// Munge a local offer to declare `stereo=1` on the Opus fmtp of every audio section.
+     ///
+     /// In single PC mode the client is the offerer for its own receive sections, and at
+@@ -594,6 +624,28 @@ extension Transport {
              }
          }
      }
@@ -684,6 +928,146 @@ index f2eebfc..ce47c19 100644
  }
  
  // MARK: - RTCPeerConnectionDelegate
+@@ -711,9 +763,13 @@ extension Transport {
+     /// against the new sender here, before returning, so the offer libwebrtc asks for in
+     /// response to this call cannot be created without it. It only matters until the
+     /// connection-level hint has been written once (``mungeVideoStartBitrate(_:kbpsBySenderId:)``).
++    ///
++    /// WordPlus Mesh (1.0.15): `resendAudio` records the new sender as one the server may ask again
++    /// (`AudioPublishOptions.resend`), here for the same reason.
+     func addTransceiver(with track: LKRTCMediaStreamTrack,
+                         transceiverInit: LKRTCRtpTransceiverInit,
+-                        startBitrateKbps: Int? = nil) throws -> LKRTCRtpTransceiver
++                        startBitrateKbps: Int? = nil,
++                        resendAudio: Bool = false) throws -> LKRTCRtpTransceiver
+     {
+         guard !_isClosed else {
+             throw LiveKitError(.invalidState, message: "Transport is closed")
+@@ -727,6 +783,10 @@ extension Transport {
+             _startBitrateKbpsBySenderId[transceiver.sender.senderId] = startBitrateKbps
+         }
+ 
++        if resendAudio {
++            _resendAudioSenderIds.insert(transceiver.sender.senderId)
++        }
++
+         return transceiver
+     }
+ 
+@@ -750,6 +810,7 @@ extension Transport {
+             throw LiveKitError(.webRTC, message: "Failed to remove track")
+         }
+         _startBitrateKbpsBySenderId.removeValue(forKey: sender.senderId)
++        _resendAudioSenderIds.remove(sender.senderId)
+ 
+         releaseTransceiver(sender: raw)
+     }
+@@ -760,11 +821,25 @@ extension Transport {
+         if let transceiver = _pc.transceivers.first(where: { $0.sender == sender }),
+            !transceiver.isStopped
+         {
++            // WordPlus Mesh (1.0.14): the first mid of the BUNDLE group stays, inactive. libwebrtc takes rejecting it as
++            // rejecting the whole group, so the next offer would drop the transport every other section rides on, the
++            // data channels with it, and what is published next would send nothing. Only someone who joined with no
++            // right to publish has media there, as a first offer lists it before the data channels.
++            if transceiver.mid == Self.bundleTag(inSDP: _pc.localDescription?.sdp) {
++                log("Leaving the first mid of the BUNDLE group inactive", .debug)
++                return
++            }
+             log("Stopping transceiver", .debug)
+             transceiver.stopInternal()
+         }
+     }
+ 
++    /// WordPlus Mesh (1.0.14): the first mid of an SDP's BUNDLE group, the one its transport is named after.
++    nonisolated static func bundleTag(inSDP sdp: String?) -> String? {
++        guard let line = sdp?.split(whereSeparator: \.isNewline).first(where: { $0.hasPrefix("a=group:BUNDLE") }) else { return nil }
++        return line.split(separator: " ").dropFirst().first.map(String.init)
++    }
++
+     var unstoppedTransceiverCount: Int {
+         _pc.transceivers.filter { !$0.isStopped }.count
+     }
+diff --git a/Sources/LiveKit/E2EE/E2EEManager.swift b/Sources/LiveKit/E2EE/E2EEManager.swift
+index 4796dfb..aef5498 100644
+--- a/Sources/LiveKit/E2EE/E2EEManager.swift
++++ b/Sources/LiveKit/E2EE/E2EEManager.swift
+@@ -81,6 +81,32 @@ public class E2EEManager: NSObject, @unchecked Sendable, ObservableObject, Logga
+         var frameCryptors = [CryptorKey: LKRTCFrameCryptor]()
+         var trackPublications = [LKRTCFrameCryptor: TrackPublication]()
+         var dataCryptor: LKRTCDataPacketCryptor?
++        /// WordPlus RTC client: the key index this device sends under since `useKey(index:)`, nil before it.
++        var senderKeyIndex: Int32?
++    }
++
++    /// WordPlus RTC client: the key index this device sends under since `useKey(index:)`, nil before it (each frame
++    /// cryptor's own, 0).
++    public var senderKeyIndex: Int32? { _state.senderKeyIndex }
++
++    /// WordPlus RTC client: sends under the key held at `index` from now on, on every track this device publishes and
++    /// on each one it publishes after, and its data packets too (the key provider's current index). Upstream's frame
++    /// cryptors keep the index they were made with, 0 for a shared key, whatever key is set. The keys at the other
++    /// indexes stay, and a receiver decrypts each frame by the index in its trailer, so what is still on its way under
++    /// them decrypts. Hold the key on every device of the room first (`BaseKeyProvider.holdKey`), then use it.
++    public func useKey(index: Int32) async {
++        let size = keyProvider.options.keyRingSize
++        let index = ((index % size) + size) % size
++        keyProvider.setCurrentKeyIndex(index)
++        // The cryptors are `@RTC`-confined, as addRtpSender makes them.
++        await RTC.run {
++            _state.mutate { state in
++                state.senderKeyIndex = index
++                for (frameCryptor, publication) in state.trackPublications where publication is LocalTrackPublication {
++                    frameCryptor.keyIndex = index
++                }
++            }
++        }
+     }
+ 
+     typealias CryptorKey = [Participant.Identity: Track.Sid]
+@@ -207,6 +233,8 @@ public class E2EEManager: NSObject, @unchecked Sendable, ObservableObject, Logga
+                 $0.frameCryptors[[participantIdentity: publication.sid]] = frameCryptor
+                 $0.trackPublications[frameCryptor] = publication
+                 frameCryptor.enabled = $0.enabled
++                // A track published after useKey(index:) sends under that index too.
++                if let index = $0.senderKeyIndex { frameCryptor.keyIndex = index }
+             }
+         }
+     }
+diff --git a/Sources/LiveKit/E2EE/KeyProvider.swift b/Sources/LiveKit/E2EE/KeyProvider.swift
+index 755fb46..e0add1c 100644
+--- a/Sources/LiveKit/E2EE/KeyProvider.swift
++++ b/Sources/LiveKit/E2EE/KeyProvider.swift
+@@ -176,6 +176,29 @@ public final class BaseKeyProvider: NSObject, Loggable, Sendable {
+         setCurrentKeyIndex(targetIndex)
+     }
+ 
++    /// WordPlus RTC client: a key held at `index` without sending under it. Frames and data packets that name the index
++    /// decrypt with it, and this device goes on sending under the index it uses until `E2EEManager.useKey(index:)`. A
++    /// room moving to a new key holds it on every device first, so nobody loses a frame in the switch. `setKey` moves
++    /// the data packets' index at once, this leaves it.
++    ///
++    /// - Parameters:
++    ///   - keyData: The key bytes, stored as provided.
++    ///   - participantId: Required in non-shared key mode; the call is a no-op when `nil`.
++    ///   - index: The key index to hold it at, taken modulo the key ring.
++    public func holdKey(keyData: Data, participantId: String? = nil, index: Int32) {
++        if options.sharedKey {
++            rtcKeyProvider.setSharedKey(keyData, with: index)
++            return
++        }
++
++        guard let participantId else {
++            log("holdKey: Please provide valid participantId for non-SharedKey mode.")
++            return
++        }
++
++        rtcKeyProvider.setKey(keyData, with: index, forParticipant: participantId)
++    }
++
+     public func ratchetKey(participantId: String? = nil, index: Int32? = nil) -> Data? {
+         let targetIndex = index ?? getCurrentKeyIndex()
+ 
 diff --git a/Sources/LiveKit/Errors.swift b/Sources/LiveKit/Errors.swift
 index 7cfe19e..0f8092b 100644
 --- a/Sources/LiveKit/Errors.swift
@@ -729,6 +1113,73 @@ index 7cfe19e..0f8092b 100644
  
          super.init(domain: "io.livekit.swift-sdk",
                     code: type.rawValue,
+diff --git a/Sources/LiveKit/Extensions/LKRTCRtpSender.swift b/Sources/LiveKit/Extensions/LKRTCRtpSender.swift
+index b2e76c4..7f873dd 100644
+--- a/Sources/LiveKit/Extensions/LKRTCRtpSender.swift
++++ b/Sources/LiveKit/Extensions/LKRTCRtpSender.swift
+@@ -40,26 +40,46 @@ extension LKRTCRtpSender: Loggable {
+         let encodings = _parameters.encodings
+ 
+         var didUpdate = false
++        var trimmedTo: String?
+ 
+         // For SVC mode...
+         if let firstEncoding = encodings.first,
+            ScalabilityMode.fromString(firstEncoding.scalabilityMode) != nil
+         {
+-            let _enabled = qualities.highest != .off
++            let highest = qualities.highest
++            let _enabled = highest != .off
+             if firstEncoding.isActive != _enabled {
+                 firstEncoding.isActive = _enabled
+                 didUpdate = true
+             }
++            // WordPlus Mesh (1.0.11): the sizes up to the largest asked while camera.svcTrim is on, whole again once
++            // off (MeshSvcTrim); a stream turned off keeps its sizes, so it comes back on in one change
++            if _enabled, encodings.count == 1,
++               let plan = MeshSvcTrim.encoding(for: self, current: firstEncoding, highest: highest.rawValue)
++            {
++                if firstEncoding.scalabilityMode != plan.mode {
++                    firstEncoding.scalabilityMode = plan.mode
++                    trimmedTo = plan.mode
++                    didUpdate = true
++                }
++                if firstEncoding.scaleResolutionDownBy?.doubleValue != plan.scale {
++                    firstEncoding.scaleResolutionDownBy = plan.scale.map { NSNumber(value: $0) }
++                    didUpdate = true
++                }
++            }
+         } else {
+             // For Simulcast...
++            // WordPlus Mesh (1.0.10): a layer the camera's live caps turned off stays off (MeshCaps)
++            let cappedOff = MeshCappedLayers.off(self)
+             for e in qualities {
+                 guard let rid = e.quality.asRID else { continue }
+                 guard let encodingforRID = encodings.first(where: { $0.rid == rid }) else { continue }
+ 
+-                if encodingforRID.isActive != e.enabled {
++                let enabled = e.enabled && !cappedOff.contains(rid)
++                if encodingforRID.isActive != enabled {
+                     didUpdate = true
+-                    encodingforRID.isActive = e.enabled
+-                    log("Setting layer \(e.quality) to \(e.enabled)", .info)
++                    encodingforRID.isActive = enabled
++                    log("Setting layer \(e.quality) to \(enabled)", .info)
+                 }
+             }
+ 
+@@ -78,6 +98,11 @@ extension LKRTCRtpSender: Loggable {
+ 
+         if didUpdate {
+             parameters = _parameters
++            // WordPlus Mesh (1.0.11): a WebRTC that keeps its mode sends this camera whole from then on
++            if let trimmedTo, !MeshSvcTrim.check(self, asked: trimmedTo) {
++                log("WebRTC kept its SVC mode for \(trimmedTo): the camera goes out whole", .warning)
++                _set(subscribedQualities: qualities)
++            }
+         }
+     }
+ }
 diff --git a/Sources/LiveKit/Extensions/URL.swift b/Sources/LiveKit/Extensions/URL.swift
 index e9f10e9..3935415 100644
 --- a/Sources/LiveKit/Extensions/URL.swift
@@ -768,12 +1219,134 @@ index e9f10e9..3935415 100644
      }
  
      func cloudConfigUrl() -> URL {
+diff --git a/Sources/LiveKit/Mesh/MeshCaps.swift b/Sources/LiveKit/Mesh/MeshCaps.swift
+new file mode 100644
+index 0000000..2c81f39
+--- /dev/null
++++ b/Sources/LiveKit/Mesh/MeshCaps.swift
+@@ -0,0 +1,116 @@
++/*
++ * Copyright 2026 The WordPlus RTC client authors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import Foundation
++
++internal import LiveKitWebRTC
++
++/// WordPlus Mesh (1.0.10): the live caps over a camera's encodings (`camera.capHeight`, `camera.capFps`,
++/// `camera.capKbps`; 0 for none), which the server sets for one person, a room or a kind of device, and which reach a
++/// running camera at once, with no republish: no layer taller than the height (scaled down to it, or turned off when a
++/// lower layer already comes near it), none faster than the frame rate, none spending more than the bitrate. The room
++/// holds them over every camera it publishes, whatever its publish options, its dimensions or dynacast say after.
++public struct MeshCaps: Sendable, Hashable {
++    public var height: Int
++    public var fps: Int
++    public var kbps: Int
++
++    public init(height: Int = 0, fps: Int = 0, kbps: Int = 0) {
++        self.height = height
++        self.fps = fps
++        self.kbps = kbps
++    }
++
++    public var isEmpty: Bool { height <= 0 && fps <= 0 && kbps <= 0 }
++
++    /// Both caps at once: each the stricter of the two where either sets it (the server's and the product's own,
++    /// `Room.setProductCameraCaps`).
++    public func combined(with other: MeshCaps) -> MeshCaps {
++        func stricter(_ a: Int, _ b: Int) -> Int { a > 0 && b > 0 ? Swift.min(a, b) : Swift.max(a, b, 0) }
++        return MeshCaps(height: stricter(height, other.height), fps: stricter(fps, other.fps), kbps: stricter(kbps, other.kbps))
++    }
++
++    /// A lower layer at least this share of the height covers the cap: the layer above goes off rather than being
++    /// scaled down onto it.
++    static let covers = 0.95
++
++    /// Holds encodings computed for a camera of `lines` (its capture's shorter side) to the caps, in place, and answers
++    /// the rids it turned off, which dynacast must leave off. A layer scaled down spends its bitrate scaled with it, as
++    /// the ladder's own layers do (by the height's ratio to the power 1.5).
++    @discardableResult
++    func apply(to encodings: [LKRTCRtpEncodingParameters], lines: Int) -> Set<String> {
++        guard !isEmpty, !encodings.isEmpty, lines > 0 else { return [] }
++        var off: Set<String> = []
++        if height > 0 {
++            let source = Double(lines)
++            let ordered = encodings.sorted { source / ($0.scaleResolutionDownBy?.doubleValue ?? 1) < source / ($1.scaleResolutionDownBy?.doubleValue ?? 1) }
++            var kept: [Double] = []
++            for encoding in ordered {
++                let scale = Swift.max(encoding.scaleResolutionDownBy?.doubleValue ?? 1, 1)
++                let layer = source / scale
++                guard layer > Double(height) else {
++                    kept.append(layer)
++                    continue
++                }
++                if let rid = encoding.rid, kept.contains(where: { $0 >= Double(height) * Self.covers }) {
++                    encoding.isActive = false
++                    off.insert(rid)
++                    continue
++                }
++                encoding.scaleResolutionDownBy = NSNumber(value: source / Double(height))
++                if let bitrate = encoding.maxBitrateBps?.doubleValue {
++                    encoding.maxBitrateBps = NSNumber(value: Int(bitrate * pow(Double(height) / layer, 1.5)))
++                }
++                kept.append(Double(height))
++            }
++        }
++        if fps > 0 {
++            for encoding in encodings {
++                let now = encoding.maxFramerate?.intValue ?? 0
++                encoding.maxFramerate = NSNumber(value: now > 0 ? Swift.min(now, fps) : fps)
++            }
++        }
++        if kbps > 0 {
++            for encoding in encodings {
++                let now = encoding.maxBitrateBps?.intValue ?? 0
++                encoding.maxBitrateBps = NSNumber(value: now > 0 ? Swift.min(now, kbps * 1000) : kbps * 1000)
++            }
++        }
++        return off
++    }
++}
++
++/// The rids a sender's caps turned off, by the sender's id (libwebrtc's, unique to it): dynacast's
++/// `_set(subscribedQualities:)` leaves them off whatever the node asks. An entry goes when its caps are lifted; one a
++/// sender left behind is a few bytes.
++enum MeshCappedLayers {
++    private static let lock = NSLock()
++    nonisolated(unsafe) private static var table: [String: Set<String>] = [:]
++
++    static func set(_ rids: Set<String>, for sender: LKRTCRtpSender) {
++        let id = sender.senderId
++        lock.lock()
++        defer { lock.unlock() }
++        table[id] = rids.isEmpty ? nil : rids
++    }
++
++    static func off(_ sender: LKRTCRtpSender) -> Set<String> {
++        let id = sender.senderId
++        lock.lock()
++        defer { lock.unlock() }
++        return table[id] ?? []
++    }
++}
 diff --git a/Sources/LiveKit/Mesh/MeshEncoders.swift b/Sources/LiveKit/Mesh/MeshEncoders.swift
 new file mode 100644
-index 0000000..529d3f5
+index 0000000..77bf98f
 --- /dev/null
 +++ b/Sources/LiveKit/Mesh/MeshEncoders.swift
-@@ -0,0 +1,666 @@
+@@ -0,0 +1,674 @@
 +/*
 + * Copyright 2026 The WordPlus RTC client authors
 + *
@@ -859,6 +1432,8 @@ index 0000000..529d3f5
 +        var queueMs: Double?
 +        var resent: Double?
 +        var huge: Int?
++        /// 1.0.11: the mode a camera in one SVC stream goes out in now (L2T3_KEY once trimmed to two sizes, MeshSvcTrim)
++        var svc: String?
 +    }
 +
 +    /// The mode a capture was opened at: its size and the frames a second asked of the device.
@@ -1338,7 +1913,9 @@ index 0000000..529d3f5
 +        var paths: [String: [MeshEncoders.Stat]] = [:]
 +        if let publisher = transport?.publisher { paths["pub"] = await stats.read(publisher) }
 +        if let subscriber = transport?.dedicatedSubscriber { paths["sub"] = await stats.read(subscriber) }
-+        let device = health.reading(paths: paths)
++        var device = health.reading(paths: paths)
++        // 1.0.10: the settings revision it runs, so the node's live view says how far a revision has reached
++        device.cfg = room._state.read { $0.meshSettings?.rev }
 +
 +        let sent = _state.read { $0.sent }
 +        let changed = encoders.json != sent && (!encoders.tracks.isEmpty || sent != nil) ? encoders.json : nil
@@ -1370,7 +1947,11 @@ index 0000000..529d3f5
 +                let key = sender.senderId
 +                let read = MeshEncoders.outbound(of: entries ?? [], before: _state.read { $0.totals[key] })
 +                _state.mutate { $0.totals[key] = read.totals }
-+                if let report = MeshEncoders.codecReport(read.outbound, named: named) {
++                if var report = MeshEncoders.codecReport(read.outbound, named: named) {
++                    // 1.0.11: the mode a camera in one SVC stream goes out in now
++                    if named == nil, report.codec == "vp9" || report.codec == "av1" {
++                        report.svc = await RTC.run { MeshSvcTrim.sentMode(sender.raw) }
++                    }
 +                    codecs.append(report)
 +                }
 +            }
@@ -1442,10 +2023,10 @@ index 0000000..529d3f5
 +}
 diff --git a/Sources/LiveKit/Mesh/MeshHardwareDrops.swift b/Sources/LiveKit/Mesh/MeshHardwareDrops.swift
 new file mode 100644
-index 0000000..c853d46
+index 0000000..27f8e8a
 --- /dev/null
 +++ b/Sources/LiveKit/Mesh/MeshHardwareDrops.swift
-@@ -0,0 +1,273 @@
+@@ -0,0 +1,349 @@
 +/*
 + * Copyright 2026 The WordPlus RTC client authors
 + *
@@ -1484,10 +2065,14 @@ index 0000000..c853d46
 +    public static let didFind = Notification.Name("WordPlusMeshHardwareDrops")
 +
 +    /// The codecs ("h264", "h265") this device saw its hardware encoder drop a camera's frames of in the last month.
-+    public static func codecs(now: Date = Date(), defaults: UserDefaults = .standard) -> [String] {
++    /// 1.0.10: as long as the settings say (`tune.rememberDropsDays`, 30 where they say nothing; 0 remembers none), and
++    /// none seen before `tune.forgetBefore` (Unix ms), which measures every device again from then.
++    public static func codecs(now: Date = Date(), defaults: UserDefaults = .standard, settings: MeshSettings = .none) -> [String] {
 +        let seen = defaults.dictionary(forKey: defaultsKey) as? [String: Double] ?? [:]
++        let keep = settings.number("tune.rememberDropsDays").map { $0 * 24 * 3600 } ?? rememberFor
++        let since = (settings.number("tune.forgetBefore") ?? 0) / 1000
 +        return seen.filter { codec, at in
-+            codec != "vp8" && now.timeIntervalSince1970 - at >= 0 && now.timeIntervalSince1970 - at < rememberFor
++            codec != "vp8" && now.timeIntervalSince1970 - at >= 0 && now.timeIntervalSince1970 - at < keep && at >= since
 +        }.keys.sorted()
 +    }
 +
@@ -1508,21 +2093,59 @@ index 0000000..c853d46
 +
 +/// The rule, as encoder-watch.ts has it: over the last `readings` readings (30 s), each of them a hardware encoder's
 +/// (`hardwareReading`): the camera goes out in H.264 or H.265 from a layer sent in hardware, its source gives at least
-+/// `minCaptured` frames a second, the device names nothing that limits a layer, the hardware takes at most `maxEncodeMs`
-+/// a frame (not a slow device), and a hardware layer sends at least `minSent` of a target of `minTarget` or more (an
-+/// encoder cut off by a path gone down sends nothing and reports no target); and the layer that keeps the most has
-+/// encoded `share` or less of the frames its source gave in all. A software encoder short of bits drops its own layer's
-+/// frames alone, and a dim room's camera gives fewer frames, which every layer sends.
++/// `minCaptured` frames a second, the device names nothing that limits a layer, the hardware keeps up with its source
++/// (`slowMs`: at most `maxEncodeMs` a frame, or `keepUpShare` of the time between two of its source's frames where
++/// that is longer, so not a slow device), and a hardware layer sends at least `minSent` of a target of `minTarget` or
++/// more (an encoder cut off by a path gone down sends nothing and reports no target); and the layer that keeps the most
++/// has encoded `share` or less of the frames its source gave in all. A software encoder short of bits drops its own
++/// layer's frames alone, and a dim room's camera gives fewer frames, which every layer sends.
 +enum HardwareDropRule {
 +    static let readEvery: TimeInterval = 5
 +    static let readings = 6
 +    // the readings of a camera's first 10 s, left out: its encoder starting sends a frame or two of them
 +    static let warmup = 2
 +    static let share = 0.7
-+    static let minCaptured = 10.0
++    // 10 before 1.0.15, as realtime-client before 1.0.85: a dim room's camera giving 9-10 frames a second was never
++    // judged, and at 5 a second 30 s is still 150 frames to judge
++    static let minCaptured = 5.0
 +    static let maxEncodeMs = 25.0
++    // past `maxEncodeMs` a frame's encoding still keeps up while it takes no more than this share of the time between
++    // the source's frames (1.0.15, realtime-client 1.0.85's HARDWARE_KEEP_UP_SHARE): 27 ms at 30 a second, 80 at 10
++    static let keepUpShare = 0.8
 +    static let minTarget = 100_000.0
 +    static let minSent = 0.25
++    // the watch ends after this long without a camera, until the next one is published (1.0.10)
++    static let idleEnd: TimeInterval = 10 * 60
++
++    /// The rule's numbers (1.0.10): the settings' (`watch.everyMs`, `watch.warmups`, `watch.dropShare`,
++    /// `watch.minCapturedFps`, `watch.maxEncodeMs`, `watch.minTargetKbps`, `watch.minSent`, `watch.idleEndMin`, and
++    /// `tune.dropWatchS` over the readings' pace for their count), the constants above where they say nothing.
++    struct Tune: Equatable {
++        var idleEnd = HardwareDropRule.idleEnd
++        var readEvery = HardwareDropRule.readEvery
++        var readings = HardwareDropRule.readings
++        var warmup = HardwareDropRule.warmup
++        var share = HardwareDropRule.share
++        var minCaptured = HardwareDropRule.minCaptured
++        var maxEncodeMs = HardwareDropRule.maxEncodeMs
++        var minTarget = HardwareDropRule.minTarget
++        var minSent = HardwareDropRule.minSent
++
++        init() {}
++
++        init(_ settings: MeshSettings) {
++            readEvery = settings.number("watch.everyMs").map { $0 / 1000 } ?? HardwareDropRule.readEvery
++            let window = settings.number("tune.dropWatchS") ?? HardwareDropRule.readEvery * Double(HardwareDropRule.readings)
++            readings = max(1, Int((window / readEvery).rounded()))
++            warmup = settings.int("watch.warmups") ?? HardwareDropRule.warmup
++            share = settings.number("watch.dropShare") ?? HardwareDropRule.share
++            minCaptured = settings.number("watch.minCapturedFps") ?? HardwareDropRule.minCaptured
++            maxEncodeMs = settings.number("watch.maxEncodeMs") ?? HardwareDropRule.maxEncodeMs
++            minTarget = settings.number("watch.minTargetKbps").map { $0 * 1000 } ?? HardwareDropRule.minTarget
++            minSent = settings.number("watch.minSent") ?? HardwareDropRule.minSent
++            idleEnd = settings.number("watch.idleEndMin").map { $0 * 60 } ?? HardwareDropRule.idleEnd
++        }
++    }
 +
 +    /// One layer between two readings.
 +    struct Layer: Equatable {
@@ -1550,28 +2173,36 @@ index 0000000..c853d46
 +        var at: Double // ms
 +    }
 +
++    /// The longest a hardware encoder may take a frame and still be keeping up with a source giving `captured` frames a
++    /// second (1.0.15, encoder-watch.ts's hardwareSlowMs): `maxEncodeMs`, or `keepUpShare` of the time between two
++    /// frames where that is longer.
++    static func slowMs(captured: Double, tune: Tune = Tune()) -> Double {
++        captured > 0 ? max(tune.maxEncodeMs, keepUpShare * 1000 / captured) : tune.maxEncodeMs
++    }
++
 +    /// A reading of a hardware encoder that nothing the device names holds back: the frames a second of the layer that
 +    /// keeps the most, and its source's; nil for any other.
-+    static func hardwareReading(_ r: Reading) -> (best: Double, captured: Double)? {
-+        guard r.codec == "h264" || r.codec == "h265", r.captured >= minCaptured else { return nil }
++    static func hardwareReading(_ r: Reading, tune: Tune = Tune()) -> (best: Double, captured: Double)? {
++        guard r.codec == "h264" || r.codec == "h265", r.captured >= tune.minCaptured else { return nil }
 +        let sent = r.layers.filter(\.active)
 +        guard sent.contains(where: \.hardware) else { return nil }
-+        guard sent.contains(where: { $0.hardware && ($0.target ?? 0) >= minTarget && $0.sentBps >= ($0.target ?? 0) * minSent }) else {
++        guard sent.contains(where: { $0.hardware && ($0.target ?? 0) >= tune.minTarget && $0.sentBps >= ($0.target ?? 0) * tune.minSent }) else {
 +            return nil
 +        }
-+        if sent.contains(where: { ($0.limit != "none" && !$0.limit.isEmpty) || ($0.hardware && ($0.encodeMs ?? 0) > maxEncodeMs) }) {
++        let slow = slowMs(captured: r.captured, tune: tune)
++        if sent.contains(where: { ($0.limit != "none" && !$0.limit.isEmpty) || ($0.hardware && ($0.encodeMs ?? 0) > slow) }) {
 +            return nil
 +        }
 +        return (sent.map(\.fps).max() ?? 0, r.captured)
 +    }
 +
 +    /// Whether readings, the last `readings` of them, are a hardware encoder taking the whole camera's frames off.
-+    static func dropsFrames(_ list: [Reading]) -> Bool {
-+        guard list.count >= readings else { return false }
-+        let read = list.suffix(readings).map(hardwareReading)
++    static func dropsFrames(_ list: [Reading], tune: Tune = Tune()) -> Bool {
++        guard list.count >= tune.readings else { return false }
++        let read = list.suffix(tune.readings).map { hardwareReading($0, tune: tune) }
 +        guard read.allSatisfy({ $0 != nil }) else { return false }
 +        let kept = read.reduce(0) { $0 + $1!.best }, given = read.reduce(0) { $0 + $1!.captured }
-+        return kept <= given * share
++        return kept <= given * tune.share
 +    }
 +
 +    /// A camera sender's reading from its stats against the counts of the one before (nil the first time). rids: its
@@ -1621,7 +2252,8 @@ index 0000000..c853d46
 +/// Watches the room's published camera (its primary codec's sender, not a backup's) while connected, on any server: a
 +/// reading every `readEvery`, and once its hardware is seen dropping frames, remembers the codec and tells
 +/// (`MeshHardwareDrops.didFind`). A new sender, a camera muted or gone, or a path that went down starts the readings
-+/// over; a sender found dropping isn't read again.
++/// over; a sender found dropping isn't read again. 1.0.10: after `watch.idleEndMin` without a camera it ends, as the
++/// web's encoder watch does, and a camera published again starts it (`LocalParticipant`'s publish).
 +final class MeshHardwareDropWatch: @unchecked Sendable, Loggable {
 +    private struct State {
 +        var task: Task<Void, Never>?
@@ -1631,6 +2263,26 @@ index 0000000..c853d46
 +        var warmup = HardwareDropRule.warmup
 +        var last: [HardwareDropRule.Reading] = []
 +        var found: Set<String> = []
++        /// since when no camera was there to read (1.0.10)
++        var idleSince: Date?
++    }
++
++    var running: Bool { _state.read { $0.task != nil } }
++
++    /// No camera to read (none, muted, or its source stopped): the readings start over, and once that has lasted the
++    /// settings' `watch.idleEndMin` the watch ends until the next camera.
++    func idle(tune: HardwareDropRule.Tune, now: Date = Date()) {
++        over(nil, tune: tune)
++        let ended: Bool = _state.mutate {
++            let since = $0.idleSince ?? now
++            $0.idleSince = since
++            guard $0.task != nil, now.timeIntervalSince(since) >= tune.idleEnd else { return false }
++            $0.task?.cancel()
++            $0.task = nil
++            $0.idleSince = nil
++            return true
++        }
++        if ended { log("no camera for \(Int(tune.idleEnd / 60)) min: the hardware-drop watch ends until the next one") }
 +    }
 +
 +    private let _state = StateSync(State())
@@ -1640,7 +2292,9 @@ index 0000000..c853d46
 +            guard $0.task == nil else { return }
 +            $0.task = Task { [weak self, weak room] in
 +                while !Task.isCancelled {
-+                    try? await Task.sleep(nanoseconds: UInt64(HardwareDropRule.readEvery * 1_000_000_000))
++                    // 1.0.10: at the settings' pace (`watch.everyMs`)
++                    let every = room.map { HardwareDropRule.Tune($0.meshSettings).readEvery } ?? HardwareDropRule.readEvery
++                    try? await Task.sleep(nanoseconds: UInt64(every * 1_000_000_000))
 +                    guard let self, let room, !Task.isCancelled else { return }
 +                    await self.read(room)
 +                }
@@ -1655,31 +2309,34 @@ index 0000000..c853d46
 +        }
 +    }
 +
-+    private func over(_ watched: String?) {
++    private func over(_ watched: String?, tune: HardwareDropRule.Tune = HardwareDropRule.Tune()) {
 +        _state.mutate {
 +            $0.watched = watched
 +            $0.counts = nil
-+            $0.warmup = HardwareDropRule.warmup
++            $0.warmup = tune.warmup
 +            $0.last = []
 +        }
 +    }
 +
 +    func read(_ room: Room) async {
++        // 1.0.10: the rule's numbers from the room's settings, as they are at this reading
++        let tune = HardwareDropRule.Tune(room.meshSettings)
 +        let camera = room.localParticipant.localVideoTracks.compactMap { $0.track as? LocalVideoTrack }.first { $0.source == .camera }
 +        let (transport, sender) = camera?._state.read { ($0.transport, $0.rtpSender) } ?? (nil, nil)
 +        guard let camera, let transport, let sender, !camera.isMuted else {
-+            return over(nil)
++            return idle(tune: tune)
 +        }
 +        // 1.0.7: upstream 2.18's WebRTC objects are read on its RTC executor
 +        let mediaTrack = camera.mediaTrack
 +        guard await RTC.run({ mediaTrack.raw.readyState == .live }) else {
-+            return over(nil)
++            return idle(tune: tune)
 +        }
++        _state.mutate { $0.idleSince = nil }
 +        let key = sender.senderId
 +        if _state.read({ $0.found.contains(key) }) { return }
-+        if _state.read({ $0.watched }) != key { over(key) }
++        if _state.read({ $0.watched }) != key { over(key, tune: tune) }
 +        // a reading across a path gone down reads the frames the path took, not the encoder's
-+        guard await transport.isConnected else { return over(key) }
++        guard await transport.isConnected else { return over(key, tune: tune) }
 +
 +        // 1.0.7: its part of the publisher's shared reading (MeshStatsHub), with the encoders' reports; its own reading
 +        // where the part can't be told
@@ -1706,8 +2363,8 @@ index 0000000..c853d46
 +                return (false, nil)
 +            }
 +            $0.last.append(reading)
-+            if $0.last.count > HardwareDropRule.readings { $0.last.removeFirst() }
-+            guard HardwareDropRule.dropsFrames($0.last), let codec = reading.codec else { return (false, nil) }
++            if $0.last.count > tune.readings { $0.last.removeFirst($0.last.count - tune.readings) }
++            guard HardwareDropRule.dropsFrames($0.last, tune: tune), let codec = reading.codec else { return (false, nil) }
 +            $0.found.insert(key)
 +            return (true, codec)
 +        }
@@ -1721,10 +2378,10 @@ index 0000000..c853d46
 +}
 diff --git a/Sources/LiveKit/Mesh/MeshHealth.swift b/Sources/LiveKit/Mesh/MeshHealth.swift
 new file mode 100644
-index 0000000..2f5d211
+index 0000000..9624c46
 --- /dev/null
 +++ b/Sources/LiveKit/Mesh/MeshHealth.swift
-@@ -0,0 +1,366 @@
+@@ -0,0 +1,368 @@
 +/*
 + * Copyright 2026 The WordPlus RTC client authors
 + *
@@ -1798,6 +2455,8 @@ index 0000000..2f5d211
 +        var pub: Path?
 +        var sub: Path?
 +        var machine: Machine?
++        /// 1.0.10: the settings revision the client runs (`MeshSettings.rev`), in every report once it has settings
++        var cfg: Int64?
 +
 +        var isEmpty: Bool { self == Report() }
 +    }
@@ -2091,6 +2750,133 @@ index 0000000..2f5d211
 +    }
 +    #endif
 +}
+diff --git a/Sources/LiveKit/Mesh/MeshProbe.swift b/Sources/LiveKit/Mesh/MeshProbe.swift
+new file mode 100644
+index 0000000..9b74e64
+--- /dev/null
++++ b/Sources/LiveKit/Mesh/MeshProbe.swift
+@@ -0,0 +1,121 @@
++/*
++ * Copyright 2026 The WordPlus RTC client authors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import Foundation
++
++/// WordPlus Mesh (1.0.10): the round trip from this device to each region's node, measured in the background while the
++/// node's settings name the nodes (`MeshSettings.probe`, `probe.enabled`) and said on the next join (`mesh_rtt`), so
++/// the mesh can place the client in its fastest region rather than the region of the node DNS led it to. Never on a
++/// join's path: a join says what was measured before, for the network it is on, within `probe.cacheMin`.
++///
++/// Each node's `/mesh/ping` is asked once to open the connection, then `probe.samples` times on it, the fastest kept;
++/// one region after the other, so the measures don't crowd each other.
++actor MeshProbe {
++    static let shared = MeshProbe()
++
++    static let storeName = "wordplus-mesh-probe"
++
++    private var running: Task<Void, Never>?
++
++    private let session: URLSession = {
++        let configuration = URLSessionConfiguration.ephemeral
++        configuration.waitsForConnectivity = false
++        configuration.httpMaximumConnectionsPerHost = 1
++        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
++        return URLSession(configuration: configuration)
++    }()
++
++    /// The network a measure belongs to: the kind of interface the device uses now (Wi-Fi, cellular, wired), read from
++    /// the system's current path, as coarse as the browser's own key (its connection's type and effective type). Not its
++    /// address, which the path monitor learns a moment after it starts, so a measure and the join after it would name two.
++    nonisolated static func network() -> String {
++        ConnectivityListener.shared.activeInterfaceType().map { String(describing: $0) } ?? "none"
++    }
++
++    /// Measures the targets in the background, unless this network has a measure of the same regions that is still
++    /// fresh, or a measure runs already.
++    func measure(_ targets: [MeshProbeTarget], samples: Int, cacheMinutes: Int, defaults store: UserDefaults = .standard) {
++        guard !targets.isEmpty, running == nil else { return }
++        let network = Self.network()
++        let regions = Set(targets.map(\.region))
++        if let kept = Self.kept(network: network, defaults: store), Set(kept.keys) == regions { return }
++        let samples = min(max(samples, 1), 10)
++        running = Task { [session] in
++            var rtt: [String: Int] = [:]
++            for target in targets.prefix(16) {
++                if Task.isCancelled { break }
++                if let ms = await Self.roundTrip(to: target.url, samples: samples, session: session) { rtt[target.region] = ms }
++            }
++            if !rtt.isEmpty { Self.keep(rtt, network: network, minutes: cacheMinutes, defaults: store) }
++            self.done()
++        }
++    }
++
++    private func done() { running = nil }
++
++    /// The fastest of `samples` asks of the node's `/mesh/ping` on an open connection, whole ms from 1 to 5000; nil when
++    /// the node doesn't answer.
++    static func roundTrip(to origin: URL, samples: Int, session: URLSession) async -> Int? {
++        let url = origin.appendingPathComponent("mesh/ping")
++        let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 3)
++        guard (try? await session.data(for: request)) != nil else { return nil }
++        var best: TimeInterval?
++        for _ in 0 ..< samples {
++            let start = Date()
++            guard (try? await session.data(for: request)) != nil else { continue }
++            let took = Date().timeIntervalSince(start)
++            best = min(best ?? took, took)
++        }
++        return best.map { min(max(Int(($0 * 1000).rounded()), 1), 5000) }
++    }
++
++    /// What this network measured, by region, while fresh.
++    nonisolated static func kept(network: String, now: Date = Date(), defaults store: UserDefaults = .standard) -> [String: Int]? {
++        guard let all = store.dictionary(forKey: storeName), let entry = all[network] as? [String: Any],
++              let at = (entry["at"] as? NSNumber)?.doubleValue, let minutes = (entry["minutes"] as? NSNumber)?.doubleValue,
++              now.timeIntervalSince1970 - at <= minutes * 60, let rtt = entry["rtt"] as? [String: NSNumber] else { return nil }
++        return rtt.mapValues(\.intValue)
++    }
++
++    /// The newest measure still fresh, of whichever network.
++    nonisolated static func freshest(now: Date = Date(), defaults store: UserDefaults = .standard) -> [String: Int]? {
++        guard let all = store.dictionary(forKey: storeName) else { return nil }
++        return all.keys.compactMap { network -> (at: Double, rtt: [String: Int])? in
++            guard let rtt = kept(network: network, now: now, defaults: store),
++                  let at = ((all[network] as? [String: Any])?["at"] as? NSNumber)?.doubleValue else { return nil }
++            return (at, rtt)
++        }.max { $0.at < $1.at }?.rtt
++    }
++
++    nonisolated static func keep(_ rtt: [String: Int], network: String, minutes: Int, now: Date = Date(), defaults store: UserDefaults = .standard) {
++        var all = store.dictionary(forKey: storeName) ?? [:]
++        // only the networks measured within the day are kept beside this one
++        all = all.filter { (($0.value as? [String: Any])?["at"] as? NSNumber).map { now.timeIntervalSince1970 - $0.doubleValue < 86400 } ?? false }
++        all[network] = ["at": now.timeIntervalSince1970, "minutes": min(max(minutes, 1), 1440), "rtt": rtt]
++        store.set(all, forKey: storeName)
++    }
++
++    /// What a join says (`mesh_rtt`): this network's fresh measure, "fr:12,lim:18", nil without one. Before the system has
++    /// named the path ("none": a join right after the app starts, before the path monitor's first report), the freshest
++    /// measure of any network: the first join after a cold start named none otherwise.
++    nonisolated static func joinParam(network: String = network(), now: Date = Date(), defaults store: UserDefaults = .standard) -> String? {
++        let measured = kept(network: network, now: now, defaults: store) ?? (network == "none" ? freshest(now: now, defaults: store) : nil)
++        guard let rtt = measured, !rtt.isEmpty else { return nil }
++        return rtt.keys.sorted().prefix(16).compactMap { region in
++            MeshSettings.isRegionName(region) ? "\(region):\(min(max(rtt[region] ?? 0, 1), 5000))" : nil
++        }.joined(separator: ",")
++    }
++}
 diff --git a/Sources/LiveKit/Mesh/MeshReceivers.swift b/Sources/LiveKit/Mesh/MeshReceivers.swift
 new file mode 100644
 index 0000000..a6ea705
@@ -2375,12 +3161,528 @@ index 0000000..a6ea705
 +        return (s.values, s.timestampUs / 1000)
 +    }
 +}
+diff --git a/Sources/LiveKit/Mesh/MeshSettings.swift b/Sources/LiveKit/Mesh/MeshSettings.swift
+new file mode 100644
+index 0000000..64e2a2d
+--- /dev/null
++++ b/Sources/LiveKit/Mesh/MeshSettings.swift
+@@ -0,0 +1,373 @@
++/*
++ * Copyright 2026 The WordPlus RTC client authors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import Foundation
++
++// WordPlus Mesh (1.0.10): the settings a mesh node hands this client for its calls, from the mesh's settings document
++// (the mesh's pkg/clientsettings), so a product takes its numbers from the server and not from its own constants. They
++// come with the join response (field 1002) and again on a running call whenever they change (signal response field
++// 102), the same JSON: {"rev": 57, "applyNow": true, "set": {"camera.capHeight": 720}, "probe": [...]}. A client takes
++// each message whole: a setting the next one leaves out goes back to its default. Every value is checked again here,
++// against the schema compiled in (MeshSettingsSchema.swift, generated from the mesh's schema.json): a key this client
++// doesn't know is left out, a value of the wrong type is the key's default, a number outside its range is held to it.
++// The device's own rules (which codecs it can send, VP8 in an encrypted room) stay the product's, above every value.
++
++/// When a client takes a change of a setting: at once, at the next camera or screen turned on, at the next camera or
++/// microphone open, at the next connect, or at the next call.
++public enum MeshSettingClass: String, Sendable {
++    case live
++    case publish
++    case capture
++    case join
++    case room
++}
++
++enum MeshSettingType: Sendable {
++    case number
++    case int
++    case bool
++    case enumeration
++    case codecs
++    case codecRules
++    case layers
++    case ints
++}
++
++/// One key of the schema (generated into MeshSettingsSchema.keys).
++struct MeshSettingKey: Sendable {
++    let type: MeshSettingType
++    let keyClass: MeshSettingClass
++    let min: Double?
++    let max: Double?
++    let values: [String]?
++    let maxLength: Int
++    let defaultJSON: String
++}
++
++/// The schema the client was built with: the keys, generated from the mesh's schema.json, and each key's default read
++/// once from them.
++enum MeshSettingsSchema {
++    static let defaults: [String: MeshSettingValue] = {
++        var out: [String: MeshSettingValue] = [:]
++        for (name, key) in keys {
++            guard let data = key.defaultJSON.data(using: .utf8),
++                  let any = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]),
++                  let value = MeshSettings.check(any, as: key) else { continue }
++            out[name] = value
++        }
++        return out
++    }()
++}
++
++/// A camera ladder's layer: its height in lines, its bitrate and frame rate.
++public struct MeshLayer: Sendable, Hashable {
++    public let height: Int
++    public let kbps: Int
++    public let fps: Int
++
++    public init(height: Int, kbps: Int, fps: Int) {
++        self.height = height
++        self.kbps = kbps
++        self.fps = fps
++    }
++}
++
++/// One of `camera.codecRules`: the camera's codec list for the machines whose given fields all match.
++public struct MeshCodecRule: Sendable, Hashable {
++    public let os: String?
++    public let browser: String?
++    public let gpu: String?
++    public let device: String?
++    public let camera: [String]
++}
++
++/// A node to measure the round trip to (`probe`, while `probe.enabled` is on for this client): one a region.
++public struct MeshProbeTarget: Sendable, Hashable {
++    public let region: String
++    /// The node's origin over HTTP(S): its `/mesh/ping` is measured.
++    public let url: URL
++}
++
++/// A setting's value, as checked.
++public enum MeshSettingValue: Sendable, Hashable {
++    case number(Double)
++    case bool(Bool)
++    case word(String)
++    case names([String])
++    case numbers([Int])
++    case layers([MeshLayer])
++    case codecRules([MeshCodecRule])
++}
++
++/// The settings a mesh node sent this client last (`Room.meshSettings`), each value checked against the schema, and
++/// every key's default where the node set none.
++public struct MeshSettings: Sendable, Hashable {
++    /// The settings document's revision (0: the node holds none, and only overrides apply); the client reports it in
++    /// its health report (`cfg`).
++    public let rev: Int64
++    /// The revision's publish settings may reach a camera or screen already on, by a republish (`MeshSettings
++    /// .republishDelay`); without it they wait for its next turn on.
++    public let applyNow: Bool
++    /// What the node set, checked: the keys this client knows, with values their keys take.
++    public let values: [String: MeshSettingValue]
++    /// The nodes to measure the round trip to, one a region; empty unless `probe.enabled` is on for this client.
++    public let probe: [MeshProbeTarget]
++
++    /// No settings from any node: every key at its default.
++    public static let none = MeshSettings(rev: 0, applyNow: false, values: [:], probe: [])
++
++    public init(rev: Int64, applyNow: Bool, values: [String: MeshSettingValue], probe: [MeshProbeTarget]) {
++        self.rev = rev
++        self.applyNow = applyNow
++        self.values = values
++        self.probe = probe
++    }
++
++    /// Whether the node set the key (a key at its default is not set).
++    public func isSet(_ key: String) -> Bool { values[key] != nil }
++
++    /// A key's value: the node's, or its default; nil where the default is the client's own rule (null).
++    public func value(_ key: String) -> MeshSettingValue? { values[key] ?? MeshSettingsSchema.defaults[key] }
++
++    public func number(_ key: String) -> Double? {
++        if case let .number(v)? = value(key) { return v }
++        return nil
++    }
++
++    public func int(_ key: String) -> Int? { number(key).map { Int($0.rounded()) } }
++
++    public func bool(_ key: String) -> Bool? {
++        if case let .bool(v)? = value(key) { return v }
++        return nil
++    }
++
++    public func word(_ key: String) -> String? {
++        if case let .word(v)? = value(key) { return v }
++        return nil
++    }
++
++    public func names(_ key: String) -> [String]? {
++        if case let .names(v)? = value(key) { return v }
++        return nil
++    }
++
++    public func numbers(_ key: String) -> [Int]? {
++        if case let .numbers(v)? = value(key) { return v }
++        return nil
++    }
++
++    public func layers(_ key: String) -> [MeshLayer]? {
++        if case let .layers(v)? = value(key) { return v }
++        return nil
++    }
++
++    public func codecRules(_ key: String) -> [MeshCodecRule]? {
++        if case let .codecRules(v)? = value(key) { return v }
++        return nil
++    }
++
++    /// Whether the server speaks for the key: it set it, or a settings document is in use (`rev` above 0), in which a
++    /// key it doesn't set is the schema's default. Without either, a product keeps its own value for the key, so a
++    /// client on a node with no document behaves as it did before it read settings.
++    public func speaks(_ key: String) -> Bool { isSet(key) || rev > 0 }
++
++    /// The reconnect waits (`reconnect.delaysMs`) in seconds, for `ConnectOptions.meshReconnectDelays`.
++    public var reconnectDelays: [TimeInterval]? { numbers("reconnect.delaysMs").map { $0.map { Double($0) / 1000 } } }
++
++    /// When a client takes a change of the key; nil for a key this client doesn't know.
++    public static func keyClass(_ key: String) -> MeshSettingClass? { MeshSettingsSchema.keys[key]?.keyClass }
++
++    /// The keys whose value (the node's or the default) differs from `other`'s.
++    public func changed(from other: MeshSettings) -> Set<String> {
++        Set(values.keys).union(other.values.keys).filter { value($0) != other.value($0) }
++    }
++
++    /// The live caps over the camera's encodings (`camera.capHeight`, `camera.capFps`, `camera.capKbps`), 0 for none.
++    public var cameraCaps: MeshCaps {
++        MeshCaps(height: max(0, int("camera.capHeight") ?? 0), fps: max(0, int("camera.capFps") ?? 0), kbps: max(0, int("camera.capKbps") ?? 0))
++    }
++
++    /// The degradation preference a word of `camera.degradation` names, nil for `default` (the publish's own).
++    public static func degradation(_ word: String?) -> DegradationPreference? {
++        switch word {
++        case "balanced": .balanced
++        case "maintain-framerate": .maintainFramerate
++        case "maintain-resolution": .maintainResolution
++        default: nil
++        }
++    }
++
++    /// How long after a revision with `applyNow` this client re-publishes a camera or screen whose publish settings it
++    /// changed: a moment within 60 s by its identity's hash, so a room doesn't switch all at once.
++    public static func republishDelay(identity: String) -> TimeInterval {
++        var hash: UInt32 = 2_166_136_261
++        for byte in identity.utf8 {
++            hash ^= UInt32(byte)
++            hash = hash &* 16_777_619
++        }
++        return Double(hash % 60000) / 1000
++    }
++
++    // MARK: - Reading
++
++    /// The settings a message's JSON holds, each value checked; nil when it isn't settings at all.
++    public static func parse(_ data: Data) -> MeshSettings? {
++        guard data.count <= 512 * 1024,
++              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
++              let rev = (object["rev"] as? NSNumber).flatMap({ isBoolean($0) ? nil : $0 })?.int64Value else { return nil }
++        var values: [String: MeshSettingValue] = [:]
++        if let set = object["set"] as? [String: Any] {
++            for (name, raw) in set {
++                guard let key = MeshSettingsSchema.keys[name], let value = check(raw, as: key) else { continue }
++                values[name] = value
++            }
++        }
++        var probe: [MeshProbeTarget] = []
++        for entry in (object["probe"] as? [[String: Any]] ?? []).prefix(16) {
++            guard let region = entry["region"] as? String, isRegionName(region),
++                  let text = entry["url"] as? String, let url = probeOrigin(text) else { continue }
++            probe.append(MeshProbeTarget(region: region, url: url))
++        }
++        return MeshSettings(rev: max(0, rev), applyNow: jsonBoolean(object["applyNow"]) == true, values: values, probe: probe)
++    }
++
++    /// A value as its key takes it, or nil where it doesn't (the default then applies): numbers held to the range,
++    /// whole where the key wants whole, a word of the key's in its spelling, codecs the client knows.
++    static func check(_ raw: Any, as key: MeshSettingKey) -> MeshSettingValue? {
++        func number(_ any: Any) -> Double? {
++            guard let n = any as? NSNumber, !isBoolean(n) else { return nil }
++            let v = n.doubleValue
++            return v.isFinite ? v : nil
++        }
++        func held(_ v: Double, whole: Bool) -> Double {
++            var out = whole ? v.rounded() : v
++            if let lo = key.min { out = Swift.max(out, lo) }
++            if let hi = key.max { out = Swift.min(out, hi) }
++            return out
++        }
++        switch key.type {
++        case .number, .int:
++            return number(raw).map { .number(held($0, whole: key.type == .int)) }
++        case .bool:
++            return jsonBoolean(raw).map { .bool($0) }
++        case .enumeration:
++            guard let word = (raw as? String)?.trimmingCharacters(in: .whitespaces) else { return nil }
++            return key.values?.first { $0.caseInsensitiveCompare(word) == .orderedSame }.map { .word($0) }
++        case .codecs:
++            let list = codecs(raw)
++            return list.isEmpty ? nil : .names(list)
++        case .codecRules:
++            guard let list = raw as? [Any] else { return nil }
++            var rules: [MeshCodecRule] = []
++            for entry in list.prefix(16) {
++                guard let rule = entry as? [String: Any] else { continue }
++                let camera = codecs(rule["camera"] ?? [])
++                guard !camera.isEmpty else { continue }
++                func word(_ name: String) -> String? {
++                    (rule[name] as? String).map { $0.lowercased().trimmingCharacters(in: .whitespaces) }.flatMap { $0.isEmpty || $0.count > 16 ? nil : $0 }
++                }
++                rules.append(MeshCodecRule(os: word("os"), browser: word("browser"), gpu: word("gpu"), device: word("device"), camera: camera))
++            }
++            return .codecRules(rules)
++        case .layers:
++            guard let list = raw as? [Any], !list.isEmpty, key.maxLength == 0 || list.count <= key.maxLength else { return nil }
++            var layers: [MeshLayer] = []
++            for entry in list {
++                guard let layer = entry as? [String: Any], let h = layer["h"].flatMap(number), let kbps = layer["kbps"].flatMap(number),
++                      let fps = layer["fps"].flatMap(number) else { return nil }
++                let next = MeshLayer(height: Int(Swift.min(Swift.max(h.rounded(), 90), 2160)),
++                                     kbps: Int(Swift.min(Swift.max(kbps.rounded(), 30), 20000)),
++                                     fps: Int(Swift.min(Swift.max(fps.rounded(), 1), 60)))
++                if let last = layers.last, next.height <= last.height { return nil }
++                layers.append(next)
++            }
++            return .layers(layers)
++        case .ints:
++            guard let list = raw as? [Any], !list.isEmpty, key.maxLength == 0 || list.count <= key.maxLength else { return nil }
++            var out: [Int] = []
++            for entry in list {
++                guard let v = number(entry) else { return nil }
++                out.append(Int(held(v, whole: true)))
++            }
++            return .numbers(out)
++        }
++    }
++
++    /// 1 to 8 codecs the client knows (vp8, h264, h265, vp9, av1, each with :hw or not), in lower case, none twice.
++    static func codecs(_ raw: Any) -> [String] {
++        guard let list = raw as? [Any] else { return [] }
++        var out: [String] = []
++        for entry in list {
++            guard let text = entry as? String else { continue }
++            let name = text.lowercased().trimmingCharacters(in: .whitespaces)
++            let parts = name.split(separator: ":", omittingEmptySubsequences: false)
++            guard ["vp8", "h264", "h265", "vp9", "av1"].contains(String(parts[0])), parts.count == 1 || (parts.count == 2 && parts[1] == "hw"),
++                  !out.contains(name) else { continue }
++            out.append(name)
++            if out.count == 8 { break }
++        }
++        return out
++    }
++
++    static func isBoolean(_ n: NSNumber) -> Bool { CFGetTypeID(n) == CFBooleanGetTypeID() }
++
++    static func jsonBoolean(_ value: Any?) -> Bool? {
++        guard let n = value as? NSNumber, isBoolean(n) else { return nil }
++        return n.boolValue
++    }
++
++    static func isRegionName(_ s: String) -> Bool {
++        !s.isEmpty && s.count <= 40 && s.unicodeScalars.allSatisfy { ("a" ... "z").contains($0) || ("0" ... "9").contains($0) || $0 == "-" }
++    }
++
++    /// A probe target's origin over HTTP(S): a node's signal URL (wss://...) or its origin as given.
++    static func probeOrigin(_ text: String) -> URL? {
++        guard var components = URLComponents(string: text), let host = components.host, !host.isEmpty else { return nil }
++        switch components.scheme?.lowercased() {
++        case "wss", "https": components.scheme = "https"
++        case "ws", "http": components.scheme = "http"
++        default: return nil
++        }
++        components.path = ""
++        components.query = nil
++        components.fragment = nil
++        return components.url
++    }
++
++    // MARK: - Kept for the next connect
++
++    /// How old the settings kept for a server may be when the next connect takes them.
++    static let keptFor: TimeInterval = 7 * 24 * 3600
++
++    static func keptName(_ url: URL) -> String? {
++        url.host.map { "wordplus-mesh-settings:\($0.lowercased())" }
++    }
++
++    /// The settings this client last had from the server at `url`, at most 7 days old: what a product connects with,
++    /// for the settings of the join and room classes, which a connect can't take from a node it hasn't reached yet.
++    public static func cached(for url: URL, now: Date = Date(), defaults store: UserDefaults = .standard) -> MeshSettings? {
++        guard let name = keptName(url), let kept = store.dictionary(forKey: name),
++              let at = (kept["at"] as? NSNumber)?.doubleValue, now.timeIntervalSince1970 - at <= keptFor, at <= now.timeIntervalSince1970 + 60,
++              let text = kept["settings"] as? String, let data = text.data(using: .utf8) else { return nil }
++        return parse(data)
++    }
++
++    /// Keeps the settings the server at `url` sent, as it sent them.
++    static func keep(_ data: Data, for url: URL, now: Date = Date(), defaults store: UserDefaults = .standard) {
++        guard let name = keptName(url), let text = String(data: data, encoding: .utf8) else { return }
++        store.set(["at": now.timeIntervalSince1970, "settings": text], forKey: name)
++    }
++}
+diff --git a/Sources/LiveKit/Mesh/MeshSettingsSchema.swift b/Sources/LiveKit/Mesh/MeshSettingsSchema.swift
+new file mode 100644
+index 0000000..9da8446
+--- /dev/null
++++ b/Sources/LiveKit/Mesh/MeshSettingsSchema.swift
+@@ -0,0 +1,131 @@
++/*
++ * Copyright 2026 The WordPlus RTC client authors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// Generated from WordPlus Mesh's pkg/clientsettings/schema.json (version 1) by clients/settings-schema.mjs:
++// don't edit, regenerate.
++
++extension MeshSettingsSchema {
++    static let version = 1
++
++    static let keys: [String: MeshSettingKey] = [
++        "camera.codecs": MeshSettingKey(type: .codecs, keyClass: .publish, min: nil, max: nil, values: nil, maxLength: 0, defaultJSON: #"["h264:hw","vp8"]"#),
++        "camera.codecRules": MeshSettingKey(type: .codecRules, keyClass: .publish, min: nil, max: nil, values: nil, maxLength: 0, defaultJSON: #"null"#),
++        "camera.backup": MeshSettingKey(type: .enumeration, keyClass: .publish, min: nil, max: nil, values: ["vp8", "h264"], maxLength: 0, defaultJSON: #""vp8""#),
++        "screen.codecs": MeshSettingKey(type: .codecs, keyClass: .publish, min: nil, max: nil, values: nil, maxLength: 0, defaultJSON: #"null"#),
++        "check.enabled": MeshSettingKey(type: .bool, keyClass: .publish, min: nil, max: nil, values: nil, maxLength: 0, defaultJSON: #"true"#),
++        "adapt.enabled": MeshSettingKey(type: .bool, keyClass: .live, min: nil, max: nil, values: nil, maxLength: 0, defaultJSON: #"true"#),
++        "tune.checkMs": MeshSettingKey(type: .int, keyClass: .publish, min: 2000.0, max: 5000.0, values: nil, maxLength: 0, defaultJSON: #"4000"#),
++        "tune.passSent": MeshSettingKey(type: .number, keyClass: .publish, min: 0.3, max: 1.0, values: nil, maxLength: 0, defaultJSON: #"0.8"#),
++        "tune.passCpu": MeshSettingKey(type: .number, keyClass: .publish, min: 0.0, max: 1.0, values: nil, maxLength: 0, defaultJSON: #"0.5"#),
++        "tune.passEncode": MeshSettingKey(type: .number, keyClass: .publish, min: 0.1, max: 1.0, values: nil, maxLength: 0, defaultJSON: #"0.6"#),
++        "tune.dropWatchS": MeshSettingKey(type: .int, keyClass: .live, min: 10.0, max: 120.0, values: nil, maxLength: 0, defaultJSON: #"30"#),
++        "tune.cpuWatchS": MeshSettingKey(type: .int, keyClass: .live, min: 10.0, max: 120.0, values: nil, maxLength: 0, defaultJSON: #"20"#),
++        "tune.cpuShare": MeshSettingKey(type: .number, keyClass: .live, min: 0.1, max: 1.0, values: nil, maxLength: 0, defaultJSON: #"0.5"#),
++        "tune.switchesMax": MeshSettingKey(type: .int, keyClass: .live, min: 0.0, max: 3.0, values: nil, maxLength: 0, defaultJSON: #"2"#),
++        "tune.switchGapS": MeshSettingKey(type: .int, keyClass: .live, min: 30.0, max: 1800.0, values: nil, maxLength: 0, defaultJSON: #"120"#),
++        "tune.warmupS": MeshSettingKey(type: .int, keyClass: .live, min: 10.0, max: 300.0, values: nil, maxLength: 0, defaultJSON: #"30"#),
++        "tune.failsafeS": MeshSettingKey(type: .int, keyClass: .live, min: 3.0, max: 30.0, values: nil, maxLength: 0, defaultJSON: #"10"#),
++        "tune.republishTimeoutS": MeshSettingKey(type: .int, keyClass: .live, min: 3.0, max: 30.0, values: nil, maxLength: 0, defaultJSON: #"8"#),
++        "tune.rememberPassDays": MeshSettingKey(type: .int, keyClass: .live, min: 0.0, max: 90.0, values: nil, maxLength: 0, defaultJSON: #"30"#),
++        "tune.rememberDropsDays": MeshSettingKey(type: .int, keyClass: .live, min: 0.0, max: 90.0, values: nil, maxLength: 0, defaultJSON: #"30"#),
++        "tune.rememberCpuDays": MeshSettingKey(type: .int, keyClass: .live, min: 0.0, max: 90.0, values: nil, maxLength: 0, defaultJSON: #"7"#),
++        "tune.forgetBefore": MeshSettingKey(type: .int, keyClass: .live, min: 0.0, max: 4503599627370496.0, values: nil, maxLength: 0, defaultJSON: #"0"#),
++        "camera.ladder.1080": MeshSettingKey(type: .layers, keyClass: .publish, min: nil, max: nil, values: nil, maxLength: 3, defaultJSON: #"[{"h":270,"kbps":400,"fps":30},{"h":540,"kbps":1200,"fps":30}]"#),
++        "camera.ladder.720": MeshSettingKey(type: .layers, keyClass: .publish, min: nil, max: nil, values: nil, maxLength: 3, defaultJSON: #"[{"h":180,"kbps":200,"fps":30},{"h":360,"kbps":600,"fps":30}]"#),
++        "camera.topKbps.h264.1080": MeshSettingKey(type: .int, keyClass: .publish, min: 300.0, max: 20000.0, values: nil, maxLength: 0, defaultJSON: #"3500"#),
++        "camera.topKbps.h264.720": MeshSettingKey(type: .int, keyClass: .publish, min: 300.0, max: 20000.0, values: nil, maxLength: 0, defaultJSON: #"1800"#),
++        "camera.topKbps.vp8.1080": MeshSettingKey(type: .int, keyClass: .publish, min: 300.0, max: 20000.0, values: nil, maxLength: 0, defaultJSON: #"4000"#),
++        "camera.topKbps.vp8.720": MeshSettingKey(type: .int, keyClass: .publish, min: 300.0, max: 20000.0, values: nil, maxLength: 0, defaultJSON: #"2000"#),
++        "camera.topKbps.vp9.1080": MeshSettingKey(type: .int, keyClass: .publish, min: 300.0, max: 20000.0, values: nil, maxLength: 0, defaultJSON: #"2800"#),
++        "camera.topKbps.vp9.720": MeshSettingKey(type: .int, keyClass: .publish, min: 300.0, max: 20000.0, values: nil, maxLength: 0, defaultJSON: #"1400"#),
++        "camera.topKbps.av1.1080": MeshSettingKey(type: .int, keyClass: .publish, min: 300.0, max: 20000.0, values: nil, maxLength: 0, defaultJSON: #"2400"#),
++        "camera.topKbps.av1.720": MeshSettingKey(type: .int, keyClass: .publish, min: 300.0, max: 20000.0, values: nil, maxLength: 0, defaultJSON: #"1200"#),
++        "camera.topKbps.h265.1080": MeshSettingKey(type: .int, keyClass: .publish, min: 300.0, max: 20000.0, values: nil, maxLength: 0, defaultJSON: #"2500"#),
++        "camera.topKbps.h265.720": MeshSettingKey(type: .int, keyClass: .publish, min: 300.0, max: 20000.0, values: nil, maxLength: 0, defaultJSON: #"1300"#),
++        "camera.fps": MeshSettingKey(type: .int, keyClass: .publish, min: 5.0, max: 60.0, values: nil, maxLength: 0, defaultJSON: #"30"#),
++        "camera.svcMode": MeshSettingKey(type: .enumeration, keyClass: .publish, min: nil, max: nil, values: ["L3T3_KEY", "L3T3", "L2T3_KEY", "L2T2_KEY", "L1T3", "L1T2"], maxLength: 0, defaultJSON: #""L3T3_KEY""#),
++        "camera.svcTrim": MeshSettingKey(type: .bool, keyClass: .live, min: nil, max: nil, values: nil, maxLength: 0, defaultJSON: #"false"#),
++        "camera.maxHeight.hw": MeshSettingKey(type: .int, keyClass: .publish, min: 360.0, max: 2160.0, values: nil, maxLength: 0, defaultJSON: #"1080"#),
++        "camera.maxHeight.sw": MeshSettingKey(type: .int, keyClass: .publish, min: 360.0, max: 2160.0, values: nil, maxLength: 0, defaultJSON: #"720"#),
++        "camera.vp9FullHdAfterCheck": MeshSettingKey(type: .bool, keyClass: .publish, min: nil, max: nil, values: nil, maxLength: 0, defaultJSON: #"true"#),
++        "camera.captureHeight": MeshSettingKey(type: .int, keyClass: .capture, min: 360.0, max: 2160.0, values: nil, maxLength: 0, defaultJSON: #"1080"#),
++        "camera.captureFps": MeshSettingKey(type: .int, keyClass: .capture, min: 5.0, max: 60.0, values: nil, maxLength: 0, defaultJSON: #"30"#),
++        "camera.minFps": MeshSettingKey(type: .int, keyClass: .capture, min: 0.0, max: 60.0, values: nil, maxLength: 0, defaultJSON: #"24"#),
++        "camera.degradation": MeshSettingKey(type: .enumeration, keyClass: .live, min: nil, max: nil, values: ["default", "balanced", "maintain-framerate", "maintain-resolution"], maxLength: 0, defaultJSON: #""default""#),
++        "camera.capHeight": MeshSettingKey(type: .int, keyClass: .live, min: 0.0, max: 2160.0, values: nil, maxLength: 0, defaultJSON: #"0"#),
++        "camera.capFps": MeshSettingKey(type: .int, keyClass: .live, min: 0.0, max: 60.0, values: nil, maxLength: 0, defaultJSON: #"0"#),
++        "camera.capKbps": MeshSettingKey(type: .int, keyClass: .live, min: 0.0, max: 20000.0, values: nil, maxLength: 0, defaultJSON: #"0"#),
++        "screen.maxKbps": MeshSettingKey(type: .int, keyClass: .live, min: 500.0, max: 20000.0, values: nil, maxLength: 0, defaultJSON: #"10000"#),
++        "screen.fps": MeshSettingKey(type: .int, keyClass: .live, min: 1.0, max: 60.0, values: nil, maxLength: 0, defaultJSON: #"30"#),
++        "screen.contentHint": MeshSettingKey(type: .enumeration, keyClass: .live, min: nil, max: nil, values: ["motion", "detail", "text"], maxLength: 0, defaultJSON: #""motion""#),
++        "screen.degradation": MeshSettingKey(type: .enumeration, keyClass: .live, min: nil, max: nil, values: ["default", "balanced", "maintain-framerate", "maintain-resolution"], maxLength: 0, defaultJSON: #""maintain-resolution""#),
++        "screen.simulcastFromWidth": MeshSettingKey(type: .int, keyClass: .publish, min: 0.0, max: 7680.0, values: nil, maxLength: 0, defaultJSON: #"1280"#),
++        "screen.simulcastFromHeight": MeshSettingKey(type: .int, keyClass: .publish, min: 0.0, max: 4320.0, values: nil, maxLength: 0, defaultJSON: #"640"#),
++        "screen.lowLayerKbps": MeshSettingKey(type: .int, keyClass: .publish, min: 100.0, max: 10000.0, values: nil, maxLength: 0, defaultJSON: #"1500"#),
++        "screen.lowLayerFps": MeshSettingKey(type: .int, keyClass: .publish, min: 1.0, max: 60.0, values: nil, maxLength: 0, defaultJSON: #"15"#),
++        "screen.vp8Simulcast": MeshSettingKey(type: .bool, keyClass: .publish, min: nil, max: nil, values: nil, maxLength: 0, defaultJSON: #"false"#),
++        "screen.captureHeight": MeshSettingKey(type: .int, keyClass: .capture, min: 360.0, max: 2160.0, values: nil, maxLength: 0, defaultJSON: #"1080"#),
++        "screen.captureFps": MeshSettingKey(type: .int, keyClass: .capture, min: 5.0, max: 60.0, values: nil, maxLength: 0, defaultJSON: #"30"#),
++        "mic.kbps": MeshSettingKey(type: .int, keyClass: .publish, min: 16.0, max: 256.0, values: nil, maxLength: 0, defaultJSON: #"64"#),
++        "mic.red": MeshSettingKey(type: .bool, keyClass: .publish, min: nil, max: nil, values: nil, maxLength: 0, defaultJSON: #"true"#),
++        "mic.dtx": MeshSettingKey(type: .bool, keyClass: .publish, min: nil, max: nil, values: nil, maxLength: 0, defaultJSON: #"true"#),
++        "mic.echoCancellation": MeshSettingKey(type: .bool, keyClass: .capture, min: nil, max: nil, values: nil, maxLength: 0, defaultJSON: #"true"#),
++        "mic.noiseSuppression": MeshSettingKey(type: .bool, keyClass: .capture, min: nil, max: nil, values: nil, maxLength: 0, defaultJSON: #"true"#),
++        "mic.autoGainControl": MeshSettingKey(type: .bool, keyClass: .capture, min: nil, max: nil, values: nil, maxLength: 0, defaultJSON: #"true"#),
++        "mic.voiceIsolation": MeshSettingKey(type: .bool, keyClass: .capture, min: nil, max: nil, values: nil, maxLength: 0, defaultJSON: #"true"#),
++        "screenAudio.kbps": MeshSettingKey(type: .int, keyClass: .publish, min: 32.0, max: 320.0, values: nil, maxLength: 0, defaultJSON: #"128"#),
++        "view.pixelDensityMax": MeshSettingKey(type: .number, keyClass: .live, min: 1.0, max: 3.0, values: nil, maxLength: 0, defaultJSON: #"1.5"#),
++        "view.pauseHiddenAfterMs": MeshSettingKey(type: .int, keyClass: .live, min: 0.0, max: 60000.0, values: nil, maxLength: 0, defaultJSON: #"5000"#),
++        "view.hiddenKeepsLowest": MeshSettingKey(type: .bool, keyClass: .live, min: nil, max: nil, values: nil, maxLength: 0, defaultJSON: #"false"#),
++        "playout.jitterMs": MeshSettingKey(type: .int, keyClass: .live, min: 0.0, max: 2000.0, values: nil, maxLength: 0, defaultJSON: #"150"#),
++        "playout.tickMs": MeshSettingKey(type: .int, keyClass: .live, min: 500.0, max: 10000.0, values: nil, maxLength: 0, defaultJSON: #"2000"#),
++        "playout.slackMs": MeshSettingKey(type: .int, keyClass: .live, min: 0.0, max: 1000.0, values: nil, maxLength: 0, defaultJSON: #"100"#),
++        "playout.stepMs": MeshSettingKey(type: .int, keyClass: .live, min: 5.0, max: 500.0, values: nil, maxLength: 0, defaultJSON: #"20"#),
++        "playout.maxHoldMs": MeshSettingKey(type: .int, keyClass: .live, min: 0.0, max: 10000.0, values: nil, maxLength: 0, defaultJSON: #"4000"#),
++        "lipsync.toleranceMs": MeshSettingKey(type: .int, keyClass: .live, min: 0.0, max: 200.0, values: nil, maxLength: 0, defaultJSON: #"10"#),
++        "lipsync.samples": MeshSettingKey(type: .int, keyClass: .live, min: 1.0, max: 10.0, values: nil, maxLength: 0, defaultJSON: #"2"#),
++        "lipsync.gain": MeshSettingKey(type: .number, keyClass: .live, min: 0.1, max: 1.0, values: nil, maxLength: 0, defaultJSON: #"0.7"#),
++        "lipsync.maxStepMs": MeshSettingKey(type: .int, keyClass: .live, min: 5.0, max: 500.0, values: nil, maxLength: 0, defaultJSON: #"80"#),
++        "watch.everyMs": MeshSettingKey(type: .int, keyClass: .live, min: 1000.0, max: 60000.0, values: nil, maxLength: 0, defaultJSON: #"5000"#),
++        "watch.warmups": MeshSettingKey(type: .int, keyClass: .live, min: 0.0, max: 10.0, values: nil, maxLength: 0, defaultJSON: #"2"#),
++        "watch.dropShare": MeshSettingKey(type: .number, keyClass: .live, min: 0.1, max: 1.0, values: nil, maxLength: 0, defaultJSON: #"0.7"#),
++        "watch.minCapturedFps": MeshSettingKey(type: .int, keyClass: .live, min: 1.0, max: 60.0, values: nil, maxLength: 0, defaultJSON: #"5"#),
++        "watch.maxEncodeMs": MeshSettingKey(type: .int, keyClass: .live, min: 5.0, max: 200.0, values: nil, maxLength: 0, defaultJSON: #"25"#),
++        "watch.minTargetKbps": MeshSettingKey(type: .int, keyClass: .live, min: 0.0, max: 5000.0, values: nil, maxLength: 0, defaultJSON: #"100"#),
++        "watch.minSent": MeshSettingKey(type: .number, keyClass: .live, min: 0.0, max: 1.0, values: nil, maxLength: 0, defaultJSON: #"0.25"#),
++        "watch.idleEndMin": MeshSettingKey(type: .int, keyClass: .live, min: 1.0, max: 120.0, values: nil, maxLength: 0, defaultJSON: #"10"#),
++        "check.connectMs": MeshSettingKey(type: .int, keyClass: .publish, min: 500.0, max: 5000.0, values: nil, maxLength: 0, defaultJSON: #"1500"#),
++        "check.warmupMs": MeshSettingKey(type: .int, keyClass: .publish, min: 0.0, max: 2000.0, values: nil, maxLength: 0, defaultJSON: #"400"#),
++        "check.keepUpMs": MeshSettingKey(type: .int, keyClass: .publish, min: 0.0, max: 2000.0, values: nil, maxLength: 0, defaultJSON: #"500"#),
++        "check.windowMs": MeshSettingKey(type: .int, keyClass: .publish, min: 500.0, max: 5000.0, values: nil, maxLength: 0, defaultJSON: #"1200"#),
++        "check.minFrames": MeshSettingKey(type: .int, keyClass: .publish, min: 1.0, max: 60.0, values: nil, maxLength: 0, defaultJSON: #"6"#),
++        "check.bandwidthShare": MeshSettingKey(type: .number, keyClass: .publish, min: 0.1, max: 1.0, values: nil, maxLength: 0, defaultJSON: #"0.5"#),
++        "check.pollMs": MeshSettingKey(type: .int, keyClass: .publish, min: 20.0, max: 1000.0, values: nil, maxLength: 0, defaultJSON: #"100"#),
++        "check.headroom": MeshSettingKey(type: .number, keyClass: .publish, min: 0.1, max: 1.0, values: nil, maxLength: 0, defaultJSON: #"0.8"#),
++        "check.fallbackKbps": MeshSettingKey(type: .int, keyClass: .publish, min: 100.0, max: 10000.0, values: nil, maxLength: 0, defaultJSON: #"1500"#),
++        "connect.signalTimeoutMs": MeshSettingKey(type: .int, keyClass: .join, min: 5000.0, max: 60000.0, values: nil, maxLength: 0, defaultJSON: #"20000"#),
++        "connect.pcTimeoutMs": MeshSettingKey(type: .int, keyClass: .join, min: 5000.0, max: 60000.0, values: nil, maxLength: 0, defaultJSON: #"20000"#),
++        "connect.joinBudgetMs": MeshSettingKey(type: .int, keyClass: .join, min: 30000.0, max: 600000.0, values: nil, maxLength: 0, defaultJSON: #"300000"#),
++        "connect.giveUpMs": MeshSettingKey(type: .int, keyClass: .join, min: 5000.0, max: 120000.0, values: nil, maxLength: 0, defaultJSON: #"20000"#),
++        "reconnect.delaysMs": MeshSettingKey(type: .ints, keyClass: .join, min: 0.0, max: 60000.0, values: nil, maxLength: 20, defaultJSON: #"[0,300,1200,2700,4800,7000,7000,7000,7000,7000]"#),
++        "ice.transportPolicy": MeshSettingKey(type: .enumeration, keyClass: .join, min: nil, max: nil, values: ["all", "relay"], maxLength: 0, defaultJSON: #""all""#),
++        "reports.everyMs": MeshSettingKey(type: .int, keyClass: .live, min: 0.0, max: 600000.0, values: nil, maxLength: 0, defaultJSON: #"null"#),
++        "stats.everyMs": MeshSettingKey(type: .int, keyClass: .live, min: 1000.0, max: 60000.0, values: nil, maxLength: 0, defaultJSON: #"1900"#),
++        "probe.enabled": MeshSettingKey(type: .bool, keyClass: .live, min: nil, max: nil, values: nil, maxLength: 0, defaultJSON: #"false"#),
++        "probe.samples": MeshSettingKey(type: .int, keyClass: .live, min: 1.0, max: 10.0, values: nil, maxLength: 0, defaultJSON: #"3"#),
++        "probe.cacheMin": MeshSettingKey(type: .int, keyClass: .live, min: 1.0, max: 1440.0, values: nil, maxLength: 0, defaultJSON: #"20"#),
++    ]
++}
 diff --git a/Sources/LiveKit/Mesh/MeshStats.swift b/Sources/LiveKit/Mesh/MeshStats.swift
 new file mode 100644
-index 0000000..8540e9b
+index 0000000..8ddb24a
 --- /dev/null
 +++ b/Sources/LiveKit/Mesh/MeshStats.swift
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,155 @@
 +/*
 + * Copyright 2026 The WordPlus RTC client authors
 + *
@@ -2480,11 +3782,20 @@ index 0000000..8540e9b
 +        var readings: [ObjectIdentifier: Reading] = [:]
 +        /// gatherings made, for tests and the lab
 +        var reads = 0
++        /// 1.0.10: how old a reading may be, the settings' `stats.everyMs` (`MeshStats.readEvery` where they say none)
++        var every = MeshStats.readEvery
 +    }
 +
 +    private let _state = StateSync(State())
 +
 +    var reads: Int { _state.read { $0.reads } }
++
++    var every: TimeInterval { _state.read { $0.every } }
++
++    /// 1.0.10: the settings' pace for the readings, from their next one.
++    func setEvery(_ every: TimeInterval) {
++        _state.mutate { $0.every = max(0.5, every) }
++    }
 +
 +    /// The connection's stats as entries, read at most once every `MeshStats.readEvery`.
 +    func read(_ transport: Transport, now: Date = Date()) async -> [MeshEncoders.Stat] {
@@ -2495,11 +3806,12 @@ index 0000000..8540e9b
 +    /// else `gather`'s.
 +    func read(key: ObjectIdentifier, now: Date = Date(), gather: @escaping @Sendable () async -> [MeshEncoders.Stat]) async -> [MeshEncoders.Stat] {
 +        let task: Task<[MeshEncoders.Stat], Never> = _state.mutate {
-+            if let last = $0.readings[key], now.timeIntervalSince(last.at) < MeshStats.readEvery {
++            let every = $0.every
++            if let last = $0.readings[key], now.timeIntervalSince(last.at) < every {
 +                return last.task
 +            }
 +            // a connection gone (a full reconnect makes new ones) is forgotten with its reading
-+            $0.readings = $0.readings.filter { now.timeIntervalSince($0.value.at) < MeshStats.readEvery }
++            $0.readings = $0.readings.filter { now.timeIntervalSince($0.value.at) < every }
 +            let task = Task { await gather() }
 +            $0.readings[key] = Reading(at: now, task: task)
 +            $0.reads += 1
@@ -2526,12 +3838,149 @@ index 0000000..8540e9b
 +        _state.mutate { $0 = State() }
 +    }
 +}
+diff --git a/Sources/LiveKit/Mesh/MeshSvcTrim.swift b/Sources/LiveKit/Mesh/MeshSvcTrim.swift
+new file mode 100644
+index 0000000..861d5c9
+--- /dev/null
++++ b/Sources/LiveKit/Mesh/MeshSvcTrim.swift
+@@ -0,0 +1,131 @@
++/*
++ * Copyright 2026 The WordPlus RTC client authors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import Foundation
++
++internal import LiveKitWebRTC
++
++/// WordPlus Mesh (1.0.11): a camera sent as one SVC stream (VP9, AV1) sends only the sizes up to the largest its
++/// viewers ask for, while the node's settings say so (`camera.svcTrim`; better-messages-server infra/SVC-TRIM.md), as
++/// the browser client does (@wordplus/rtc-client 1.0.24): 360p asked of a 720p camera in L3T3_KEY sends L2T3_KEY of half
++/// the picture (180p and 360p), 180p sends L1T3 of a quarter. Each size keeps its height, so the node's layers still
++/// name it. A size nobody asks for can't flap with the upload's estimate (libwebrtc's SVC allocator turns a size off and
++/// on at one threshold, each time on a key frame of every size), and its bits go to the sizes watched. A mode whose
++/// trimmed form the SDK can't name (L3T3, L3T3_KEY_SHIFT) goes out whole, and so does a camera whose WebRTC keeps its
++/// mode. Turned off, the camera goes out whole again at once.
++enum MeshSvcTrim {
++    /// The mode and scale a camera's one encoding went out with before any trim: the publish's, under the live caps.
++    struct Whole: Equatable {
++        var mode: String
++        var scale: Double?
++    }
++
++    /// The mode and scale to send, from the whole one and the largest quality asked (low 0, medium 1, high 2).
++    struct Plan: Equatable {
++        var mode: String
++        var scale: Double?
++        var sizes: Int
++    }
++
++    private struct Entry {
++        var on = false
++        var refused = false
++        var whole: Whole?
++    }
++
++    private static let lock = NSLock()
++    nonisolated(unsafe) private static var table: [String: Entry] = [:]
++
++    private static func with<T>(_ sender: LKRTCRtpSender, _ body: (inout Entry) -> T) -> T {
++        let id = sender.senderId
++        lock.lock()
++        defer { lock.unlock() }
++        var entry = table[id] ?? Entry()
++        let out = body(&entry)
++        table[id] = entry.on || entry.whole != nil || entry.refused ? entry : nil
++        return out
++    }
++
++    /// Whether the settings trim this camera sender (the room sets it for its cameras alone).
++    static func set(on: Bool, for sender: LKRTCRtpSender) {
++        with(sender) { $0.on = on }
++    }
++
++    /// The live caps computed the camera's encodings again (`recomputeSenderParameters`): the whole one's scale is theirs.
++    static func rebase(_ sender: LKRTCRtpSender, scale: NSNumber?) {
++        with(sender) { entry in
++            if entry.whole != nil { entry.whole?.scale = scale?.doubleValue }
++        }
++    }
++
++    /// A mode's first `sizes` spatial layers, as the SDK names them; one size predicts across none, so L1T3 has no
++    /// suffix. Nil where the SDK has no name for it.
++    static func mode(_ whole: String, sizes: Int) -> String? {
++        guard let m = ScalabilityMode.fromString(whole) else { return nil }
++        if sizes >= m.spatial { return whole }
++        let temporal = whole.dropFirst(3).prefix(1)
++        let suffix = whole.dropFirst(4)
++        let name = sizes == 1 ? "L1T\(temporal)" : "L\(sizes)T\(temporal)\(suffix)"
++        return ScalabilityMode.fromString(name) != nil ? name : nil
++    }
++
++    /// What a camera sends for the largest quality asked: the sizes up to it, half the picture a size left out.
++    static func plan(_ whole: Whole, highest: Int) -> Plan? {
++        guard let m = ScalabilityMode.fromString(whole.mode) else { return nil }
++        let sizes = Swift.min(m.spatial, Swift.max(1, highest + 1))
++        guard sizes < m.spatial, let mode = mode(whole.mode, sizes: sizes) else {
++            return Plan(mode: whole.mode, scale: whole.scale, sizes: m.spatial)
++        }
++        // the trim's own scale, under a live cap's when that is smaller still (the browser client's order)
++        let scale = Swift.max(pow(2, Double(m.spatial - sizes)), whole.scale ?? 1)
++        return Plan(mode: mode, scale: scale, sizes: sizes)
++    }
++
++    /// The mode and scale a sender's one SVC encoding should go out in for the largest quality asked, nil to leave it as
++    /// it is: trimmed while on, and whole again once off after a trim.
++    static func encoding(for sender: LKRTCRtpSender, current: LKRTCRtpEncodingParameters, highest: Int) -> Plan? {
++        with(sender) { entry in
++            guard let mode = current.scalabilityMode else { return nil }
++            if !entry.on || entry.refused {
++                guard let whole = entry.whole else { return nil }
++                entry.whole = nil
++                return Plan(mode: whole.mode, scale: whole.scale, sizes: ScalabilityMode.fromString(whole.mode)?.spatial ?? 1)
++            }
++            let whole = entry.whole ?? Whole(mode: mode, scale: current.scaleResolutionDownBy?.doubleValue)
++            entry.whole = whole
++            return plan(whole, highest: highest)
++        }
++    }
++
++    /// After the change: a WebRTC that kept another mode than the one set sends this camera whole from then on. False
++    /// the first time, for the caller to set it whole; true once it is whole-only already, so nothing tries again.
++    static func check(_ sender: LKRTCRtpSender, asked: String) -> Bool {
++        let kept = sender.parameters.encodings.first?.scalabilityMode
++        guard let kept, kept != asked else { return true }
++        return with(sender) { entry in
++            if entry.refused { return true }
++            entry.refused = true
++            return false
++        }
++    }
++
++    /// The mode a sender's one SVC encoding goes out in now, for the encoder report; nil for simulcast.
++    static func sentMode(_ sender: LKRTCRtpSender) -> String? {
++        let encodings = sender.parameters.encodings
++        guard encodings.count == 1, let mode = encodings[0].scalabilityMode, ScalabilityMode.fromString(mode) != nil else { return nil }
++        return mode
++    }
++}
 diff --git a/Sources/LiveKit/Mesh/WordPlusMesh.swift b/Sources/LiveKit/Mesh/WordPlusMesh.swift
 new file mode 100644
-index 0000000..14f65fb
+index 0000000..13ddd01
 --- /dev/null
 +++ b/Sources/LiveKit/Mesh/WordPlusMesh.swift
-@@ -0,0 +1,437 @@
+@@ -0,0 +1,482 @@
 +/*
 + * Copyright 2026 The WordPlus RTC client authors
 + *
@@ -2769,13 +4218,54 @@ index 0000000..14f65fb
 +    /// The WordPlus RTC client for Swift's own version, which a mesh node is told on each join (`rtc_client`) beside
 +    /// upstream's, which the client reports as its SDK's and servers gate protocol features on. build.sh refuses a
 +    /// patch whose version here isn't the one its revisions list.
-+    static let clientVersion = "1.0.9"
++    static let clientVersion = "1.0.15"
 +
 +    /// What this client can do beyond upstream's, which a mesh node is told on each join (`mesh_caps`, 1.0.3, as
 +    /// rtc-client 1.0.7 and 1.0.8): it stops sending an audio track nobody hears when its node says so
-+    /// (`LocalAudioTrack.setMeshHeard`), and its room hands the node's codec policy to the product
-+    /// (`Room.meshCodecPolicy`).
-+    static let caps = "audio-pause,codec-policy"
++    /// (`LocalAudioTrack.setMeshHeard`), its room hands the node's codec policy to the product
++    /// (`Room.meshCodecPolicy`), since 1.0.10 it reads its settings (`Room.meshSettings`, fields 1002 and 102), and
++    /// since 1.0.13 which tracks stopped reaching its node (`Room.meshSourcesDry`, field 103).
++    static let caps = "audio-pause,codec-policy,settings,source-dry"
++
++    /// The signal response field a node tells a viewer in which of the tracks it subscribes to have stopped reaching the
++    /// node (1.0.13, rtc-client 1.0.25): JSON, `{"dry": ["TR_..."]}`, its whole list each time, empty when none has.
++    static let sourcesDryField: UInt64 = 103
++
++    /// The tracks a signal response says stopped reaching the node (`sourcesDryField`); nil when the message is another.
++    static func sourcesDry(inSignalMessage data: Data) -> Set<String>? {
++        guard let raw = lengthDelimitedField(sourcesDryField, in: data),
++              let object = try? JSONSerialization.jsonObject(with: raw) as? [String: Any],
++              let dry = object["dry"] as? [Any] else { return nil }
++        return Set(dry.compactMap { $0 as? String })
++    }
++
++    /// The join response field a node sends a client its settings in (1.0.10, WordPlus Mesh's client settings): JSON,
++    /// `MeshSettings`. LiveKit's JoinResponse has no field of that number; 1001 is the codec policy.
++    static let settingsJoinField: UInt64 = 1002
++
++    /// The signal response field a node sends a client its settings in on a running call, whenever they change (1.0.10):
++    /// the same JSON. 100 is the region list, 101 the report pace.
++    static let settingsField: UInt64 = 102
++
++    /// The wait before a reconnect attempt from the settings' list (`ConnectOptions.meshReconnectDelays`): the
++    /// attempt's own, the last one's past the list, with up to a tenth of jitter, as the curve has.
++    @Sendable
++    static func reconnectDelay(forAttempt attempt: Int, delays: [TimeInterval]) -> TimeInterval {
++        guard let delay = delays[safe: attempt] ?? delays.last else { return 0 }
++        return delay + Double.random(in: 0 ..< 0.1) * delay
++    }
++
++    /// The settings a signal message carrying a join response has (its `join`, field 1, then `settingsJoinField` in it),
++    /// as JSON, if any.
++    static func settingsJSON(inJoinMessage data: Data) -> Data? {
++        lengthDelimitedField(1, in: data).flatMap { lengthDelimitedField(settingsJoinField, in: $0) }
++    }
++
++    /// The settings a signal response sends on a running call (`settingsField`), as JSON; nil when the message is
++    /// another.
++    static func settingsJSON(inSignalMessage data: Data) -> Data? {
++        lengthDelimitedField(settingsField, in: data)
++    }
 +
 +    /// What a join to a mesh's server says beside upstream's parameters (upstream already names the network's type,
 +    /// `network`):
@@ -2802,6 +4292,10 @@ index 0000000..14f65fb
 +        }
 +        if let device = deviceType() {
 +            items.append(URLQueryItem(name: "device_type", value: device))
++        }
++        // 1.0.10: the round trips to each region this network measured lately (MeshProbe), for the mesh's placement
++        if let rtt = MeshProbe.joinParam() {
++            items.append(URLQueryItem(name: "mesh_rtt", value: rtt))
 +        }
 +        if url.isMeshWait {
 +            items.append(URLQueryItem(name: "mesh_wait", value: "1"))
@@ -2970,16 +4464,148 @@ index 0000000..14f65fb
 +    }
 +}
 diff --git a/Sources/LiveKit/Participant/LocalParticipant.swift b/Sources/LiveKit/Participant/LocalParticipant.swift
-index 50ff094..13cb849 100644
+index 50ff094..4471ca9 100644
 --- a/Sources/LiveKit/Participant/LocalParticipant.swift
 +++ b/Sources/LiveKit/Participant/LocalParticipant.swift
-@@ -959,6 +959,11 @@ extension LocalParticipant {
+@@ -251,6 +251,96 @@ public class LocalParticipant: Participant, @unchecked Sendable {
+         sender.raw._set(subscribedQualities: merged)
+     }
+ 
++    /// WordPlus Mesh (1.0.10): holds every camera this participant publishes to the live caps its settings hold now
++    /// (`MeshCaps`), on its running sender: its encodings computed again from its options and dimensions under the
++    /// caps, then dynacast's last state on top, so a layer nobody watches stays paused and one the caps turned off stays
++    /// off. Caps lifted, the camera goes back to what its options compute.
++    func applyMeshCaps() async {
++        guard let room = _room else { return }
++        let caps = room.cameraCaps
++        for publication in localVideoTracks where publication.source == .camera {
++            guard let track = publication.track as? LocalVideoTrack else { continue }
++            let (qualities, backups, qualitiesForCodec) = track._state.read { ($0.subscribedQualities, $0.rtpSenderForCodec, $0.subscribedQualitiesForCodec) }
++            let publishOptions = (track.publishOptions as? VideoPublishOptions) ?? room._state.roomOptions.defaultVideoPublishOptions
++            await RTC.run {
++                publication.recomputeSenderParameters()
++                if !qualities.isEmpty, let sender = track._state.rtpSender {
++                    sender.raw._set(subscribedQualities: qualities)
++                }
++                // a backup codec's sender, for the viewers that decode none of the camera's codec, under the same caps
++                guard let dimensions = track.capturer.dimensions else { return }
++                for (codec, sender) in backups {
++                    let encodings = Utils.computeVideoEncodings(dimensions: dimensions, publishOptions: publishOptions, isScreenShare: false, overrideVideoCodec: codec)
++                    MeshCappedLayers.set(caps.apply(to: encodings, lines: Int(min(dimensions.width, dimensions.height))), for: sender.raw)
++                    let parameters = sender.raw.parameters
++                    for current in parameters.encodings {
++                        guard let updated = encodings.first(where: { $0.rid == current.rid }) else { continue }
++                        current.isActive = updated.isActive
++                        current.scaleResolutionDownBy = updated.scaleResolutionDownBy
++                        current.maxBitrateBps = updated.maxBitrateBps
++                        current.maxFramerate = updated.maxFramerate
++                    }
++                    sender.raw.parameters = parameters
++                    if let codecQualities = qualitiesForCodec[codec], !codecQualities.isEmpty {
++                        sender.raw._set(subscribedQualities: codecQualities)
++                    }
++                }
++            }
++        }
++    }
++
++    /// WordPlus Mesh (1.0.11): whether every camera this participant publishes in one SVC stream sends only the sizes
++    /// its viewers ask for (`camera.svcTrim`, MeshSvcTrim), on its running sender: dynacast's last state given again,
++    /// trimmed or whole.
++    func applyMeshSvcTrim() async {
++        guard let room = _room else { return }
++        let on = room.meshSettings.bool("camera.svcTrim") == true
++        for publication in localVideoTracks where publication.source == .camera {
++            guard let track = publication.track as? LocalVideoTrack else { continue }
++            let (qualities, sender) = track._state.read { ($0.subscribedQualities, $0.rtpSender) }
++            guard let sender else { continue }
++            await RTC.run {
++                MeshSvcTrim.set(on: on, for: sender.raw)
++                if !qualities.isEmpty {
++                    sender.raw._set(subscribedQualities: qualities)
++                }
++            }
++        }
++    }
++
++    /// WordPlus Mesh (1.0.10): what the encoder of a running camera gives up first, as the settings say it
++    /// (`camera.degradation`), on its sender and its backups' at once: the settings' word where they set one, what the
++    /// camera was published with where they don't (or say `default`).
++    func applyMeshDegradation() async {
++        guard let room = _room else { return }
++        let settings = room.meshSettings
++        let word = settings.isSet("camera.degradation") ? settings.word("camera.degradation") : nil
++        for publication in localVideoTracks where publication.source == .camera {
++            guard let track = publication.track as? LocalVideoTrack else { continue }
++            let publishOptions = (track.publishOptions as? VideoPublishOptions) ?? room._state.roomOptions.defaultVideoPublishOptions
++            let preference = MeshSettings.degradation(word) ?? publishOptions.degradationPreference
++            let resolved = preference.resolve(for: track.source)
++            let senders = track._state.read { state in [state.rtpSender].compactMap { $0 } + Array(state.rtpSenderForCodec.values) }
++            await RTC.run {
++                for sender in senders {
++                    sender.raw.set(degradationPreference: resolved)
++                }
++            }
++        }
++    }
++
++    /// WordPlus Mesh (1.0.10): the same video track out again with other publish options, the track kept running in
++    /// between: a settings revision with `applyNow` moves a shared screen to its new shape without the person starting
++    /// the broadcast again, which unpublishing (it stops the track) would take.
++    @discardableResult
++    public func republish(publication: LocalTrackPublication, options: VideoPublishOptions) async throws -> LocalTrackPublication {
++        guard let track = publication.track as? LocalVideoTrack else {
++            throw LiveKitError(.invalidState, message: "republish takes a published video track")
++        }
++        try await _unpublish(publication: publication, notify: true, stopTrack: false)
++        return try await publish(videoTrack: track, options: options)
++    }
++
+     /// Re-applies the last known dynacast state to every local video sender.
+     ///
+     /// Applying a publisher answer re-enables every encoding, and the server only ever reports
+@@ -880,11 +970,16 @@ extension LocalParticipant {
+                 ? Transport.startBitrateKbps(for: sendEncodings, isScreenShare: track.source == .screenShareVideo)
+                 : nil
+ 
++            // WordPlus Mesh (1.0.15): audio the server may ask again for what its upload lost (`AudioPublishOptions.resend`)
++            let resendAudio = (track is LocalAudioTrack)
++                && ((options as? AudioPublishOptions) ?? room._state.roomOptions.defaultAudioPublishOptions).resend
++
+             let negotiateFunc: @Sendable () async throws -> Void = {
+                 let sender = try await RTC.run {
+                     let transceiver = try publisher.addTransceiver(with: track.mediaTrack.raw,
+                                                                    transceiverInit: transInit,
+-                                                                   startBitrateKbps: startBitrateKbps)
++                                                                   startBitrateKbps: startBitrateKbps,
++                                                                   resendAudio: resendAudio)
+ 
+                     if track is LocalVideoTrack {
+                         let publishOptions = (options as? VideoPublishOptions) ?? room._state.roomOptions.defaultVideoPublishOptions
+@@ -959,6 +1054,28 @@ extension LocalParticipant {
                  $0.room?(room, participant: self, didPublishTrack: publication)
              }
  
 +            // WordPlus Mesh (1.0.3): a new video's encoders are told once they run, not at the next reading
 +            if track is LocalVideoTrack {
 +                room._meshEncoders.reportSoon(room)
++            }
++
++            // WordPlus Mesh (1.0.10): a camera goes out under the live caps its settings hold now
++            if track.source == .camera, !room.cameraCaps.isEmpty {
++                await applyMeshCaps()
++            }
++            // and what its encoder gives up first, where the settings set it
++            if track.source == .camera, room.meshSettings.isSet("camera.degradation") {
++                await applyMeshDegradation()
++            }
++            // 1.0.11: and its SVC sizes trimmed to its viewers, where the settings say so
++            if track.source == .camera, room.meshSettings.bool("camera.svcTrim") == true {
++                await applyMeshSvcTrim()
++            }
++            // the hardware-drop watch, ended after a while without a camera, watches this one
++            if track.source == .camera {
++                room._meshHardwareDrops.start(room)
 +            }
 +
              log("[publish] success \(publication)", .info)
@@ -3007,11 +4633,46 @@ index 170ccfe..fd95401 100644
      }
  
      let _state: StateSync<State>
+diff --git a/Sources/LiveKit/Participant/RemoteParticipant.swift b/Sources/LiveKit/Participant/RemoteParticipant.swift
+index 7dee9cd..7f419b7 100644
+--- a/Sources/LiveKit/Participant/RemoteParticipant.swift
++++ b/Sources/LiveKit/Participant/RemoteParticipant.swift
+@@ -28,9 +28,30 @@ public class RemoteParticipant: Participant, @unchecked Sendable {
+         _state.dataTracks.reduce(into: [:]) { $0[$1.name] = $1 }
+     }
+ 
++    /// WordPlus Mesh (1.0.14): whether this person's first info has been read, what they join with being no change.
++    private let _joined = StateSync(false)
++
+     init(info: Livekit_ParticipantInfo, room: Room, connectionState: ConnectionState) {
+         super.init(room: room, sid: Participant.Sid(from: info.sid), identity: Participant.Identity(from: info.identity))
+         set(info: info, connectionState: connectionState)
++        _joined.mutate { $0 = true }
++    }
++
++    /// WordPlus Mesh (1.0.14): what someone else may do, told as it changes, as a browser's client tells it. Stock tells
++    /// it of the local participant alone, so an app only learned that a host let someone speak once they sent something.
++    override func set(permissions newValue: ParticipantPermissions) -> Bool {
++        let didUpdate = super.set(permissions: newValue)
++
++        if didUpdate, _joined.read({ $0 }), let room = _room {
++            delegates.notify(label: { "participant.didUpdatePermissions: \(newValue)" }) {
++                $0.participant?(self, didUpdatePermissions: newValue)
++            }
++            room.delegates.notify(label: { "room.didUpdatePermissions: \(newValue)" }) {
++                $0.room?(room, participant: self, didUpdatePermissions: newValue)
++            }
++        }
++
++        return didUpdate
+     }
+ 
+     /// Adds the track, returning `false` if this exact track is already attached. Identity-based
 diff --git a/Sources/LiveKit/Protocols/SignalClientDelegate.swift b/Sources/LiveKit/Protocols/SignalClientDelegate.swift
-index 14c5508..7cd5cff 100644
+index 14c5508..4a3bad4 100644
 --- a/Sources/LiveKit/Protocols/SignalClientDelegate.swift
 +++ b/Sources/LiveKit/Protocols/SignalClientDelegate.swift
-@@ -41,4 +41,18 @@ protocol SignalClientDelegate: AnyObject, Sendable {
+@@ -41,4 +41,24 @@ protocol SignalClientDelegate: AnyObject, Sendable {
      func signalClient(_ signalClient: SignalClient, didSubscribeTrack trackSid: Track.Sid) async
      func signalClient(_ signalClient: SignalClient, didReceiveMediaSectionsRequirement requirement: Livekit_MediaSectionsRequirement) async
      func signalClient(_ signalClient: SignalClient, didReceiveDataTrackResponse data: Data) async
@@ -3021,6 +4682,10 @@ index 14c5508..7cd5cff 100644
 +    func signalClient(_ signalClient: SignalClient, didUpdateSubscribedAudioCodecs codecs: [Livekit_SubscribedAudioCodec], forTrackSid sid: String) async
 +    /// WordPlus Mesh (1.0.7): how often the node asks for the reports, ms (0: none).
 +    func signalClient(_ signalClient: SignalClient, didReceiveMeshReportPace every: Int) async
++    /// WordPlus Mesh (1.0.10): the client's settings on a running call, their JSON as the node sent it.
++    func signalClient(_ signalClient: SignalClient, didReceiveMeshSettings settings: Data) async
++    /// WordPlus Mesh (1.0.13): the tracks it subscribes to that stopped reaching its node, their whole list.
++    func signalClient(_ signalClient: SignalClient, didReceiveMeshSourcesDry dry: Set<String>) async
 +}
 +
 +/// WordPlus Mesh (1.0.7): the mesh's messages are the room's alone; any other delegate (upstream's test doubles among
@@ -3029,6 +4694,8 @@ index 14c5508..7cd5cff 100644
 +    func signalClient(_: SignalClient, didReceiveMeshRegions _: [RegionInfo]) async {}
 +    func signalClient(_: SignalClient, didUpdateSubscribedAudioCodecs _: [Livekit_SubscribedAudioCodec], forTrackSid _: String) async {}
 +    func signalClient(_: SignalClient, didReceiveMeshReportPace _: Int) async {}
++    func signalClient(_: SignalClient, didReceiveMeshSettings _: Data) async {}
++    func signalClient(_: SignalClient, didReceiveMeshSourcesDry _: Set<String>) async {}
  }
 diff --git a/Sources/LiveKit/Support/Network/HTTP.swift b/Sources/LiveKit/Support/Network/HTTP.swift
 index fd854e6..8fd4db0 100644
@@ -3083,6 +4750,36 @@ index c976661..cc99558 100644
          request.addValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
  
          #if targetEnvironment(simulator)
+diff --git a/Sources/LiveKit/Support/Schedulers/QueueActor.swift b/Sources/LiveKit/Support/Schedulers/QueueActor.swift
+index 02c5d0c..dc0b11e 100644
+--- a/Sources/LiveKit/Support/Schedulers/QueueActor.swift
++++ b/Sources/LiveKit/Support/Schedulers/QueueActor.swift
+@@ -55,6 +55,9 @@ actor QueueActor<T: Sendable>: Loggable {
+             await onProcess(value)
+         } else if elseEnqueue {
+             queue.append(value)
++        } else {
++            // WordPlus Mesh (1.0.14): a dropped request explains a failure seen long after.
++            log("Dropped while suspended: \(type(of: value))", .warning)
+         }
+     }
+ 
+diff --git a/Sources/LiveKit/Support/Utils+VideoEncodings.swift b/Sources/LiveKit/Support/Utils+VideoEncodings.swift
+index 82efab4..35e1449 100644
+--- a/Sources/LiveKit/Support/Utils+VideoEncodings.swift
++++ b/Sources/LiveKit/Support/Utils+VideoEncodings.swift
+@@ -32,8 +32,9 @@ extension Utils {
+         if let videoCodec, videoCodec.isSVC {
+             // SVC mode
+             log("Using SVC mode")
+-            // VP9/AV1 with screen sharing requires single spatial layer
+-            return [RTC.createRtpEncodingParameters(encoding: encoding, scalabilityMode: isScreenShare ? .L1T3 : .L3T3_KEY)]
++            // VP9/AV1 with screen sharing requires single spatial layer; a camera's as its options say (WordPlus Mesh
++            // 1.0.10, the settings' `camera.svcMode`), L3T3_KEY where they say none
++            return [RTC.createRtpEncodingParameters(encoding: encoding, scalabilityMode: isScreenShare ? .L1T3 : (publishOptions.scalabilityMode ?? .L3T3_KEY))]
+         } else if !publishOptions.simulcast {
+             // Not-simulcast mode
+             log("Simulcast not enabled")
 diff --git a/Sources/LiveKit/Support/Utils.swift b/Sources/LiveKit/Support/Utils.swift
 index 9fc3d9e..4fb768c 100644
 --- a/Sources/LiveKit/Support/Utils.swift
@@ -3107,10 +4804,33 @@ index 9fc3d9e..4fb768c 100644
          guard let result = builder.url else {
              throw LiveKitError(.failedToParseUrl)
 diff --git a/Sources/LiveKit/Track/Local/LocalAudioTrack.swift b/Sources/LiveKit/Track/Local/LocalAudioTrack.swift
-index d92e42f..58b0d2e 100644
+index d92e42f..06e1705 100644
 --- a/Sources/LiveKit/Track/Local/LocalAudioTrack.swift
 +++ b/Sources/LiveKit/Track/Local/LocalAudioTrack.swift
-@@ -164,6 +164,27 @@ public class LocalAudioTrack: Track, LocalTrackProtocol, AudioTrackProtocol, @un
+@@ -139,6 +139,22 @@ public class LocalAudioTrack: Track, LocalTrackProtocol, AudioTrackProtocol, @un
+         return result
+     }
+ 
++    /// WordPlus Mesh (1.0.12; a browser's product sets it on the sender itself, as `watchRoomMic` in
++    /// @wordplus/realtime-client does): what this track may spend from now on, in bits per second, as a product's
++    /// microphone ceiling on a slow upload asks. It renegotiates nothing, and the track and whether it is sent stay as
++    /// they are. On upstream 2.18's RTC executor, where its WebRTC objects are read and written.
++    public func setMeshMaxBitrate(_ bitrate: Int) async {
++        guard let sender = _state.read({ $0.rtpSender }) else { return }
++        await RTC.run {
++            let parameters = sender.raw.parameters
++            guard !parameters.encodings.isEmpty, parameters.encodings.contains(where: { $0.maxBitrateBps?.intValue != bitrate }) else { return }
++            for encoding in parameters.encodings {
++                encoding.maxBitrateBps = NSNumber(value: bitrate)
++            }
++            sender.raw.parameters = parameters
++        }
++    }
++
+     // MARK: - Internal
+ 
+     override func startCapture() async throws {
+@@ -164,6 +180,27 @@ public class LocalAudioTrack: Track, LocalTrackProtocol, AudioTrackProtocol, @un
      override func stopCapture() async throws {
          cleanUpFrameWatcher()
      }
@@ -3138,6 +4858,28 @@ index d92e42f..58b0d2e 100644
  }
  
  public extension LocalAudioTrack {
+diff --git a/Sources/LiveKit/TrackPublications/LocalTrackPublication.swift b/Sources/LiveKit/TrackPublications/LocalTrackPublication.swift
+index 245b25d..be64153 100644
+--- a/Sources/LiveKit/TrackPublications/LocalTrackPublication.swift
++++ b/Sources/LiveKit/TrackPublications/LocalTrackPublication.swift
+@@ -191,6 +191,17 @@ extension LocalTrackPublication {
+                                                     publishOptions: publishOptions,
+                                                     isScreenShare: track.source == .screenShareVideo)
+ 
++        // WordPlus Mesh (1.0.10): a camera's live caps from its settings hold over what its options compute
++        if track.source == .camera {
++            let off = room.cameraCaps.apply(to: encodings, lines: Int(min(dimensions.width, dimensions.height)))
++            MeshCappedLayers.set(off, for: sender.raw)
++            // 1.0.11: a camera in one SVC stream goes out whole under them, and a trim (MeshSvcTrim) over that, which
++            // dynacast's state applied after this gives back
++            if encodings.count == 1 {
++                MeshSvcTrim.rebase(sender.raw, scale: encodings[0].scaleResolutionDownBy)
++            }
++        }
++
+         log("Computed encodings: \(encodings)")
+ 
+         for current in parameters.encodings {
 diff --git a/Sources/LiveKit/TrackPublications/RemoteTrackPublication.swift b/Sources/LiveKit/TrackPublications/RemoteTrackPublication.swift
 index f44bc6d..7279b32 100644
 --- a/Sources/LiveKit/TrackPublications/RemoteTrackPublication.swift
@@ -3178,11 +4920,71 @@ index f44bc6d..7279b32 100644
          } catch {
              // Revert track settings on failure
              _state.mutate {
+diff --git a/Sources/LiveKit/Types/Options/AudioPublishOptions.swift b/Sources/LiveKit/Types/Options/AudioPublishOptions.swift
+index b7eb30f..06beb1d 100644
+--- a/Sources/LiveKit/Types/Options/AudioPublishOptions.swift
++++ b/Sources/LiveKit/Types/Options/AudioPublishOptions.swift
+@@ -31,12 +31,20 @@ public final class AudioPublishOptions: NSObject, TrackPublishOptions, Sendable
+ 
+     public let preConnect: Bool
+ 
++    /// WordPlus Mesh (1.0.15, rtc-client 1.0.27's `resend`): the server may ask this track again for what its upload
++    /// lost, in RED too. The offers sent list `nack` for its Opus (`Transport.listAudioNack`), which a mesh node
++    /// answers whatever its own rule for RED; another server ignores the line. Off by default: a microphone in RED
++    /// isn't asked again, as what was sent again on a narrow upload once took the camera's room. For a product whose
++    /// engine makes that room.
++    public let resend: Bool
++
+     public init(name: String? = nil,
+                 encoding: AudioEncoding? = nil,
+                 dtx: Bool = true,
+                 red: Bool = true,
+                 streamName: String? = nil,
+-                preConnect: Bool = false)
++                preConnect: Bool = false,
++                resend: Bool = false)
+     {
+         self.name = name
+         self.encoding = encoding
+@@ -44,6 +52,7 @@ public final class AudioPublishOptions: NSObject, TrackPublishOptions, Sendable
+         self.red = red
+         self.streamName = streamName
+         self.preConnect = preConnect
++        self.resend = resend
+     }
+ 
+     // MARK: - Equal
+@@ -55,7 +64,8 @@ public final class AudioPublishOptions: NSObject, TrackPublishOptions, Sendable
+             dtx == other.dtx &&
+             red == other.red &&
+             streamName == other.streamName &&
+-            preConnect == other.preConnect
++            preConnect == other.preConnect &&
++            resend == other.resend
+     }
+ 
+     override public var hash: Int {
+@@ -66,6 +76,7 @@ public final class AudioPublishOptions: NSObject, TrackPublishOptions, Sendable
+         hasher.combine(red)
+         hasher.combine(streamName)
+         hasher.combine(preConnect)
++        hasher.combine(resend)
+         return hasher.finalize()
+     }
+ }
+@@ -89,6 +100,7 @@ extension AudioPublishOptions {
+             red: red,
+             streamName: streamName,
+             preConnect: enabled,
++            resend: resend,
+         )
+     }
+ }
 diff --git a/Sources/LiveKit/Types/Options/ConnectOptions.swift b/Sources/LiveKit/Types/Options/ConnectOptions.swift
-index 020b9da..64e5475 100644
+index 020b9da..e508d96 100644
 --- a/Sources/LiveKit/Types/Options/ConnectOptions.swift
 +++ b/Sources/LiveKit/Types/Options/ConnectOptions.swift
-@@ -80,6 +80,29 @@ public final class ConnectOptions: NSObject, Sendable {
+@@ -80,6 +80,34 @@ public final class ConnectOptions: NSObject, Sendable {
      /// with no 15 KB size limit). Generally, it's not recommended to change this.
      public let clientProtocol: ClientProtocol
  
@@ -3209,10 +5011,15 @@ index 020b9da..64e5475 100644
 +    /// `full` while the mesh holds a place for it, `unreachable` while no server of the list answers.
 +    @nonobjc public let onMeshWait: (@Sendable (MeshWait) -> Void)?
 +
++    /// WordPlus Mesh (1.0.10): the waits before each reconnect attempt, first first (`reconnect.delaysMs` of the
++    /// client's settings): as many attempts as waits, each with up to a tenth of jitter, in place of the
++    /// `reconnectAttempts` curve from `reconnectAttemptDelay` to `reconnectMaxDelay`. Nil: that curve.
++    public let meshReconnectDelays: [TimeInterval]?
++
      override public init() {
          autoSubscribe = true
          reconnectAttempts = 10
-@@ -94,22 +117,70 @@ public final class ConnectOptions: NSObject, Sendable {
+@@ -94,22 +122,73 @@ public final class ConnectOptions: NSObject, Sendable {
          enableMicrophone = false
          protocolVersion = .v16
          clientProtocol = .v1
@@ -3221,6 +5028,7 @@ index 020b9da..64e5475 100644
 +        meshHardwareEncoders = []
 +        meshApp = nil
 +        onMeshWait = nil
++        meshReconnectDelays = nil
 +    }
 +
 +    public convenience init(autoSubscribe: Bool = true,
@@ -3286,8 +5094,10 @@ index 020b9da..64e5475 100644
 +                         meshHardwareDecoders: [String],
 +                         onMeshWait: (@Sendable (MeshWait) -> Void)?,
 +                         meshHardwareEncoders: [String] = [],
-+                         meshApp: MeshApp? = nil)
++                         meshApp: MeshApp? = nil,
++                         meshReconnectDelays: [TimeInterval]? = nil)
      {
++        self.meshReconnectDelays = meshReconnectDelays.flatMap { $0.isEmpty ? nil : $0.map { max(0, $0) } }
 +        self.meshJoinBudget = meshJoinBudget
 +        self.meshHardwareDecoders = meshHardwareDecoders
 +        self.meshHardwareEncoders = meshHardwareEncoders
@@ -3296,7 +5106,7 @@ index 020b9da..64e5475 100644
          self.autoSubscribe = autoSubscribe
          self.reconnectAttempts = reconnectAttempts
          self.reconnectAttemptDelay = reconnectAttemptDelay
-@@ -141,7 +212,12 @@ public final class ConnectOptions: NSObject, Sendable {
+@@ -141,7 +220,13 @@ public final class ConnectOptions: NSObject, Sendable {
              isDscpEnabled == other.isDscpEnabled &&
              enableMicrophone == other.enableMicrophone &&
              protocolVersion == other.protocolVersion &&
@@ -3306,10 +5116,56 @@ index 020b9da..64e5475 100644
 +            meshHardwareDecoders == other.meshHardwareDecoders &&
 +            meshHardwareEncoders == other.meshHardwareEncoders &&
 +            meshApp == other.meshApp &&
++            meshReconnectDelays == other.meshReconnectDelays &&
 +            (onMeshWait == nil) == (other.onMeshWait == nil)
      }
  
      override public var hash: Int {
+diff --git a/Sources/LiveKit/Types/Options/VideoPublishOptions.swift b/Sources/LiveKit/Types/Options/VideoPublishOptions.swift
+index 35ec3ff..e703dca 100644
+--- a/Sources/LiveKit/Types/Options/VideoPublishOptions.swift
++++ b/Sources/LiveKit/Types/Options/VideoPublishOptions.swift
+@@ -41,6 +41,10 @@ public final class VideoPublishOptions: NSObject, TrackPublishOptions, Sendable
+ 
+     public let streamName: String?
+ 
++    /// WordPlus Mesh (1.0.10): a camera's layers in an SVC codec (VP9, AV1), L3T3_KEY where nil; a shared screen takes
++    /// L1T3 whatever this says.
++    public let scalabilityMode: ScalabilityMode?
++
+     public init(name: String? = nil,
+                 encoding: VideoEncoding? = nil,
+                 screenShareEncoding: VideoEncoding? = nil,
+@@ -50,8 +54,10 @@ public final class VideoPublishOptions: NSObject, TrackPublishOptions, Sendable
+                 preferredCodec: VideoCodec? = nil,
+                 preferredBackupCodec: VideoCodec? = nil,
+                 degradationPreference: DegradationPreference = .auto,
+-                streamName: String? = nil)
++                streamName: String? = nil,
++                scalabilityMode: ScalabilityMode? = nil)
+     {
++        self.scalabilityMode = scalabilityMode
+         self.name = name
+         self.encoding = encoding
+         self.screenShareEncoding = screenShareEncoding
+@@ -77,7 +83,8 @@ public final class VideoPublishOptions: NSObject, TrackPublishOptions, Sendable
+             preferredCodec == other.preferredCodec &&
+             preferredBackupCodec == other.preferredBackupCodec &&
+             degradationPreference == other.degradationPreference &&
+-            streamName == other.streamName
++            streamName == other.streamName &&
++            scalabilityMode == other.scalabilityMode
+     }
+ 
+     override public var hash: Int {
+@@ -92,6 +99,7 @@ public final class VideoPublishOptions: NSObject, TrackPublishOptions, Sendable
+         hasher.combine(preferredBackupCodec)
+         hasher.combine(degradationPreference)
+         hasher.combine(streamName)
++        hasher.combine(scalabilityMode)
+         return hasher.finalize()
+     }
+ }
 diff --git a/Sources/LiveKit/Types/RegionInfo.swift b/Sources/LiveKit/Types/RegionInfo.swift
 index b2bb011..738cdfc 100644
 --- a/Sources/LiveKit/Types/RegionInfo.swift
@@ -3355,6 +5211,66 @@ index b2bb011..738cdfc 100644
      }
  }
  
+diff --git a/Sources/LiveKit/Types/ScalabilityMode.swift b/Sources/LiveKit/Types/ScalabilityMode.swift
+index 80e9fd3..06ec224 100644
+--- a/Sources/LiveKit/Types/ScalabilityMode.swift
++++ b/Sources/LiveKit/Types/ScalabilityMode.swift
+@@ -17,11 +17,15 @@
+ import Foundation
+ 
+ @objc
+-public enum ScalabilityMode: Int {
++public enum ScalabilityMode: Int, Sendable {
+     case L3T3 = 1
+     case L3T3_KEY = 2
+     case L3T3_KEY_SHIFT = 3
+     case L1T3 = 4
++    // WordPlus Mesh (1.0.10): the modes the mesh's settings may name (`camera.svcMode`) beside upstream's
++    case L2T3_KEY = 5
++    case L2T2_KEY = 6
++    case L1T2 = 7
+ }
+ 
+ public extension ScalabilityMode {
+@@ -31,6 +35,9 @@ public extension ScalabilityMode {
+         case "L3T3": .L3T3
+         case "L3T3_KEY": .L3T3_KEY
+         case "L3T3_KEY_SHIFT": .L3T3_KEY_SHIFT
++        case "L2T3_KEY": .L2T3_KEY
++        case "L2T2_KEY": .L2T2_KEY
++        case "L1T2": .L1T2
+         default: nil
+         }
+     }
+@@ -41,17 +48,26 @@ public extension ScalabilityMode {
+         case .L3T3: "L3T3"
+         case .L3T3_KEY: "L3T3_KEY"
+         case .L3T3_KEY_SHIFT: "L3T3_KEY_SHIFT"
++        case .L2T3_KEY: "L2T3_KEY"
++        case .L2T2_KEY: "L2T2_KEY"
++        case .L1T2: "L1T2"
+         }
+     }
+ 
+     var spatial: Int {
+         switch self {
+-        case .L1T3: 1
++        case .L1T3, .L1T2: 1
++        case .L2T3_KEY, .L2T2_KEY: 2
+         case .L3T3, .L3T3_KEY, .L3T3_KEY_SHIFT: 3
+         }
+     }
+ 
+-    var temporal: Int { 3 }
++    var temporal: Int {
++        switch self {
++        case .L2T2_KEY, .L1T2: 2
++        default: 3
++        }
++    }
+ }
+ 
+ // MARK: - CustomStringConvertible
 diff --git a/Tests/LiveKitCoreTests/WordPlusMeshDiagnosticsTests.swift b/Tests/LiveKitCoreTests/WordPlusMeshDiagnosticsTests.swift
 new file mode 100644
 index 0000000..fec1660
@@ -3807,10 +5723,10 @@ index 0000000..3df0e7c
 +}
 diff --git a/Tests/LiveKitCoreTests/WordPlusMeshHardwareDropsTests.swift b/Tests/LiveKitCoreTests/WordPlusMeshHardwareDropsTests.swift
 new file mode 100644
-index 0000000..b3cf45f
+index 0000000..cadb292
 --- /dev/null
 +++ b/Tests/LiveKitCoreTests/WordPlusMeshHardwareDropsTests.swift
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,238 @@
 +/*
 + * Copyright 2026 The WordPlus RTC client authors
 + *
@@ -3966,6 +5882,148 @@ index 0000000..b3cf45f
 +        #expect(MeshHardwareDrops.codecs(now: now.addingTimeInterval(29 * 24 * 3600), defaults: defaults) == ["h264"])
 +        #expect(MeshHardwareDrops.codecs(now: now.addingTimeInterval(31 * 24 * 3600), defaults: defaults).isEmpty, "a month on, tried again")
 +        MeshHardwareDrops.forget(defaults: defaults)
++    }
++
++    // 1.0.10: the watch's numbers from the settings, today's constants where they say nothing
++    @Test func hardwareDropsTunedBySettings() throws {
++        #expect(HardwareDropRule.Tune(.none) == HardwareDropRule.Tune(), "no document: the constants")
++        let settings = try #require(MeshSettings.parse(Data(#"""
++        {"rev":2,"set":{"watch.everyMs":10000,"tune.dropWatchS":20,"watch.warmups":0,"watch.dropShare":0.5,"watch.minCapturedFps":8,
++        "watch.maxEncodeMs":40,"watch.minTargetKbps":50,"watch.minSent":0.1}}
++        """#.utf8)))
++        let tune = HardwareDropRule.Tune(settings)
++        #expect(tune.readEvery == 10)
++        #expect(tune.readings == 2, "20 s of readings every 10 s")
++        #expect(tune.warmup == 0)
++        #expect(tune.share == 0.5)
++        #expect(tune.minCaptured == 8)
++        #expect(tune.maxEncodeMs == 40)
++        #expect(tune.minTarget == 50000)
++        #expect(tune.minSent == 0.1)
++        // 4-6 of 15 is dropping by the constants (70%), not by a share of 25%
++        #expect(HardwareDropRule.dropsFrames(thirty(4, 5, 6, 4, 5, 6)))
++        var strict = HardwareDropRule.Tune()
++        strict.share = 0.25
++        #expect(!HardwareDropRule.dropsFrames(thirty(4, 5, 6, 4, 5, 6), tune: strict))
++        // two readings are the whole window when the settings say so
++        #expect(HardwareDropRule.dropsFrames(thirty(3, 4), tune: tune))
++        // a slow encoder (30 ms a frame of a source giving 30 a second) is taken by a 40 ms limit
++        #expect(!HardwareDropRule.dropsFrames([3.0, 4, 5, 4, 5, 6].map { camera($0, captured: 30, encodeMs: 30) }), "over the constants' 25 ms, and over 80% of 33")
++        #expect(HardwareDropRule.dropsFrames([3.0, 4].map { camera($0, captured: 30, encodeMs: 30) }, tune: tune))
++    }
++
++    // 1.0.15: a dim room's camera is judged from 5 frames a second, and an encoder keeps up while it takes no more
++    // than 80% of the time between its source's frames (realtime-client 1.0.85's encoder watch)
++    @Test func hardwareDropsOfADimRoomsCamera() {
++        let fps: [Double] = [3, 2, 4, 3, 2, 4]
++        // a camera giving 9-10 a second in the dark, 2-4 of them sent on every layer, its hardware at 24-26 ms a frame
++        #expect(HardwareDropRule.dropsFrames(fps.map { camera($0, captured: 9.5, encodeMs: 26) }))
++        #expect(!HardwareDropRule.dropsFrames(fps.map { camera($0, captured: 4) }), "under 5 a second says nothing of the encoder")
++        #expect(!HardwareDropRule.dropsFrames(fps.map { camera($0, captured: 10, encodeMs: 90) }), "a slow device still")
++        #expect(abs(HardwareDropRule.slowMs(captured: 30) - 26.67) < 0.01)
++        #expect(abs(HardwareDropRule.slowMs(captured: 15) - 53.33) < 0.01)
++        #expect(abs(HardwareDropRule.slowMs(captured: 10) - 80) < 0.01)
++        #expect(HardwareDropRule.slowMs(captured: 60) == 25, "never under the limit itself")
++        #expect(HardwareDropRule.slowMs(captured: 0) == 25)
++    }
++
++    // 1.0.10: no camera for `watch.idleEndMin` ends the watch; the next camera starts it again
++    @Test func hardwareDropWatchEndsWithoutACamera() throws {
++        let room = Room()
++        let watch = MeshHardwareDropWatch()
++        watch.start(room)
++        #expect(watch.running)
++        let settings = try #require(MeshSettings.parse(Data(#"{"rev":1,"set":{"watch.idleEndMin":2}}"#.utf8)))
++        let tune = HardwareDropRule.Tune(settings)
++        #expect(tune.idleEnd == 120)
++        #expect(HardwareDropRule.Tune(.none).idleEnd == 600, "no document: 10 minutes")
++        let t0 = Date()
++        watch.idle(tune: tune, now: t0)
++        watch.idle(tune: tune, now: t0.addingTimeInterval(119))
++        #expect(watch.running, "under 2 minutes without a camera")
++        watch.idle(tune: tune, now: t0.addingTimeInterval(120))
++        #expect(!watch.running, "2 minutes: ended")
++        watch.start(room)
++        #expect(watch.running, "a camera published starts it again")
++        watch.stop()
++    }
++
++    @Test func hardwareDropsRememberedAsTheSettingsSay() throws {
++        let defaults = UserDefaults(suiteName: "WordPlusMeshHardwareDropsTests-settings")!
++        MeshHardwareDrops.forget(defaults: defaults)
++        let now = Date(timeIntervalSince1970: 1_800_000_000)
++        MeshHardwareDrops.remember("h264", now: now, defaults: defaults)
++        let week = try #require(MeshSettings.parse(Data(#"{"rev":1,"set":{"tune.rememberDropsDays":7}}"#.utf8)))
++        #expect(MeshHardwareDrops.codecs(now: now.addingTimeInterval(6 * 24 * 3600), defaults: defaults, settings: week) == ["h264"])
++        #expect(MeshHardwareDrops.codecs(now: now.addingTimeInterval(8 * 24 * 3600), defaults: defaults, settings: week).isEmpty)
++        let none = try #require(MeshSettings.parse(Data(#"{"rev":1,"set":{"tune.rememberDropsDays":0}}"#.utf8)))
++        #expect(MeshHardwareDrops.codecs(now: now, defaults: defaults, settings: none).isEmpty, "0 remembers none")
++        // measured again from a moment on: what was seen before it is forgotten
++        let after = try #require(MeshSettings.parse(Data(#"{"rev":1,"set":{"tune.forgetBefore":1800000001000}}"#.utf8)))
++        #expect(MeshHardwareDrops.codecs(now: now.addingTimeInterval(60), defaults: defaults, settings: after).isEmpty)
++        #expect(MeshHardwareDrops.codecs(now: now.addingTimeInterval(60), defaults: defaults) == ["h264"], "no document: a month")
++        MeshHardwareDrops.forget(defaults: defaults)
++    }
++}
+diff --git a/Tests/LiveKitCoreTests/WordPlusMeshKeysTests.swift b/Tests/LiveKitCoreTests/WordPlusMeshKeysTests.swift
+new file mode 100644
+index 0000000..59a94b5
+--- /dev/null
++++ b/Tests/LiveKitCoreTests/WordPlusMeshKeysTests.swift
+@@ -0,0 +1,55 @@
++/*
++ * Copyright 2026 The WordPlus RTC client authors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++
++import Foundation
++@testable import LiveKit
++import Testing
++
++/// WordPlus RTC client: a key held at an index without sending under it, then used (the mesh's clients/swift README).
++@Suite struct WordPlusMeshKeysTests {
++    @Test func aHeldKeyDecryptsItsIndexAndMovesNothing() throws {
++        let provider = BaseKeyProvider(isSharedKey: true)
++        provider.setKey(keyData: Data("epoch-0".utf8), index: 0)
++        provider.holdKey(keyData: Data("epoch-1".utf8), index: 1)
++
++        #expect(try #require(provider.exportKey(index: 1)) == Data("epoch-1".utf8))
++        #expect(try #require(provider.exportKey(index: 0)) == Data("epoch-0".utf8))
++        // setKey would have moved the data packets' index to 1.
++        #expect(provider.getCurrentKeyIndex() == 0)
++    }
++
++    @Test func aHeldKeyTakesItsIndexModuloTheRing() throws {
++        let provider = BaseKeyProvider(isSharedKey: true)
++        provider.holdKey(keyData: Data("epoch-17".utf8), index: 17)
++        #expect(try #require(provider.exportKey(index: 1)) == Data("epoch-17".utf8))
++    }
++
++    @Test func useKeyMovesTheSenderAndTheDataPacketsModuloTheRing() async {
++        let provider = BaseKeyProvider(isSharedKey: true)
++        let manager = E2EEManager(options: EncryptionOptions(keyProvider: provider))
++        #expect(manager.senderKeyIndex == nil)
++
++        provider.holdKey(keyData: Data("epoch-1".utf8), index: 1)
++        await manager.useKey(index: 1)
++        #expect(manager.senderKeyIndex == 1)
++        #expect(provider.getCurrentKeyIndex() == 1)
++
++        await manager.useKey(index: 18)
++        #expect(manager.senderKeyIndex == 2)
++        #expect(provider.getCurrentKeyIndex() == 2)
 +    }
 +}
 diff --git a/Tests/LiveKitCoreTests/WordPlusMeshReceiversTests.swift b/Tests/LiveKitCoreTests/WordPlusMeshReceiversTests.swift
@@ -4129,12 +6187,12 @@ index 0000000..a64da26
 +        #expect(Mesh.lengthDelimitedField(MeshReceivers.field, in: bytes) == json)
 +    }
 +}
-diff --git a/Tests/LiveKitCoreTests/WordPlusMeshTests.swift b/Tests/LiveKitCoreTests/WordPlusMeshTests.swift
+diff --git a/Tests/LiveKitCoreTests/WordPlusMeshSettingsTests.swift b/Tests/LiveKitCoreTests/WordPlusMeshSettingsTests.swift
 new file mode 100644
-index 0000000..29ca5b9
+index 0000000..8b5ccb4
 --- /dev/null
-+++ b/Tests/LiveKitCoreTests/WordPlusMeshTests.swift
-@@ -0,0 +1,310 @@
++++ b/Tests/LiveKitCoreTests/WordPlusMeshSettingsTests.swift
+@@ -0,0 +1,329 @@
 +/*
 + * Copyright 2026 The WordPlus RTC client authors
 + *
@@ -4153,6 +6211,342 @@ index 0000000..29ca5b9
 +
 +import Foundation
 +@testable import LiveKit
++import LiveKitWebRTC
++import Testing
++
++/// WordPlus Mesh (1.0.10): the client's settings from its node, as the wire contract has them (the mesh's
++/// better-messages-server infra/CLIENT-CONFIG.md): each value checked again against the schema compiled in.
++@Suite struct WordPlusMeshSettingsTests {
++    private func settings(_ json: String) throws -> MeshSettings {
++        try #require(MeshSettings.parse(Data(json.utf8)))
++    }
++
++    @Test func schemaCompiledIn() throws {
++        #expect(MeshSettingsSchema.keys.count > 90)
++        // every key's default reads as its own key takes it, or is the client's own rule
++        for (name, key) in MeshSettingsSchema.keys where key.defaultJSON != "null" {
++            #expect(MeshSettingsSchema.defaults[name] != nil, "\(name)'s default")
++        }
++        #expect(MeshSettings.none.int("mic.kbps") == 64)
++        #expect(MeshSettings.none.names("camera.codecs") == ["h264:hw", "vp8"])
++        #expect(MeshSettings.none.names("screen.codecs") == nil, "a null default: the client's own rule")
++        #expect(MeshSettings.none.layers("camera.ladder.720") == [MeshLayer(height: 180, kbps: 200, fps: 30), MeshLayer(height: 360, kbps: 600, fps: 30)])
++        #expect(MeshSettings.none.numbers("reconnect.delaysMs")?.first == 0)
++        #expect(MeshSettings.keyClass("camera.capHeight") == .live)
++        #expect(MeshSettings.keyClass("camera.codecs") == .publish)
++        #expect(MeshSettings.keyClass("connect.signalTimeoutMs") == .join)
++        #expect(MeshSettings.keyClass("camera.warp") == nil)
++    }
++
++    @Test func valuesCheckedAgain() throws {
++        let s = try settings("""
++        {"rev": 57, "applyNow": true, "set": {
++          "mic.kbps": 9000, "camera.capHeight": 720.4, "view.pixelDensityMax": 0.2, "mic.red": 1,
++          "camera.backup": "H264", "camera.svcMode": "nope", "camera.codecs": ["VP9", "h264:sw", "vp9", "av1:hw"],
++          "camera.ladder.720": [{"h": 180, "kbps": 150, "fps": 24}, {"h": 360, "kbps": 500, "fps": 30}],
++          "camera.ladder.1080": [{"h": 540, "kbps": 1200, "fps": 30}, {"h": 270, "kbps": 400, "fps": 30}],
++          "reconnect.delaysMs": [0, 500, 90000], "camera.warp": 9, "check.enabled": false
++        }}
++        """)
++        #expect(s.rev == 57)
++        #expect(s.applyNow)
++        #expect(s.int("mic.kbps") == 256, "held to the range")
++        #expect(s.int("camera.capHeight") == 720, "whole")
++        #expect(s.number("view.pixelDensityMax") == 1)
++        #expect(!s.isSet("mic.red"), "1 is no boolean")
++        #expect(s.bool("mic.red") == true, "its default then")
++        #expect(s.word("camera.backup") == "h264")
++        #expect(s.word("camera.svcMode") == "L3T3_KEY", "a word the key doesn't take: its default")
++        #expect(s.names("camera.codecs") == ["vp9", "av1:hw"])
++        #expect(s.layers("camera.ladder.720") == [MeshLayer(height: 180, kbps: 150, fps: 24), MeshLayer(height: 360, kbps: 500, fps: 30)])
++        #expect(!s.isSet("camera.ladder.1080"), "layers not smallest first")
++        #expect(s.numbers("reconnect.delaysMs") == [0, 500, 60000])
++        #expect(!s.isSet("camera.warp"), "a key this client doesn't know")
++        #expect(s.bool("check.enabled") == false)
++        #expect(s.cameraCaps == MeshCaps(height: 720))
++        #expect(MeshSettings.parse(Data(#"{"set": {}}"#.utf8)) == nil, "no revision: not settings")
++        #expect(MeshSettings.parse(Data("[]".utf8)) == nil)
++    }
++
++    @Test func takenWholeWithWhatChanged() throws {
++        let a = try settings(#"{"rev": 3, "set": {"mic.kbps": 48, "camera.capFps": 24}}"#)
++        let b = try settings(#"{"rev": 4, "set": {"mic.kbps": 40, "camera.capHeight": 720}}"#)
++        #expect(b.changed(from: a) == ["mic.kbps", "camera.capFps", "camera.capHeight"])
++        #expect(b.int("camera.capFps") == 0, "left out of the next message: back to its default")
++        let same = try settings(#"{"rev": 5, "set": {"mic.kbps": 64}}"#)
++        #expect(same.changed(from: .none).isEmpty, "a value equal to the default changes nothing")
++    }
++
++    @Test func speaksOnlyWithADocumentOrTheKeySet() throws {
++        #expect(!MeshSettings.none.speaks("mic.kbps"))
++        let overridesOnly = try settings(#"{"rev": 0, "set": {"camera.capHeight": 720}}"#)
++        #expect(overridesOnly.speaks("camera.capHeight"))
++        #expect(!overridesOnly.speaks("mic.kbps"), "no document: a product keeps its own value")
++        #expect(try settings(#"{"rev": 2, "set": {}}"#).speaks("mic.kbps"), "a document: the schema's default")
++    }
++
++    @Test func probeTargets() throws {
++        let s = try settings("""
++        {"rev": 1, "set": {"probe.enabled": true}, "probe": [
++          {"region": "fr", "url": "wss://n-a.rtc.wordplus.cloud:443/rtc?x=1"}, {"region": "lim", "url": "https://n-b.rtc.wordplus.cloud"},
++          {"region": "Bad Region", "url": "https://n-c"}, {"region": "x", "url": "ftp://n-d"}
++        ]}
++        """)
++        #expect(s.probe.map(\.region) == ["fr", "lim"])
++        #expect(s.probe.first?.url.absoluteString == "https://n-a.rtc.wordplus.cloud:443")
++    }
++
++    @Test func keptPerServerForSevenDays() throws {
++        let store = try #require(UserDefaults(suiteName: "wordplus-mesh-settings-tests-\(UUID().uuidString)"))
++        let url = try #require(URL(string: "wss://rtc.wordplus.cloud"))
++        let now = Date()
++        MeshSettings.keep(Data(#"{"rev": 9, "set": {"connect.signalTimeoutMs": 15000}}"#.utf8), for: url, now: now, defaults: store)
++        #expect(MeshSettings.cached(for: url, now: now.addingTimeInterval(3600), defaults: store)?.int("connect.signalTimeoutMs") == 15000)
++        #expect(MeshSettings.cached(for: url, now: now.addingTimeInterval(8 * 86400), defaults: store) == nil)
++        #expect(try MeshSettings.cached(for: #require(URL(string: "wss://other.example")), now: now, defaults: store) == nil)
++    }
++
++    @Test func messagesOnTheWire() throws {
++        let json = Data(#"{"rev":2,"set":{}}"#.utf8)
++        let join = Mesh.lengthDelimited(1, Mesh.lengthDelimited(Mesh.codecPolicyField, Data("{}".utf8)) + Mesh.lengthDelimited(Mesh.settingsJoinField, json))
++        #expect(Mesh.settingsJSON(inJoinMessage: join) == json)
++        #expect(Mesh.settingsJSON(inSignalMessage: Mesh.lengthDelimited(Mesh.settingsField, json)) == json)
++        #expect(Mesh.settingsJSON(inSignalMessage: Mesh.lengthDelimited(Mesh.reportsField, json)) == nil)
++        #expect(Mesh.caps.split(separator: ",").contains("settings"))
++    }
++
++    @Test func sourcesDryOnTheWire() {
++        let said = { (json: String) in Mesh.lengthDelimited(Mesh.sourcesDryField, Data(json.utf8)) }
++        #expect(Mesh.sourcesDry(inSignalMessage: said(#"{"dry":["TR_a","TR_b"]}"#)) == ["TR_a", "TR_b"])
++        #expect(Mesh.sourcesDry(inSignalMessage: said(#"{"dry":[]}"#)) == [], "an empty list is a message like any other")
++        #expect(Mesh.sourcesDry(inSignalMessage: said(#"{"other":1}"#)) == nil)
++        #expect(Mesh.sourcesDry(inSignalMessage: said("not json")) == nil)
++        #expect(Mesh.sourcesDry(inSignalMessage: Mesh.lengthDelimited(Mesh.settingsField, Data(#"{"dry":[]}"#.utf8))) == nil)
++        #expect(Mesh.caps.split(separator: ",").contains("source-dry"))
++    }
++
++    @Test func aRoomTellsOnlyAChangeInWhatStoppedReachingTheNode() {
++        let room = Room()
++        let told = StateSync<[Set<String>]>([])
++        room.setMeshSourcesDryHandler { dry in told.mutate { $0.append(dry) } }
++        #expect(room.meshSourcesDry.isEmpty)
++
++        room.takeMeshSourcesDry(["TR_a"])
++        room.takeMeshSourcesDry(["TR_a"])
++        room.takeMeshSourcesDry(["TR_a", "TR_b"])
++        room.takeMeshSourcesDry([])
++        room.takeMeshSourcesDry([])
++
++        #expect(room.meshSourcesDry.isEmpty)
++        #expect(told.read { $0 } == [["TR_a"], ["TR_a", "TR_b"], []])
++    }
++
++    @Test func svcCameraTakesItsMode() {
++        let dimensions = Dimensions(width: 1280, height: 720)
++        func mode(_ options: VideoPublishOptions, screen: Bool = false) -> String? {
++            Utils.computeVideoEncodings(dimensions: dimensions, publishOptions: options, isScreenShare: screen).first?.scalabilityMode
++        }
++        #expect(mode(VideoPublishOptions(preferredCodec: .vp9)) == "L3T3_KEY", "none given: upstream's")
++        #expect(mode(VideoPublishOptions(preferredCodec: .vp9, scalabilityMode: .L2T3_KEY)) == "L2T3_KEY")
++        #expect(mode(VideoPublishOptions(preferredCodec: .av1, scalabilityMode: .L1T2)) == "L1T2")
++        #expect(mode(VideoPublishOptions(preferredCodec: .vp9, scalabilityMode: .L2T3_KEY), screen: true) == "L1T3", "a screen: one layer")
++        #expect(mode(VideoPublishOptions(preferredCodec: .h264, scalabilityMode: .L2T3_KEY)) == nil, "simulcast for H.264")
++        #expect(ScalabilityMode.fromString("L2T2_KEY")?.spatial == 2)
++        #expect(ScalabilityMode.fromString("L2T2_KEY")?.temporal == 2)
++        #expect(ScalabilityMode.fromString("L1T2")?.rawStringValue == "L1T2")
++    }
++
++    @Test func degradationWords() {
++        #expect(MeshSettings.degradation("balanced") == .balanced)
++        #expect(MeshSettings.degradation("maintain-framerate") == .maintainFramerate)
++        #expect(MeshSettings.degradation("maintain-resolution") == .maintainResolution)
++        #expect(MeshSettings.degradation("default") == nil, "the publish's own")
++        #expect(MeshSettings.degradation(nil) == nil)
++    }
++
++    @Test func statsReadAtTheSettingsPace() async {
++        let hub = MeshStatsHub()
++        #expect(hub.every == MeshStats.readEvery, "no document: 1.9 s")
++        hub.setEvery(5)
++        let key = ObjectIdentifier(hub)
++        let gathered = StateSync(0)
++        let gather: @Sendable () async -> [MeshEncoders.Stat] = {
++            gathered.mutate { $0 += 1 }
++            return []
++        }
++        let t0 = Date()
++        _ = await hub.read(key: key, now: t0, gather: gather)
++        _ = await hub.read(key: key, now: t0.addingTimeInterval(3), gather: gather)
++        #expect(gathered.read { $0 } == 1, "a reading 3 s old is young at 5 s")
++        _ = await hub.read(key: key, now: t0.addingTimeInterval(5.1), gather: gather)
++        #expect(gathered.read { $0 } == 2)
++    }
++
++    @Test func reconnectDelaysFromTheList() {
++        let delays: [TimeInterval] = [0.1, 0.3, 5]
++        for (attempt, base) in [(0, 0.1), (1, 0.3), (2, 5.0), (7, 5.0)] {
++            let delay = Mesh.reconnectDelay(forAttempt: attempt, delays: delays)
++            #expect(delay >= base && delay < base * 1.1 + 0.0001, "attempt \(attempt): \(delay)")
++        }
++        #expect(Mesh.reconnectDelay(forAttempt: 0, delays: []) == 0)
++        #expect(MeshSettings.none.reconnectDelays?.prefix(3) == [0, 0.3, 1.2])
++    }
++
++    @Test func probeJoinParam() throws {
++        let store = try #require(UserDefaults(suiteName: "wordplus-mesh-probe-tests-\(UUID().uuidString)"))
++        MeshProbe.keep(["lim": 18, "fr": 12, "Bad": 3], network: "wifi", minutes: 20, defaults: store)
++        #expect(MeshProbe.joinParam(network: "wifi", defaults: store) == "fr:12,lim:18")
++        #expect(MeshProbe.joinParam(network: "cellular", defaults: store) == nil, "another network's measure isn't this one's")
++        #expect(MeshProbe.joinParam(network: "wifi", now: Date().addingTimeInterval(21 * 60), defaults: store) == nil, "past probe.cacheMin")
++        // before the path monitor's first report: the newest fresh measure of any network
++        MeshProbe.keep(["lim": 30], network: "cellular", minutes: 20, now: Date().addingTimeInterval(-60), defaults: store)
++        #expect(MeshProbe.joinParam(network: "none", defaults: store) == "fr:12,lim:18")
++        #expect(MeshProbe.joinParam(network: "none", now: Date().addingTimeInterval(21 * 60), defaults: store) == nil, "none fresh")
++    }
++
++    // MARK: - The live caps
++
++    private func layer(_ rid: String, scale: Double, kbps: Int, fps: Int = 30) -> LKRTCRtpEncodingParameters {
++        RTC.createRtpEncodingParameters(rid: rid, encoding: VideoEncoding(maxBitrate: kbps * 1000, maxFps: fps), scaleDownBy: scale)
++    }
++
++    @Test func capsOverTheLadder() {
++        // a 1080-line camera's ladder: 270, 540, 1080
++        var ladder = [layer("q", scale: 4, kbps: 400), layer("h", scale: 2, kbps: 1200), layer("f", scale: 1, kbps: 3500)]
++        var off = MeshCaps(height: 720).apply(to: ladder, lines: 1080)
++        #expect(off.isEmpty)
++        #expect(ladder[2].scaleResolutionDownBy?.doubleValue == 1.5, "the top layer scaled down to 720")
++        #expect(abs((ladder[2].maxBitrateBps?.doubleValue ?? 0) - 3_500_000 * pow(720.0 / 1080, 1.5)) < 2, "and its bitrate with it")
++        #expect(ladder[1].scaleResolutionDownBy?.doubleValue == 2, "540 untouched")
++
++        ladder = [layer("q", scale: 4, kbps: 400), layer("h", scale: 2, kbps: 1200), layer("f", scale: 1, kbps: 3500)]
++        off = MeshCaps(height: 540).apply(to: ladder, lines: 1080)
++        #expect(off == ["f"], "a lower layer covers the cap: the top goes off")
++        #expect(!ladder[2].isActive)
++
++        ladder = [layer("q", scale: 4, kbps: 400), layer("h", scale: 2, kbps: 1200), layer("f", scale: 1, kbps: 3500)]
++        off = MeshCaps(fps: 15, kbps: 1000).apply(to: ladder, lines: 1080)
++        #expect(off.isEmpty)
++        #expect(ladder.allSatisfy { $0.maxFramerate?.intValue == 15 })
++        #expect(ladder.map { $0.maxBitrateBps?.intValue } == [400_000, 1_000_000, 1_000_000])
++
++        let svc = [RTC.createRtpEncodingParameters(encoding: VideoEncoding(maxBitrate: 2_800_000, maxFps: 30), scalabilityMode: .L3T3_KEY)]
++        #expect(MeshCaps(height: 360).apply(to: svc, lines: 1080).isEmpty, "one SVC stream is scaled whole, never turned off")
++        #expect(svc[0].scaleResolutionDownBy?.doubleValue == 3)
++        #expect(MeshCaps().apply(to: ladder, lines: 1080).isEmpty)
++
++        // the server's and the product's own: the stricter of each
++        #expect(MeshCaps(height: 720, fps: 0, kbps: 2000).combined(with: MeshCaps(height: 540, fps: 24)) == MeshCaps(height: 540, fps: 24, kbps: 2000))
++        #expect(MeshCaps().combined(with: MeshCaps()) == MeshCaps())
++    }
++
++    @Test @RTC func dynacastLeavesCappedLayersOff() throws {
++        let factory = LKRTCPeerConnectionFactory()
++        let connection = try #require(factory.peerConnection(with: LKRTCConfiguration(), constraints: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil), delegate: nil))
++        defer { connection.close() }
++        let init_ = LKRTCRtpTransceiverInit()
++        init_.direction = .sendOnly
++        init_.sendEncodings = [layer("q", scale: 4, kbps: 400), layer("h", scale: 2, kbps: 1200), layer("f", scale: 1, kbps: 3500)]
++        let transceiver = try #require(connection.addTransceiver(of: .video, init: init_))
++        let sender = transceiver.sender
++        MeshCappedLayers.set(["f"], for: sender)
++        let qualities: [Livekit_VideoQuality] = [.low, .medium, .high]
++        let all: [Livekit_SubscribedQuality] = qualities.map { q in Livekit_SubscribedQuality.with { $0.quality = q; $0.enabled = true } }
++        sender._set(subscribedQualities: all)
++        #expect(sender.parameters.encodings.map(\.isActive) == [true, true, false])
++        MeshCappedLayers.set([], for: sender)
++        sender._set(subscribedQualities: all)
++        #expect(sender.parameters.encodings.map(\.isActive) == [true, true, true], "caps lifted: dynacast's own say")
++    }
++
++    // MARK: - A camera's SVC sizes trimmed to its viewers (1.0.11)
++
++    @Test func svcTrimPlans() {
++        #expect(MeshSvcTrim.mode("L3T3_KEY", sizes: 2) == "L2T3_KEY")
++        #expect(MeshSvcTrim.mode("L3T3_KEY", sizes: 1) == "L1T3")
++        #expect(MeshSvcTrim.mode("L2T2_KEY", sizes: 1) == "L1T2")
++        #expect(MeshSvcTrim.mode("L3T3", sizes: 2) == nil, "no name for L2T3 in the SDK: such a camera goes out whole")
++
++        let whole = MeshSvcTrim.Whole(mode: "L3T3_KEY", scale: nil)
++        #expect(MeshSvcTrim.plan(whole, highest: 0) == .init(mode: "L1T3", scale: 4, sizes: 1))
++        #expect(MeshSvcTrim.plan(whole, highest: 1) == .init(mode: "L2T3_KEY", scale: 2, sizes: 2))
++        #expect(MeshSvcTrim.plan(whole, highest: 2) == .init(mode: "L3T3_KEY", scale: nil, sizes: 3))
++        // a live cap under the trim's own scale stands; one over it gives way to the trim's
++        #expect(MeshSvcTrim.plan(.init(mode: "L3T3_KEY", scale: 3), highest: 1) == .init(mode: "L2T3_KEY", scale: 3, sizes: 2))
++        #expect(MeshSvcTrim.plan(.init(mode: "L3T3_KEY", scale: 1.5), highest: 0) == .init(mode: "L1T3", scale: 4, sizes: 1))
++        #expect(MeshSvcTrim.plan(.init(mode: "L3T3", scale: nil), highest: 0) == .init(mode: "L1T3", scale: 4, sizes: 1))
++        #expect(MeshSvcTrim.plan(.init(mode: "L3T3", scale: nil), highest: 1) == .init(mode: "L3T3", scale: nil, sizes: 3), "L2T3 has no name here: whole")
++    }
++
++    @Test @RTC func dynacastTrimsSvcSizes() throws {
++        // the SDK's own factory, whose encoders take SVC modes (a bare one has no VP9 to check them against)
++        let connection = try #require(RTC.peerConnectionFactory.peerConnection(with: LKRTCConfiguration(), constraints: LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil), delegate: nil))
++        defer { connection.close() }
++        let init_ = LKRTCRtpTransceiverInit()
++        init_.direction = .sendOnly
++        init_.sendEncodings = [RTC.createRtpEncodingParameters(encoding: VideoEncoding(maxBitrate: 1_400_000, maxFps: 30), scalabilityMode: .L3T3_KEY)]
++        let transceiver = try #require(connection.addTransceiver(of: .video, init: init_))
++        let sender = transceiver.sender
++        func asked(_ top: Livekit_VideoQuality?) -> [Livekit_SubscribedQuality] {
++            [Livekit_VideoQuality.low, .medium, .high].map { q in
++                Livekit_SubscribedQuality.with { $0.quality = q; $0.enabled = top.map { q.rawValue <= $0.rawValue } ?? false }
++            }
++        }
++        let first = { sender.parameters.encodings[0] }
++
++        // off: whole, as upstream
++        sender._set(subscribedQualities: asked(.low))
++        #expect(first().scalabilityMode == "L3T3_KEY")
++
++        MeshSvcTrim.set(on: true, for: sender)
++        defer { MeshSvcTrim.set(on: false, for: sender) }
++        sender._set(subscribedQualities: asked(.low))
++        #expect(first().scalabilityMode == "L1T3", "this WebRTC takes the trimmed mode on a sender not yet negotiated")
++        #expect(first().scalabilityMode == "L1T3")
++        #expect(first().scaleResolutionDownBy?.doubleValue == 4)
++        sender._set(subscribedQualities: asked(.medium))
++        #expect(first().scalabilityMode == "L2T3_KEY")
++        #expect(first().scaleResolutionDownBy?.doubleValue == 2)
++        sender._set(subscribedQualities: asked(nil))
++        #expect(!first().isActive)
++        #expect(first().scalabilityMode == "L2T3_KEY", "turned off with its sizes kept")
++        sender._set(subscribedQualities: asked(.high))
++        #expect(first().isActive)
++        #expect(first().scalabilityMode == "L3T3_KEY")
++        #expect(first().scaleResolutionDownBy == nil)
++
++        sender._set(subscribedQualities: asked(.low))
++        MeshSvcTrim.set(on: false, for: sender)
++        sender._set(subscribedQualities: asked(.low))
++        #expect(first().scalabilityMode == "L3T3_KEY", "trim off: whole again")
++        #expect(first().scaleResolutionDownBy == nil)
++    }
++}
+diff --git a/Tests/LiveKitCoreTests/WordPlusMeshTests.swift b/Tests/LiveKitCoreTests/WordPlusMeshTests.swift
+new file mode 100644
+index 0000000..191c123
+--- /dev/null
++++ b/Tests/LiveKitCoreTests/WordPlusMeshTests.swift
+@@ -0,0 +1,474 @@
++/*
++ * Copyright 2026 The WordPlus RTC client authors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import Foundation
++@testable import LiveKit
++import LiveKitWebRTC
 +import Testing
 +
 +/// WordPlus Mesh: what this client does differently on a mesh's servers, as @wordplus/rtc-client's own tests have it.
@@ -4214,7 +6608,7 @@ index 0000000..29ca5b9
 +        let mesh = try Utils.buildUrl(url("wss://n-a.de.rtc.wordplus.cloud"), connectOptions: options, adaptiveStream: false)
 +        let items = try #require(URLComponents(url: mesh, resolvingAgainstBaseURL: false)?.queryItems)
 +        #expect(items.contains(URLQueryItem(name: "rtc_client", value: Mesh.clientVersion)))
-+        #expect(items.contains(URLQueryItem(name: "mesh_caps", value: "audio-pause,codec-policy")))
++        #expect(items.contains(URLQueryItem(name: "mesh_caps", value: "audio-pause,codec-policy,settings,source-dry")))
 +        #expect(items.contains(URLQueryItem(name: "rtc_app", value: "better-messages/3.1.4")))
 +        #expect(items.contains(URLQueryItem(name: "mesh_hwenc", value: "h264")))
 +        #expect(items.contains(URLQueryItem(name: "device_type", value: "desktop")), "these tests run on a Mac")
@@ -4443,5 +6837,168 @@ index 0000000..29ca5b9
 +        let unknown = try url("wss://does-not-exist.invalid")
 +        #expect(await !Mesh.serverAnswers(closed, timeout: 1), "nothing listens on the discard port")
 +        #expect(await !Mesh.serverAnswers(unknown, timeout: 1))
++    }
++
++    /// 1.0.14: the first mid of an SDP's BUNDLE group.
++    @Test func bundleTag() {
++        #expect(Transport.bundleTag(inSDP: "v=0\r\na=group:BUNDLE 0 1 2\r\nm=audio 9 UDP\r\n") == "0")
++        #expect(Transport.bundleTag(inSDP: "v=0\r\na=group:BUNDLE 1\r\n") == "1")
++        #expect(Transport.bundleTag(inSDP: "v=0\r\nm=audio 9 UDP\r\n") == nil)
++        #expect(Transport.bundleTag(inSDP: nil) == nil)
++    }
++
++    /// 1.0.15: nack listed for the Opus of the audio a publish asked to be asked again for, in what is sent only.
++    @Test func listAudioNack() {
++        // a microphone in RED, a shared screen's sound, a camera and a section this side only receives on
++        let offer = """
++        v=0
++        o=- 0 0 IN IP4 127.0.0.1
++        s=-
++        t=0 0
++        a=group:BUNDLE 0 1 2 3
++        m=audio 9 UDP/TLS/RTP/SAVPF 63 111
++        a=mid:0
++        a=sendonly
++        a=msid:stream mic
++        a=rtpmap:63 red/48000/2
++        a=rtpmap:111 opus/48000/2
++        a=rtcp-fb:111 transport-cc
++        a=fmtp:111 minptime=10;useinbandfec=1
++        m=audio 9 UDP/TLS/RTP/SAVPF 111
++        a=mid:1
++        a=sendonly
++        a=msid:stream screen-sound
++        a=rtpmap:111 opus/48000/2
++        a=rtcp-fb:111 transport-cc
++        m=video 9 UDP/TLS/RTP/SAVPF 96
++        a=mid:2
++        a=sendonly
++        a=msid:stream mic
++        a=rtpmap:96 VP8/90000
++        m=audio 9 UDP/TLS/RTP/SAVPF 111
++        a=mid:3
++        a=recvonly
++        a=msid:stream mic
++        a=rtpmap:111 opus/48000/2
++        """.replacingOccurrences(of: "\n", with: "\r\n") + "\r\n"
++
++        #expect(Transport.listAudioNack(offer, senderIds: []) == offer, "nothing asked: the offer itself")
++        #expect(Transport.listAudioNack(offer, senderIds: ["someone-else"]) == offer)
++
++        let listed = Transport.listAudioNack(offer, senderIds: ["mic"])
++        let sections = SDP(parsing: listed).mediaSections
++
++        #expect(sections[0].hasRtcpFeedback("nack", forPayload: "111"), "the microphone's Opus, under its RED")
++        #expect(!sections[0].hasRtcpFeedback("nack", forPayload: "63"))
++        #expect(!sections[1].hasRtcpFeedback("nack", forPayload: "111"), "another sender's sound is left as it was")
++        #expect(!sections[2].hasRtcpFeedback("nack", forPayload: "96"), "no video")
++        #expect(!sections[3].hasRtcpFeedback("nack", forPayload: "111"), "nor a section it doesn't send on")
++        #expect(listed.hasSuffix("\r\n"))
++        #expect(Transport.listAudioNack(listed, senderIds: ["mic"]) == listed, "listed once")
++
++        #expect(AudioPublishOptions().resend == false, "off unless a publish asks")
++        #expect(AudioPublishOptions(resend: true) != AudioPublishOptions())
++    }
++
++    private final class StubTransportDelegate: TransportDelegate {
++        func transport(_: Transport, didUpdateState _: LKRTCPeerConnectionState) {}
++        func transport(_: Transport, didGenerateIceCandidate _: IceCandidate) {}
++        func transport(_: Transport, didOpenDataChannel _: LKRTCDataChannel) {}
++        func transport(_: Transport, didAddTrack _: RTCMediaTrack, rtpReceiver _: RTCReceiver, streamIds _: [String]) {}
++        func transport(_: Transport, didRemoveTrackWithId _: String) {}
++        func transportShouldNegotiate(_: Transport) {}
++    }
++
++    /// 1.0.14: someone who joined with no right to publish has media first in their first offer, as it comes before the
++    /// data channels. Taking that track away must not reject its section, which libwebrtc takes as rejecting the whole
++    /// BUNDLE group, the transport and the data channels with it. A later section is released as ever.
++    @Test(.tags(.media)) func theFirstSectionOfTheBundleOutlivesItsTrack() async throws {
++        let delegate = StubTransportDelegate()
++        let publisher = try await Transport(config: .liveKitDefault(), target: .publisher, primary: false, delegate: delegate)
++        let answerer = try await Transport(config: .liveKitDefault(), target: .subscriber, primary: true, delegate: delegate)
++
++        // Exchanges an offer of the publisher for an answer, and answers with what was offered.
++        func negotiate() async throws -> String {
++            let offer = try await publisher.createOffer()
++            try await publisher.set(localDescription: offer)
++            try await answerer.set(remoteDescription: offer)
++            let answer = try await answerer.createAnswer()
++            try await answerer.set(localDescription: answer)
++            try await publisher.set(remoteDescription: answer)
++            return offer.sdp
++        }
++
++        let (microphone, camera) = try await RTC.run {
++            let factory = RTC.peerConnectionFactory
++            let sendOnly = LKRTCRtpTransceiverInit()
++            sendOnly.direction = .sendOnly
++            let audio = factory.audioTrack(with: factory.audioSource(with: nil), trackId: "microphone")
++            let video = factory.videoTrack(with: factory.videoSource(forScreenCast: false), trackId: "camera")
++            let first = try publisher.addTransceiver(with: audio, transceiverInit: sendOnly)
++            let second = try publisher.addTransceiver(with: video, transceiverInit: sendOnly)
++            return (RTCSender(first.sender), RTCSender(second.sender))
++        }
++        _ = await publisher.dataChannel(for: LKRTCDataChannel.Labels.reliable, configuration: RTC.createDataChannelConfiguration())
++
++        let first = try await negotiate()
++        #expect(first.contains("a=group:BUNDLE 0 1 2"), "media comes first, the data channels last")
++
++        try await publisher.remove(track: camera)
++        let withoutCamera = try await negotiate()
++        #expect(withoutCamera.contains("m=video 0 "), "a section further on is released")
++        #expect(withoutCamera.contains("a=group:BUNDLE 0 2"))
++
++        try await publisher.remove(track: microphone)
++        let withoutMicrophone = try await negotiate()
++        #expect(!withoutMicrophone.contains("m=audio 0 "), "the first section is not rejected")
++        #expect(withoutMicrophone.contains("a=group:BUNDLE 0 2"), "the group keeps its first mid")
++        #expect(withoutMicrophone.contains("a=inactive"), "and it carries nothing")
++
++        await publisher.close()
++        await answerer.close()
++    }
++
++    private final class PermissionsHeard: NSObject, RoomDelegate, @unchecked Sendable {
++        private let heard = StateSync([Bool]())
++        var told: [Bool] { heard.read { $0 } }
++        func room(_: Room, participant: Participant, didUpdatePermissions permissions: ParticipantPermissions) {
++            if participant is RemoteParticipant { heard.mutate { $0.append(permissions.canPublish) } }
++        }
++    }
++
++    /// 1.0.14: what someone else may do is told as it changes, not what they join with, and only when it changes.
++    @Test func aRemoteParticipantsPermissionsAreToldAsTheyChange() async throws {
++        let room = Room()
++        let heard = PermissionsHeard()
++        room.delegates.add(delegate: heard)
++
++        func info(canPublish: Bool) -> Livekit_ParticipantInfo {
++            Livekit_ParticipantInfo.with {
++                $0.sid = "PA_someone"
++                $0.identity = "someone"
++                $0.permission = Livekit_ParticipantPermission.with {
++                    $0.canPublish = canPublish
++                    $0.canSubscribe = true
++                }
++            }
++        }
++        func settled() async throws { try await Task.sleep(nanoseconds: 300_000_000) }
++
++        let person = RemoteParticipant(info: info(canPublish: false), room: room, connectionState: .connected)
++        try await settled()
++        #expect(heard.told.isEmpty, "what they join with is no change")
++
++        person.set(info: info(canPublish: true), connectionState: .connected)
++        try await settled()
++        #expect(heard.told == [true])
++        #expect(person.permissions.canPublish)
++
++        person.set(info: info(canPublish: true), connectionState: .connected)
++        try await settled()
++        #expect(heard.told == [true], "nothing changed")
++
++        person.set(info: info(canPublish: false), connectionState: .connected)
++        try await settled()
++        #expect(heard.told == [true, false])
 +    }
 +}

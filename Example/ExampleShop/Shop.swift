@@ -224,6 +224,13 @@ final class Shop: ObservableObject {
         // A call ringing for this user, from a browser or another app: Better Messages call screen rings and shows it
         // (WordPlusRealtimeUI), the shop follows the call it becomes.
         CallScreen.shared.attach(rt.calls)
+        // The way back to the shop, a button of the app's own in the dock: the call goes on in the shop's bar. The screen
+        // has none of its own for the SDK's calls.
+        CallScreen.shared.pieces = .init(controls: { ours, state in
+            state.phase == "ringing_in" ? ours : ours + [.init(id: "shop", label: "Back to the shop", icon: "m6 9 6 6 6-6") { CallScreen.shared.hide() }]
+        })
+        // Add Person in the dock: whom the shop server lists (its calls rule's `people`), rung into the call.
+        CallScreen.shared.addPerson = true
         CallScreen.shared.onAnswered = { [weak self] answered in
             self?.callEnded = nil
             switch answered {

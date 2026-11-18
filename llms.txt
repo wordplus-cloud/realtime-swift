@@ -1,20 +1,21 @@
 # WordPlusRealtime for Swift
 
-> WordPlus Cloud's realtime SDK for iOS and macOS apps: rooms with emit, emitWithAck and volatile, presence and who is online, history, what the app's server sends the user, calls between a phone and a browser, group calls, and the native call screen of Better Messages, sealed end to end. Three products of one Swift package: WordPlusRealtime, WordPlusRealtimeCalls and WordPlusRealtimeUI. The app's server is the website's own, with @wordplus/realtime, wordplus/realtime-php or wordplus-realtime.
+> WordPlus Cloud's realtime SDK for iOS and macOS apps: rooms with emit, emitWithAck and volatile, presence and who is online, history, what the app's server sends the user, calls between a phone and a browser, group calls, live streams, and the native call and stream screens of Better Messages. Rooms are sealed end to end, calls between two people are encrypted end to end, group calls when their rule says encrypt, and live streams are not. Three products of one Swift package: WordPlusRealtime, WordPlusRealtimeCalls and WordPlusRealtimeUI. The app's server is the website's own, with @wordplus/realtime, wordplus/realtime-php or wordplus-realtime.
 
 ## Docs
 
 All of them, with the guides of the server packages and every other, on the web: https://docs.wordplus.cloud/llms.txt.
 
-- [Getting started](docs/ios/getting-started.md): the products, installing, the server knowing the app's user, connecting, a first room
-- [Rooms](docs/ios/rooms.md): joining, events and their meta, async sequences decoded, history after a reconnect
-- [Presence and online status](docs/ios/presence.md): a presence room's members, counts, rt.online, the directory
-- [Sending from your server](docs/ios/sending.md): to a room, except the app's own tab, to a user, webhooks
-- [Events from the app](docs/ios/events.md): emit, emitWithAck, volatile, Codable data, the web chat's events
-- [Calls](docs/ios/calls.md): the call screen, ringing a locked phone and a closed app with CallKit (SystemCalls), calls of your own, adding people, group calls, end reasons
-- [Encryption and your users](docs/ios/encryption.md): what is sealed, how the app gets its keys, the directory
+- [Getting started](docs/ios/getting-started.md): the products, installing, the server knowing the app's user, connecting, a first room, the connection's state (rt.state, rt.onState, error, moved, signed_out), another namespace of the realtime server (RealtimeOptions namespace and auth)
+- [Rooms](docs/ios/rooms.md): the room rule, joining, many rooms in one request, events and their meta, once and off, async sequences decoded, history after a reconnect
+- [Presence and online status](docs/ios/presence.md): the presence rule, a presence room's members, counts, rt.online, the directory, and the views drawn from what the app gives them (OnlineList, PersonRow, RowAction, OnlineCount, Avatar, PresenceDot, TypingDots, ActivityIndicator)
+- [Sending from your server](docs/ios/sending.md): to a room, except the app's own tab, to a user, asking the app, webhooks
+- [Events from the app](docs/ios/events.md): the chat rule, emit, emitWithAck, volatile and its emitWithAck, Codable data, the web chat's events
+- [Calls](docs/ios/calls.md): starting with a token from your server (startCall, joinGroupCall, joinStream, call.add, call.ref), the call rules (side.role, admin, encrypt), the call screen, ringing a locked phone and a closed app with CallKit (SystemCalls and its options), calls of your own (remoteMedia, onError, onCall, onGroup, onPath, people, may, off, flipCamera, frontCamera, preferCamera, microphoneLevel, the audio route), calls on your own signalling (rt.calls.call(over:), CallTransport, the P2PCallTransport of Better Messages), adding people (CallInvite, its onState, canCancel and cancel, group.invites, group.onInvite, CallScreen.shared.addPerson), group calls (setCamera, setMicrophone, group.me, group.quality, group.onQuality, group.onError, group.waiting, joining again), sharing the screen (ScreenShare.isAvailable, setScreenShare, sharingScreen, onScreenShare, call.remoteScreen, and the broadcast extension an app must add), the host (the call screen's menus, GroupCall.moderate and the spotlight), speakers and listeners, moderating a group call (what holds and for how long, group.acts and CallAct, ban, unban, holdMic, releaseMic, setRules and rules, hands, raiseHand, lowerHand, lowerAllHands, askToTurnOn, onAsk, answerAsk, onAskAnswer, end for everyone, can.micHeld and turnOnMicrophone, reconnecting and stalled tiles, joins refused banned or locked and CallScreen.refusal), the server's calls, end reasons
+- [Live streams](docs/ios/streams.md): the stream rule and its settings, LiveStreamScreen, watching (video: false and watch(), waiting, audience, qualities, setQuality, stats), going live, setScreenShare, guests on stage (hand, canAskStage, joinStage, declineStage, leaveStage, and what LiveStreamScreen draws of it), keeping the chat, the server's streams, stream webhooks, not end to end encrypted, refusals
+- [Encryption and your users](docs/ios/encryption.md): what is sealed, calls and live streams, how the app gets its keys, where the keys are kept (the day keys in the Keychain for SystemCalls), the directory
 - [Customizing the screens](docs/ios/customizing.md): the call screen's look, a piece of the app's own, its whole code copied: CallScreen.shared.pieces, CallControl, GroupVideoView, swift package wordplus-ui add/diff/update/accept
-- [Shipping](docs/ios/shipping.md): HTTPS, microphone and camera, the background, push and CallKit (capabilities, the APNs key), privacy manifests, encryption questions
+- [Shipping](docs/ios/shipping.md): HTTPS, microphone and camera, the background, the broadcast extension for sharing the screen, push and CallKit (capabilities, the APNs key), privacy manifests and the Keychain, encryption questions
 - [The example app](docs/ios/example.md): the API demo in SwiftUI, and its end-to-end proof
 
 ## For agents

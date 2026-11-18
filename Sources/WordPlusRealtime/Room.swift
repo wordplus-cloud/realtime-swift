@@ -42,6 +42,12 @@ public final class Room: @unchecked Sendable {
         listeners.add(event, handler)
     }
 
+    /// As `on`, for the next one only.
+    @discardableResult
+    public func once(_ event: String, _ handler: @escaping (JSONValue, EventMeta) -> Void) -> Listener {
+        listeners.once(event, handler)
+    }
+
     /// Every event of the room, whatever its name.
     @discardableResult
     public func onAny(_ handler: @escaping (String, JSONValue, EventMeta) -> Void) -> Listener {
@@ -50,6 +56,11 @@ public final class Room: @unchecked Sendable {
 
     public func off(_ listener: Listener) {
         listeners.remove(listener)
+    }
+
+    /// Takes every handler of an event off.
+    public func off(_ event: String) {
+        listeners.remove(event: event)
     }
 
     /// An event of the room, as an async sequence.
@@ -170,13 +181,15 @@ public final class Room: @unchecked Sendable {
                 }
                 socket.emit("emit", .object(payload), timeout: timeout) { [self] reply in
                     guard let reply else { return done(.failure(RealtimeError("timeout"))) }
-                    guard reply["ok"]?.bool == true, let id = reply["id"]?.string else { return done(.failure(RealtimeError(reply["error"]?.string ?? "server"))) }
+                    guard reply["ok"]?.bool == true else { return done(.failure(RealtimeError(reply["error"]?.string ?? "server"))) }
+                    // A volatile event is never kept, so it has no id.
+                    let id = reply["id"]?.string ?? ""
                     owner.queue.async { self.seen(id) }
                     done(.success(Ack(id: id, at: reply["at"]?.number ?? 0)))
                 }
             }
             if _state == .joined { return go() }
-            if volatile { return done(.success(Ack(id: "", at: 0))) }
+            if volatile, !ack { return done(.success(Ack(id: "", at: 0))) }
             waitForJoin(timeout: ack ? timeout : 120) { result in
                 switch result {
                 case .success: go()
@@ -204,6 +217,9 @@ public final class Room: @unchecked Sendable {
     func failed(_ code: String) {
         _state = .failed
         _error = code
+        // Out of it: nobody in it shows here any more.
+        _members = [:]
+        _count = nil
         let waiters = readyWaiters
         readyWaiters = []
         waiters.forEach { $0(.failure(RealtimeError(code))) }
@@ -280,6 +296,20 @@ public struct VolatileEmitter {
     public func emit<T: Encodable>(_ event: String, _ data: T) {
         emit(event, (try? JSONValue(encoding: data)) ?? .null)
     }
+
+    /// Sends without keeping, once the room is joined, and waits for the cloud to take it (checked and sent): when it
+    /// did, with no id as it isn't kept, or a RealtimeError.
+    @discardableResult
+    public func emitWithAck(_ event: String, _ data: JSONValue = .null, timeout: TimeInterval = 8) async throws -> Ack {
+        try await withCheckedThrowingContinuation { continuation in
+            room.send(event, data, ack: true, volatile: true, timeout: timeout) { continuation.resume(with: $0) }
+        }
+    }
+
+    @discardableResult
+    public func emitWithAck<T: Encodable>(_ event: String, _ data: T, timeout: TimeInterval = 8) async throws -> Ack {
+        try await emitWithAck(event, try JSONValue(encoding: data), timeout: timeout)
+    }
 }
 
 /// What the cloud answers an acked emit: the event's id, rising within the room, and when it took it.
@@ -344,7 +374,8 @@ public final class Online: @unchecked Sendable {
         owner.queue.sync { states[id].flatMap { $0.online ? nil : $0.at } }
     }
 
-    /// `change` ({ id, online, at? }) for the users watched, `count` ({ n }) once listened to.
+    /// `change` ({ id, online, at? }) for the users watched, `count` ({ n }) once listened to, and `error` ({ code }) for a
+    /// watch refused, such as `no_identity`, or not answered (`timeout`).
     @discardableResult
     public func on(_ event: String, _ handler: @escaping (JSONValue) -> Void) -> Listener {
         let listener = listeners.add(event) { (value: (JSONValue, EventMeta)) in handler(value.0) }
@@ -362,6 +393,11 @@ public final class Online: @unchecked Sendable {
         listeners.remove(listener)
     }
 
+    /// Takes every handler of an event off.
+    public func off(_ event: String) {
+        listeners.remove(event: event)
+    }
+
     /// A page of who is online: their ids, and the cursor of the next page ("0" after the last).
     public func list(cursor: String = "0", limit: Int = 1000) async throws -> (ids: [String], next: String) {
         let reply = try await owner.request("online", ["cursor": .string(cursor), "limit": .number(Double(limit))])
@@ -370,21 +406,26 @@ public final class Online: @unchecked Sendable {
 
     // MARK: - On the owner's queue
 
-    func again(on socket: SocketIO, _ done: @escaping () -> Void) {
+    func again(on socket: RoomSocket, _ done: @escaping () -> Void) {
         guard !watching.isEmpty || counting else { return done() }
         var payload: [String: JSONValue] = ["ids": .array(watching.map(JSONValue.string))]
         if counting { payload["count"] = true }
         send(payload, on: socket, done)
     }
 
-    private func send(_ payload: [String: JSONValue], on socket: SocketIO, _ done: @escaping () -> Void) {
+    private func send(_ payload: [String: JSONValue], on socket: RoomSocket, _ done: @escaping () -> Void) {
         var body = payload
         body["tab"] = .string(owner.tab)
         socket.emit("watch", .object(body)) { [self] reply in
             owner.queue.async {
-                for state in reply?["online"]?.array ?? [] { self.set(state) }
-                if let n = reply?["count"]?.int { self.counted(n) }
-                done()
+                defer { done() }
+                guard let reply, reply["ok"]?.bool == true else {
+                    let code = reply == nil ? "timeout" : reply?["error"]?.string ?? "server"
+                    self.listeners.fire("error", (["code": .string(code)], EventMeta()), on: self.owner.options.callbackQueue)
+                    return
+                }
+                for state in reply["online"]?.array ?? [] { self.set(state) }
+                if let n = reply["count"]?.int { self.counted(n) }
             }
         }
     }

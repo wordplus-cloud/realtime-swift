@@ -81,6 +81,32 @@ public class E2EEManager: NSObject, @unchecked Sendable, ObservableObject, Logga
         var frameCryptors = [CryptorKey: LKRTCFrameCryptor]()
         var trackPublications = [LKRTCFrameCryptor: TrackPublication]()
         var dataCryptor: LKRTCDataPacketCryptor?
+        /// WordPlus RTC client: the key index this device sends under since `useKey(index:)`, nil before it.
+        var senderKeyIndex: Int32?
+    }
+
+    /// WordPlus RTC client: the key index this device sends under since `useKey(index:)`, nil before it (each frame
+    /// cryptor's own, 0).
+    public var senderKeyIndex: Int32? { _state.senderKeyIndex }
+
+    /// WordPlus RTC client: sends under the key held at `index` from now on, on every track this device publishes and
+    /// on each one it publishes after, and its data packets too (the key provider's current index). Upstream's frame
+    /// cryptors keep the index they were made with, 0 for a shared key, whatever key is set. The keys at the other
+    /// indexes stay, and a receiver decrypts each frame by the index in its trailer, so what is still on its way under
+    /// them decrypts. Hold the key on every device of the room first (`BaseKeyProvider.holdKey`), then use it.
+    public func useKey(index: Int32) async {
+        let size = keyProvider.options.keyRingSize
+        let index = ((index % size) + size) % size
+        keyProvider.setCurrentKeyIndex(index)
+        // The cryptors are `@RTC`-confined, as addRtpSender makes them.
+        await RTC.run {
+            _state.mutate { state in
+                state.senderKeyIndex = index
+                for (frameCryptor, publication) in state.trackPublications where publication is LocalTrackPublication {
+                    frameCryptor.keyIndex = index
+                }
+            }
+        }
     }
 
     typealias CryptorKey = [Participant.Identity: Track.Sid]
@@ -207,6 +233,8 @@ public class E2EEManager: NSObject, @unchecked Sendable, ObservableObject, Logga
                 $0.frameCryptors[[participantIdentity: publication.sid]] = frameCryptor
                 $0.trackPublications[frameCryptor] = publication
                 frameCryptor.enabled = $0.enabled
+                // A track published after useKey(index:) sends under that index too.
+                if let index = $0.senderKeyIndex { frameCryptor.keyIndex = index }
             }
         }
     }

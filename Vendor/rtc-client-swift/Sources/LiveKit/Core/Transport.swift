@@ -77,6 +77,10 @@ final class Transport: NSObject, Loggable {
     /// is at best a no-op and at worst restarts a converged bandwidth estimator. A full
     /// reconnect builds a new `Transport`, whose new estimator is seeded again.
     private var _hasAppliedVideoStartBitrate = false
+    /// WordPlus Mesh (1.0.15): the ids of the audio senders the server may ask again for what their upload lost
+    /// (`AudioPublishOptions.resend`), recorded by ``addTransceiver(with:transceiverInit:startBitrateKbps:resendAudio:)``.
+    /// The offers sent list `nack` for their Opus; see ``listAudioNack(_:senderIds:)``.
+    private var _resendAudioSenderIds: Set<String> = []
 
     // forbid direct access to PeerConnection; the box parks its blocking release on deinit
     private let _pcBox: RTCBox<LKRTCPeerConnection>
@@ -304,7 +308,7 @@ final class Transport: NSObject, Loggable {
             if !_hasAppliedVideoStartBitrate, Self.carriesVideoStartBitrate(offer.sdp) {
                 _hasAppliedVideoStartBitrate = true
             }
-            try await _onOffer(offer, _latestOfferId)
+            try await _onOffer(offerToSend(offer), _latestOfferId)
         }
 
         if signalingState == .haveLocalOffer, iceRestart, let sd = remoteDescription {
@@ -414,6 +418,32 @@ extension Transport {
             document.mediaSections[index].appendRtcpFeedback("nack", forPayload: payload)
         }
         return document.write()
+    }
+
+    /// WordPlus Mesh (1.0.15): the SDP with `nack` listed for the Opus of each sending audio section whose `a=msid`
+    /// track id, which libwebrtc sets to the sender id, is one of `senderIds`, once each; the SDP itself where there
+    /// is nothing to add. rtc-client 1.0.27's `listAudioNack`.
+    nonisolated static func listAudioNack(_ sdp: String, senderIds: Set<String>) -> String {
+        guard !senderIds.isEmpty else { return sdp }
+        var document = SDP(parsing: sdp)
+        var listed = false
+        for index in document.mediaSections.indices {
+            let section = document.mediaSections[index]
+            guard section.mediaType == "audio",
+                  section.direction != .recvonly, section.direction != .inactive,
+                  let sender = section.msidTrackId, senderIds.contains(sender),
+                  let payload = section.payload(forCodec: "opus") else { continue }
+            if document.mediaSections[index].appendRtcpFeedback("nack", forPayload: payload) { listed = true }
+        }
+        return listed ? document.write() : sdp
+    }
+
+    /// WordPlus Mesh (1.0.15): the offer as it is sent, `nack` listed for the Opus of each audio sender the server
+    /// may ask again. Only what is sent says so: libwebrtc's sender takes it from the answer alone, and the
+    /// description it set stays the one it accepted, with nothing more for it to refuse.
+    func offerToSend(_ offer: LKRTCSessionDescription) -> LKRTCSessionDescription {
+        let sdp = Self.listAudioNack(offer.sdp, senderIds: _resendAudioSenderIds)
+        return sdp == offer.sdp ? offer : RTC.createSessionDescription(type: offer.type, sdp: sdp)
     }
 
     /// Munge a local offer to declare `stereo=1` on the Opus fmtp of every audio section.
@@ -733,9 +763,13 @@ extension Transport {
     /// against the new sender here, before returning, so the offer libwebrtc asks for in
     /// response to this call cannot be created without it. It only matters until the
     /// connection-level hint has been written once (``mungeVideoStartBitrate(_:kbpsBySenderId:)``).
+    ///
+    /// WordPlus Mesh (1.0.15): `resendAudio` records the new sender as one the server may ask again
+    /// (`AudioPublishOptions.resend`), here for the same reason.
     func addTransceiver(with track: LKRTCMediaStreamTrack,
                         transceiverInit: LKRTCRtpTransceiverInit,
-                        startBitrateKbps: Int? = nil) throws -> LKRTCRtpTransceiver
+                        startBitrateKbps: Int? = nil,
+                        resendAudio: Bool = false) throws -> LKRTCRtpTransceiver
     {
         guard !_isClosed else {
             throw LiveKitError(.invalidState, message: "Transport is closed")
@@ -747,6 +781,10 @@ extension Transport {
 
         if let startBitrateKbps {
             _startBitrateKbpsBySenderId[transceiver.sender.senderId] = startBitrateKbps
+        }
+
+        if resendAudio {
+            _resendAudioSenderIds.insert(transceiver.sender.senderId)
         }
 
         return transceiver
@@ -772,6 +810,7 @@ extension Transport {
             throw LiveKitError(.webRTC, message: "Failed to remove track")
         }
         _startBitrateKbpsBySenderId.removeValue(forKey: sender.senderId)
+        _resendAudioSenderIds.remove(sender.senderId)
 
         releaseTransceiver(sender: raw)
     }
@@ -782,9 +821,23 @@ extension Transport {
         if let transceiver = _pc.transceivers.first(where: { $0.sender == sender }),
            !transceiver.isStopped
         {
+            // WordPlus Mesh (1.0.14): the first mid of the BUNDLE group stays, inactive. libwebrtc takes rejecting it as
+            // rejecting the whole group, so the next offer would drop the transport every other section rides on, the
+            // data channels with it, and what is published next would send nothing. Only someone who joined with no
+            // right to publish has media there, as a first offer lists it before the data channels.
+            if transceiver.mid == Self.bundleTag(inSDP: _pc.localDescription?.sdp) {
+                log("Leaving the first mid of the BUNDLE group inactive", .debug)
+                return
+            }
             log("Stopping transceiver", .debug)
             transceiver.stopInternal()
         }
+    }
+
+    /// WordPlus Mesh (1.0.14): the first mid of an SDP's BUNDLE group, the one its transport is named after.
+    nonisolated static func bundleTag(inSDP sdp: String?) -> String? {
+        guard let line = sdp?.split(whereSeparator: \.isNewline).first(where: { $0.hasPrefix("a=group:BUNDLE") }) else { return nil }
+        return line.split(separator: " ").dropFirst().first.map(String.init)
     }
 
     var unstoppedTransceiverCount: Int {

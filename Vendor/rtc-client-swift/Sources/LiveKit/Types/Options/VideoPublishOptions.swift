@@ -41,6 +41,10 @@ public final class VideoPublishOptions: NSObject, TrackPublishOptions, Sendable 
 
     public let streamName: String?
 
+    /// WordPlus Mesh (1.0.10): a camera's layers in an SVC codec (VP9, AV1), L3T3_KEY where nil; a shared screen takes
+    /// L1T3 whatever this says.
+    public let scalabilityMode: ScalabilityMode?
+
     public init(name: String? = nil,
                 encoding: VideoEncoding? = nil,
                 screenShareEncoding: VideoEncoding? = nil,
@@ -50,8 +54,10 @@ public final class VideoPublishOptions: NSObject, TrackPublishOptions, Sendable 
                 preferredCodec: VideoCodec? = nil,
                 preferredBackupCodec: VideoCodec? = nil,
                 degradationPreference: DegradationPreference = .auto,
-                streamName: String? = nil)
+                streamName: String? = nil,
+                scalabilityMode: ScalabilityMode? = nil)
     {
+        self.scalabilityMode = scalabilityMode
         self.name = name
         self.encoding = encoding
         self.screenShareEncoding = screenShareEncoding
@@ -77,7 +83,8 @@ public final class VideoPublishOptions: NSObject, TrackPublishOptions, Sendable 
             preferredCodec == other.preferredCodec &&
             preferredBackupCodec == other.preferredBackupCodec &&
             degradationPreference == other.degradationPreference &&
-            streamName == other.streamName
+            streamName == other.streamName &&
+            scalabilityMode == other.scalabilityMode
     }
 
     override public var hash: Int {
@@ -92,6 +99,7 @@ public final class VideoPublishOptions: NSObject, TrackPublishOptions, Sendable 
         hasher.combine(preferredBackupCodec)
         hasher.combine(degradationPreference)
         hasher.combine(streamName)
+        hasher.combine(scalabilityMode)
         return hasher.finalize()
     }
 }

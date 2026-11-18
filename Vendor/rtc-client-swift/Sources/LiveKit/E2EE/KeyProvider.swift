@@ -176,6 +176,29 @@ public final class BaseKeyProvider: NSObject, Loggable, Sendable {
         setCurrentKeyIndex(targetIndex)
     }
 
+    /// WordPlus RTC client: a key held at `index` without sending under it. Frames and data packets that name the index
+    /// decrypt with it, and this device goes on sending under the index it uses until `E2EEManager.useKey(index:)`. A
+    /// room moving to a new key holds it on every device first, so nobody loses a frame in the switch. `setKey` moves
+    /// the data packets' index at once, this leaves it.
+    ///
+    /// - Parameters:
+    ///   - keyData: The key bytes, stored as provided.
+    ///   - participantId: Required in non-shared key mode; the call is a no-op when `nil`.
+    ///   - index: The key index to hold it at, taken modulo the key ring.
+    public func holdKey(keyData: Data, participantId: String? = nil, index: Int32) {
+        if options.sharedKey {
+            rtcKeyProvider.setSharedKey(keyData, with: index)
+            return
+        }
+
+        guard let participantId else {
+            log("holdKey: Please provide valid participantId for non-SharedKey mode.")
+            return
+        }
+
+        rtcKeyProvider.setKey(keyData, with: index, forParticipant: participantId)
+    }
+
     public func ratchetKey(participantId: String? = nil, index: Int32? = nil) -> Data? {
         let targetIndex = index ?? getCurrentKeyIndex()
 

@@ -11,7 +11,7 @@ import AVFoundation
 /**
  Calls as iOS knows them: CallKit's ring on a locked phone and in a closed app, answering and hanging up from the
  system's screen, a watch, a car or headphones, calls that go on in the background, audio routes the system follows, a
- cellular call holding this one, and Recents. The Better Messages app's (`bm-calls`), whose calls these are.
+ cellular call holding this one, and Recents.
 
      // application(_:didFinishLaunchingWithOptions:), before anything else: a push may have woken the app
      SystemCalls.start(.init(name: "Example Shop")) {
@@ -24,7 +24,7 @@ import AVFoundation
    rings it through a VoIP push, which WordPlus Cloud sends with the app's own APNs key (the account's Apps page).
    The push is reported to CallKit before anything else, as iOS requires of every VoIP push. Then the app's closure
    gives a connection, the line is held on it, and the ring goes on as one that came over the line.
- - **An open app** rings on its own screen (`onIncoming`, or `CallScreen`), as the Better Messages app does, and the
+ - **An open app** rings on its own screen (`onIncoming`, or `CallScreen`), and the
    system's ring comes too once the push lands. Answered on either, it is answered once.
  - **Every call goes through CallKit,** placed or answered, a group call too: CallKit owns the audio session and hands
    it over (CallAudio). A live stream, which is no call, takes the session itself.
@@ -109,6 +109,67 @@ public final class SystemCalls: NSObject {
         }
     }
 
+    /// A ring of the app's own: one its server sends in a VoIP push of its own form, not a call of the user's line (the
+    /// WordPlus app's visitors calling a site's team, whose site rings the team's phones). The system shows it as any ring,
+    /// and answering it is the app's: it places the call, which then goes on as this ring.
+    public struct AppRing: Sendable {
+        /// The same for every phone it rings, and for the push that calls it off.
+        public let id: String
+        /// What the system's screen says: the caller.
+        public let name: String
+        public let video: Bool
+        /// Past this, it rings no more.
+        public let until: Date
+        /// The handle Recents keeps for it.
+        public let handle: String
+
+        public init(id: String, name: String, video: Bool, until: Date, handle: String) {
+            self.id = id
+            self.name = name
+            self.video = video
+            self.until = until
+            self.handle = handle
+        }
+    }
+
+    /// Reads each VoIP push that is not a ring of the user's line, with the app's own form: its ring, or nil (then the
+    /// push is reported and ended at once, as iOS asks of every VoIP push). Set it before a push can come, with `start`.
+    @MainActor
+    public static func onAppPush(_ read: @escaping ([AnyHashable: Any]) -> AppRing?) {
+        shared.appRead = read
+    }
+
+    /// An app ring answered on the system's screen: the app places its call (`rt.calls.start`), which takes the ring's
+    /// place on the system's screen, and gives it back, or nil when it could not, which ends the ring as failed.
+    @MainActor
+    public static func onAppAnswer(_ answer: @escaping @MainActor (AppRing) async -> Call?) {
+        shared.appAnswer = answer
+    }
+
+    /// An app ring declined on the system's screen, before it became a call.
+    @MainActor
+    public static func onAppDecline(_ decline: @escaping @MainActor (AppRing) -> Void) {
+        shared.appDecline = decline
+    }
+
+    /// An app ring is over before this phone answered it: another phone took it, or the caller called off.
+    @MainActor
+    public static func endAppRing(_ id: String, answeredElsewhere: Bool = false) {
+        guard let entry = shared.entries[id], entry.app != nil, entry.call == nil, !entry.appAnswering else { return }
+        shared.endReported(entry, reason: answeredElsewhere ? .answeredElsewhere : .remoteEnded)
+    }
+
+    /// The VoIP token PushKit gave this phone, for an app whose own server sends its rings: nil until it gave one.
+    @MainActor
+    public static var voipToken: String? { shared.pushToken }
+
+    /// The VoIP token each time it changes, nil when it went.
+    @MainActor
+    public static func onVoipToken(_ handler: @escaping (String?) -> Void) {
+        shared.voipHandlers.append(handler)
+        if let token = shared.pushToken { handler(token) }
+    }
+
     /// The activity the system hands the app for a call tapped in Recents, or asked of Siri: from
     /// `application(_:continue:restorationHandler:)` or the scene's `scene(_:continue:)`. True when it was one.
     @MainActor
@@ -141,6 +202,13 @@ public final class SystemCalls: NSObject {
     private var answeredHandlers: [(IncomingCall.Answered) -> Void] = []
     private var callBackHandlers: [(CallBack) -> Void] = []
     private var waitingCallBack: CallBack?
+    /// Rings of the app's own: what reads them from a VoIP push, and what the app does with one answered or declined.
+    private var appRead: (([AnyHashable: Any]) -> AppRing?)?
+    private var appAnswer: (@MainActor (AppRing) async -> Call?)?
+    private var appDecline: (@MainActor (AppRing) -> Void)?
+    private var voipHandlers: [(String?) -> Void] = []
+    /// An app ring answered, whose call the app is placing: the call it places takes the ring's place.
+    private var adopting: Entry?
     /// A call the system asked for and the app has not placed yet: the call that follows adopts it.
     private var requestedUUID: UUID?
 
@@ -176,6 +244,9 @@ public final class SystemCalls: NSObject {
         var heldCamera: Bool?
         var connectedReported = false
         var ended = false
+        /// A ring of the app's own, and whether the app is answering it.
+        var app: AppRing?
+        var appAnswering = false
 
         init(id: String, uuid: UUID, name: String, video: Bool, outgoing: Bool) {
             self.id = id
@@ -352,6 +423,7 @@ public final class SystemCalls: NSObject {
 
     /// Answered from the system's screen: the ring's answer, and the app told once it is on.
     private func answerFromSystem(_ entry: Entry) {
+        if let app = entry.app { return answerApp(entry, app) }
         guard let incoming = entry.incoming else {
             entry.answerOnArrival = true
             return
@@ -376,6 +448,12 @@ public final class SystemCalls: NSObject {
     /// main queue, as the calls are placed.
     func outgoing(_ call: Call) {
         guard options != nil, call.state != .ended else { return }
+        // The call an app ring became: it goes on as that ring, the system's same call, not a second one.
+        if let ring = adopting {
+            adopting = nil
+            adopt(ring, call)
+            return
+        }
         CallAudio.configure(video: call.type == .video)
         let entry = startOutgoing(id: call.id, handle: "wordplus:" + call.peer, name: call.peerInfo["name"]?.string ?? "", video: call.type == .video)
         entry?.call = call
@@ -427,7 +505,66 @@ public final class SystemCalls: NSObject {
 
     /// Whether a call is on here, so a ring is answered busy.
     var busy: Bool {
-        entries.values.contains { !$0.ended && ($0.call != nil || $0.group != nil || $0.answering != nil) }
+        entries.values.contains { !$0.ended && ($0.call != nil || $0.group != nil || $0.answering != nil || $0.appAnswering) }
+    }
+
+    // MARK: - Rings of the app's own
+
+    /// An app ring from its push: reported to the system before anything else, as for every VoIP push, and over at its end.
+    private func ringApp(_ app: AppRing, completion: @escaping () -> Void) {
+        CallLog.write("push app ring=\(app.id) video=\(app.video) until=\(Int(app.until.timeIntervalSinceNow))s")
+        let entry = Entry(id: app.id, uuid: UUID(), name: app.name, video: app.video, outgoing: false)
+        entry.app = app
+        // Twice for one ring, or a ring during a call: still a call reported, as iOS asks, and ended at once.
+        let again = entries[app.id].map { !$0.ended } ?? false
+        let late = app.until.timeIntervalSinceNow <= 0
+        if provider != nil {
+            reportIncoming(entry, handle: app.handle) { _ in completion() }
+        } else {
+            // No CallKit (a simulator): the app rings on its own screen.
+            remember(entry)
+            completion()
+        }
+        if again || late || busy {
+            endReported(entry, reason: again ? .answeredElsewhere : .unanswered)
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(1, app.until.timeIntervalSinceNow)) { [weak self] in
+            guard let self, self.entries[entry.id] === entry, entry.call == nil, !entry.appAnswering else { return }
+            self.endReported(entry, reason: .unanswered)
+        }
+    }
+
+    /// An app ring answered on the system's screen: the app places its call, which goes on as this ring.
+    private func answerApp(_ entry: Entry, _ app: AppRing) {
+        guard !entry.appAnswering, entry.call == nil else { return }
+        entry.appAnswering = true
+        CallAudio.configure(video: app.video)
+        adopting = entry
+        Task { @MainActor in
+            let call = await self.appAnswer?(app)
+            if self.adopting === entry { self.adopting = nil }
+            guard let call else {
+                entry.appAnswering = false
+                self.endReported(entry, reason: .failed)
+                return
+            }
+            // Placed otherwise than through the calls of the connection: it still goes on as this ring.
+            if entry.call == nil, !entry.ended { self.adopt(entry, call) }
+        }
+    }
+
+    /// The call an app ring became takes its place: the same call for the system, its audio session and its timer.
+    private func adopt(_ ring: Entry, _ call: Call) {
+        let entry = Entry(id: call.id, uuid: ring.uuid, name: ring.name, video: call.type == .video, outgoing: false)
+        entry.app = ring.app
+        entry.appAnswering = true
+        entry.call = call
+        ring.call = call
+        if entries[ring.id] === ring { entries[ring.id] = nil }
+        remember(entry)
+        if !ring.name.isEmpty { setName(ring.name, id: entry.id) }
+        track(call)
     }
 
     private func track(_ call: Call) {
@@ -612,6 +749,8 @@ public final class SystemCalls: NSObject {
             return
         }
         guard let ring = PushRing(payload) else {
+            // A ring of the app's own, which the app reads.
+            if let read = appRead, let app = read(payload) { return ringApp(app, completion: completion) }
             // A VoIP push must report a call even when it cannot be read: reported and ended at once.
             CallLog.write("a push carried no ring")
             let entry = Entry(id: "unread-" + UUID().uuidString, uuid: UUID(), name: options.name, video: false, outgoing: false)
@@ -724,7 +863,7 @@ public final class SystemCalls: NSObject {
     #if DEBUG
     /// A push as a debug build's launch argument gives one (`-WordPlusSimulatedPush <base64 JSON of the push>`), into
     /// the same entry point, and the system's answer after `-WordPlusSimulatedAnswer <seconds>`: the woken path on a
-    /// simulator, which has no PushKit or CallKit, as the Better Messages app rehearses it.
+    /// simulator, which has no PushKit or CallKit.
     private func rehearse() {
         let arguments = ProcessInfo.processInfo.arguments
         guard let at = arguments.firstIndex(of: "-WordPlusSimulatedPush"), at + 1 < arguments.count,
@@ -776,6 +915,14 @@ extension SystemCalls: CXProviderDelegate {
     }
 
     public func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
+        // An app ring declined on the system's screen, before it became a call: the app hears, and the ring goes.
+        if let entry = byUUID[action.callUUID], let app = entry.app, entry.call == nil {
+            CallLog.write("callkit declined app ring=\(entry.id)")
+            forget(entry)
+            if !entry.appAnswering, let decline = appDecline { Task { @MainActor in decline(app) } }
+            action.fulfill()
+            return
+        }
         if let entry = byUUID[action.callUUID] {
             CallLog.write("callkit ended call=\(entry.id)")
             forget(entry)
@@ -866,10 +1013,12 @@ extension SystemCalls: PKPushRegistryDelegate {
         pushToken = token
         // Every line held now brings it again, so the user's calls ring this phone from now on.
         RealtimeCalls.refreshLines()
+        voipHandlers.forEach { $0(token) }
     }
 
     public func pushRegistry(_ registry: PKPushRegistry, didInvalidatePushTokenFor type: PKPushType) {
         pushToken = nil
+        voipHandlers.forEach { $0(nil) }
     }
 
     public func pushRegistry(_ registry: PKPushRegistry, didReceiveIncomingPushWith payload: PKPushPayload, for type: PKPushType, completion: @escaping () -> Void) {
@@ -987,7 +1136,7 @@ enum Intents {
             return start.contacts?.first?.personHandle?.value.flatMap { callBack(handle: $0, video: start.callCapability == .videoCall) }
         }
         // And the two Apple deprecated, which the system still hands back: tapping a call in the history delivers
-        // `INStartAudioCallIntent`, not `INStartCallIntent` (the Better Messages app, iOS 26.6.1). Read by name, so
+        // `INStartAudioCallIntent`, not `INStartCallIntent` (seen on iOS 26.6.1). Read by name, so
         // the deprecated classes are not named here.
         let kind = String(describing: type(of: intent))
         guard kind == "INStartVideoCallIntent" || kind == "INStartAudioCallIntent",

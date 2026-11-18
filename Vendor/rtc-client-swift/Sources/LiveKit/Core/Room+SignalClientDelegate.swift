@@ -429,6 +429,10 @@ extension Room: SignalClientDelegate {
             // WordPlus Mesh (1.0.3, read here since 1.0.7): the node's codec policy, in a field LiveKit's JoinResponse
             // hasn't got, from the signal message's own bytes
             _state.mutate { $0.meshCodecPolicy = Mesh.codecPolicy(inSignalMessage: encoded) }
+            // WordPlus Mesh (1.0.10): the client's settings, in field 1002 of the join response
+            if let settings = Mesh.settingsJSON(inJoinMessage: encoded) {
+                await takeMeshSettings(settings)
+            }
             dataTracks?.handleJoinResponse(encoded)
         case let .participantUpdate(encoded):
             guard let identity = localParticipant.identity?.stringValue else { return }
@@ -459,6 +463,65 @@ extension Room: SignalClientDelegate {
     /// WordPlus Mesh (1.0.7, rtc-client 1.0.16): the node's pace for the reports (MeshEncoderReporter's tick).
     func signalClient(_: SignalClient, didReceiveMeshReportPace every: Int) async {
         _meshEncoders.setPace(every)
+    }
+
+    /// WordPlus Mesh (1.0.10): the client's settings on a running call.
+    func signalClient(_: SignalClient, didReceiveMeshSettings settings: Data) async {
+        await takeMeshSettings(settings)
+    }
+
+    /// WordPlus Mesh (1.0.13): the tracks it subscribes to that stopped reaching its node.
+    func signalClient(_: SignalClient, didReceiveMeshSourcesDry dry: Set<String>) async {
+        takeMeshSourcesDry(dry)
+    }
+
+    /// Keeps what the node says of the tracks that stopped reaching it, telling the product only when that changed.
+    func takeMeshSourcesDry(_ dry: Set<String>) {
+        let changed = _meshSourcesDry.mutate { held -> Bool in
+            defer { held = dry }
+            return held != dry
+        }
+        if changed, let handler = _meshSourcesDryHandler.read({ $0 }) {
+            handler(dry)
+        }
+    }
+
+    /// Takes the settings a node sent, whole: keeps them for the next connect to this server, holds this room's cameras
+    /// to their live caps, starts the round-trip probe when they name nodes to measure, and tells the product what
+    /// changed.
+    func takeMeshSettings(_ data: Data) async {
+        guard let next = MeshSettings.parse(data) else {
+            log("settings from the server not read (\(data.count) bytes)", .warning)
+            return
+        }
+        let before = _state.mutate { state -> MeshSettings in
+            defer { state.meshSettings = next }
+            return state.meshSettings ?? .none
+        }
+        if let url = _state.providedUrl {
+            MeshSettings.keep(data, for: url)
+        }
+        let changed = next.changed(from: before)
+        log("settings rev \(next.rev), \(next.values.count) set, changed: \(changed.sorted())")
+        if next.cameraCaps != before.cameraCaps {
+            await localParticipant.applyMeshCaps()
+        }
+        // what the encoder of a running camera gives up first, live (`camera.degradation`)
+        if changed.contains("camera.degradation") {
+            await localParticipant.applyMeshDegradation()
+        }
+        // whether a camera in one SVC stream sends only the sizes its viewers ask for, live (`camera.svcTrim`)
+        if changed.contains("camera.svcTrim") {
+            await localParticipant.applyMeshSvcTrim()
+        }
+        // how often the connections' stats are read (`stats.everyMs`)
+        _meshEncoders.stats.setEvery(next.number("stats.everyMs").map { $0 / 1000 } ?? MeshStats.readEvery)
+        if next.bool("probe.enabled") == true, !next.probe.isEmpty {
+            await MeshProbe.shared.measure(next.probe, samples: next.int("probe.samples") ?? 3, cacheMinutes: next.int("probe.cacheMin") ?? 20)
+        }
+        if !changed.isEmpty || before.rev != next.rev, let handler = _meshSettingsHandler.read({ $0 }) {
+            handler(next, changed)
+        }
     }
 
     func signalClient(_: SignalClient, didReceiveMediaSectionsRequirement requirement: Livekit_MediaSectionsRequirement) async {

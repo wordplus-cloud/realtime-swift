@@ -191,6 +191,17 @@ extension LocalTrackPublication {
                                                     publishOptions: publishOptions,
                                                     isScreenShare: track.source == .screenShareVideo)
 
+        // WordPlus Mesh (1.0.10): a camera's live caps from its settings hold over what its options compute
+        if track.source == .camera {
+            let off = room.cameraCaps.apply(to: encodings, lines: Int(min(dimensions.width, dimensions.height)))
+            MeshCappedLayers.set(off, for: sender.raw)
+            // 1.0.11: a camera in one SVC stream goes out whole under them, and a trim (MeshSvcTrim) over that, which
+            // dynacast's state applied after this gives back
+            if encodings.count == 1 {
+                MeshSvcTrim.rebase(sender.raw, scale: encodings[0].scaleResolutionDownBy)
+            }
+        }
+
         log("Computed encodings: \(encodings)")
 
         for current in parameters.encodings {

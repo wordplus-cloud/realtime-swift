@@ -48,6 +48,66 @@ final class LiveStreamTests: XCTestCase {
         XCTAssertGreaterThan(changes, 0)
     }
 
+    /// A stream with a seat in its room, which nothing can connect to: `media` says whether it tried. As the browser's
+    /// `video` option (realtime-client calls.ts:239, streams/client.ts:752-762).
+    private func seated(video: Bool) -> LiveStream {
+        let rt = Realtime(RealtimeOptions(app: "app_test", endpoint: URL(string: "https://shop.example/api/realtime")!))
+        kept.append(rt)
+        let s = LiveStream(owner: rt.calls, name: "show:1", video: video)
+        s.seats = ["media": ["url": "wss://nowhere.invalid", "token": "t"]]
+        return s
+    }
+
+    private var kept: [Realtime] = []
+    private let ended = #"{"stream": {"id": "show:1", "state": "ended"}, "you": {"identity": "u:34", "role": "viewer"}}"#
+    private let live = #"{"stream": {"id": "show:1", "state": "live"}}"#
+
+    private func moment() async { try? await Task.sleep(nanoseconds: 100_000_000) }
+
+    func testAStreamTakesThePictureByDefault() async {
+        let s = seated(video: true)
+        XCTAssertTrue(s.video)
+        s.apply("hello", json(ended))
+        s.apply("hello", json(live))
+        await moment()
+        XCTAssertNotEqual(s.media, .off)
+        s.leave()
+    }
+
+    func testAStreamJoinedWithoutThePictureDoesNotFetchIt() async {
+        let s = seated(video: false)
+        XCTAssertFalse(s.video)
+        s.apply("hello", json(ended))
+        s.apply("hello", json(live))
+        await moment()
+        XCTAssertEqual(s.media, .off)
+        XCTAssertEqual(s.state, .live, "the chat and the state go on")
+        s.leave()
+    }
+
+    func testThePictureComesOnceAsked() async {
+        let s = seated(video: false)
+        s.apply("hello", json(ended))
+        s.apply("hello", json(live))
+        s.watch()
+        XCTAssertTrue(s.video)
+        await moment()
+        XCTAssertNotEqual(s.media, .off)
+        s.leave()
+    }
+
+    func testAskedBeforeItIsLiveThePictureComesWithIt() async {
+        let s = seated(video: false)
+        s.apply("hello", json(ended))
+        s.watch()
+        await moment()
+        XCTAssertEqual(s.media, .off, "nothing to fetch yet")
+        s.apply("hello", json(live))
+        await moment()
+        XCTAssertNotEqual(s.media, .off)
+        s.leave()
+    }
+
     func testTheChatAsItGoes() {
         let s = stream()
         var heard: [String] = []
@@ -165,6 +225,62 @@ final class LiveStreamTests: XCTestCase {
         XCTAssertFalse(s.handRaised)
         s.apply("unstaged", json("{}"))
         XCTAssertFalse(s.onStage, "a viewer who never came on stage stays off it")
+    }
+
+    /// As the player of the web offers it (realtime-ui streams/controls.tsx): signed in, not the host, live, taking guests.
+    func testWhoMayAskToComeOnStage() {
+        func may(_ change: (String) -> String = { $0 }) -> Bool {
+            let s = stream()
+            s.apply("hello", json(change(hello)))
+            return s.canAskStage
+        }
+        XCTAssertTrue(may())
+        XCTAssertTrue(may { $0.replacingOccurrences(of: #", "stage": true"#, with: "") }, "a cloud that does not say takes guests")
+        XCTAssertFalse(may { $0.replacingOccurrences(of: #""stage": true"#, with: #""stage": false"#) })
+        XCTAssertFalse(may { $0.replacingOccurrences(of: #""identity": "u:34""#, with: #""identity": "a:0123456789abcdef""#) }, "a visitor")
+        XCTAssertFalse(may { $0.replacingOccurrences(of: #""role": "viewer", "name": "Ben""#, with: #""role": "host", "name": "Ben""#) })
+        XCTAssertFalse(may { $0.replacingOccurrences(of: #""state": "live""#, with: #""state": "idle""#) })
+    }
+
+    func testSayingNoToTheInvitationTellsNobodyAndItMayComeAgain() async {
+        let s = stream()
+        s.apply("hello", json(hello))
+        var asked: [String] = []
+        s.asking = { event, _ in asked.append(event); return self.json(#"{"ok": true}"#) }
+        s.declineStage()
+        s.apply("invited", json("{}"))
+        XCTAssertTrue(s.invited)
+        s.declineStage()
+        XCTAssertFalse(s.invited)
+        XCTAssertEqual(asked, [])
+        s.apply("invited", json("{}"))
+        XCTAssertTrue(s.invited)
+    }
+
+    /// The cloud takes the guest off first (realtime-client streams/client.ts:3182). When the word is its own, it hears nothing back.
+    func testLeavingTheStageTellsTheCloudAndItsOwnWordDoesNot() async {
+        let s = stream()
+        s.apply("hello", json(hello))
+        var asked: [String] = []
+        s.asking = { event, payload in
+            asked.append(event + " " + (payload["identity"]?.string ?? ""))
+            return self.json(#"{"ok": true}"#)
+        }
+        s.leaveStage()
+        XCTAssertEqual(asked, [], "a viewer never on stage has nothing to leave")
+
+        s.onStage = true
+        s.leaveStage()
+        XCTAssertFalse(s.onStage)
+        await Task.yield()
+        for _ in 0..<50 where asked.isEmpty { try? await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertEqual(asked, ["unstage u:34"])
+
+        s.onStage = true
+        s.apply("unstaged", json("{}"))
+        XCTAssertFalse(s.onStage)
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(asked, ["unstage u:34"])
     }
 
     func testAViewerOffStageSendsNothing() async {

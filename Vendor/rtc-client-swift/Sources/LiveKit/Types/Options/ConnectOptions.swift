@@ -103,6 +103,11 @@ public final class ConnectOptions: NSObject, Sendable {
     /// `full` while the mesh holds a place for it, `unreachable` while no server of the list answers.
     @nonobjc public let onMeshWait: (@Sendable (MeshWait) -> Void)?
 
+    /// WordPlus Mesh (1.0.10): the waits before each reconnect attempt, first first (`reconnect.delaysMs` of the
+    /// client's settings): as many attempts as waits, each with up to a tenth of jitter, in place of the
+    /// `reconnectAttempts` curve from `reconnectAttemptDelay` to `reconnectMaxDelay`. Nil: that curve.
+    public let meshReconnectDelays: [TimeInterval]?
+
     override public init() {
         autoSubscribe = true
         reconnectAttempts = 10
@@ -122,6 +127,7 @@ public final class ConnectOptions: NSObject, Sendable {
         meshHardwareEncoders = []
         meshApp = nil
         onMeshWait = nil
+        meshReconnectDelays = nil
     }
 
     public convenience init(autoSubscribe: Bool = true,
@@ -174,8 +180,10 @@ public final class ConnectOptions: NSObject, Sendable {
                          meshHardwareDecoders: [String],
                          onMeshWait: (@Sendable (MeshWait) -> Void)?,
                          meshHardwareEncoders: [String] = [],
-                         meshApp: MeshApp? = nil)
+                         meshApp: MeshApp? = nil,
+                         meshReconnectDelays: [TimeInterval]? = nil)
     {
+        self.meshReconnectDelays = meshReconnectDelays.flatMap { $0.isEmpty ? nil : $0.map { max(0, $0) } }
         self.meshJoinBudget = meshJoinBudget
         self.meshHardwareDecoders = meshHardwareDecoders
         self.meshHardwareEncoders = meshHardwareEncoders
@@ -217,6 +225,7 @@ public final class ConnectOptions: NSObject, Sendable {
             meshHardwareDecoders == other.meshHardwareDecoders &&
             meshHardwareEncoders == other.meshHardwareEncoders &&
             meshApp == other.meshApp &&
+            meshReconnectDelays == other.meshReconnectDelays &&
             (onMeshWait == nil) == (other.onMeshWait == nil)
     }
 

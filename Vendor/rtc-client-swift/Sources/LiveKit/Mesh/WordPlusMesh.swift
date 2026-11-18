@@ -235,13 +235,54 @@ enum Mesh {
     /// The WordPlus RTC client for Swift's own version, which a mesh node is told on each join (`rtc_client`) beside
     /// upstream's, which the client reports as its SDK's and servers gate protocol features on. build.sh refuses a
     /// patch whose version here isn't the one its revisions list.
-    static let clientVersion = "1.0.9"
+    static let clientVersion = "1.0.15"
 
     /// What this client can do beyond upstream's, which a mesh node is told on each join (`mesh_caps`, 1.0.3, as
     /// rtc-client 1.0.7 and 1.0.8): it stops sending an audio track nobody hears when its node says so
-    /// (`LocalAudioTrack.setMeshHeard`), and its room hands the node's codec policy to the product
-    /// (`Room.meshCodecPolicy`).
-    static let caps = "audio-pause,codec-policy"
+    /// (`LocalAudioTrack.setMeshHeard`), its room hands the node's codec policy to the product
+    /// (`Room.meshCodecPolicy`), since 1.0.10 it reads its settings (`Room.meshSettings`, fields 1002 and 102), and
+    /// since 1.0.13 which tracks stopped reaching its node (`Room.meshSourcesDry`, field 103).
+    static let caps = "audio-pause,codec-policy,settings,source-dry"
+
+    /// The signal response field a node tells a viewer in which of the tracks it subscribes to have stopped reaching the
+    /// node (1.0.13, rtc-client 1.0.25): JSON, `{"dry": ["TR_..."]}`, its whole list each time, empty when none has.
+    static let sourcesDryField: UInt64 = 103
+
+    /// The tracks a signal response says stopped reaching the node (`sourcesDryField`); nil when the message is another.
+    static func sourcesDry(inSignalMessage data: Data) -> Set<String>? {
+        guard let raw = lengthDelimitedField(sourcesDryField, in: data),
+              let object = try? JSONSerialization.jsonObject(with: raw) as? [String: Any],
+              let dry = object["dry"] as? [Any] else { return nil }
+        return Set(dry.compactMap { $0 as? String })
+    }
+
+    /// The join response field a node sends a client its settings in (1.0.10, WordPlus Mesh's client settings): JSON,
+    /// `MeshSettings`. LiveKit's JoinResponse has no field of that number; 1001 is the codec policy.
+    static let settingsJoinField: UInt64 = 1002
+
+    /// The signal response field a node sends a client its settings in on a running call, whenever they change (1.0.10):
+    /// the same JSON. 100 is the region list, 101 the report pace.
+    static let settingsField: UInt64 = 102
+
+    /// The wait before a reconnect attempt from the settings' list (`ConnectOptions.meshReconnectDelays`): the
+    /// attempt's own, the last one's past the list, with up to a tenth of jitter, as the curve has.
+    @Sendable
+    static func reconnectDelay(forAttempt attempt: Int, delays: [TimeInterval]) -> TimeInterval {
+        guard let delay = delays[safe: attempt] ?? delays.last else { return 0 }
+        return delay + Double.random(in: 0 ..< 0.1) * delay
+    }
+
+    /// The settings a signal message carrying a join response has (its `join`, field 1, then `settingsJoinField` in it),
+    /// as JSON, if any.
+    static func settingsJSON(inJoinMessage data: Data) -> Data? {
+        lengthDelimitedField(1, in: data).flatMap { lengthDelimitedField(settingsJoinField, in: $0) }
+    }
+
+    /// The settings a signal response sends on a running call (`settingsField`), as JSON; nil when the message is
+    /// another.
+    static func settingsJSON(inSignalMessage data: Data) -> Data? {
+        lengthDelimitedField(settingsField, in: data)
+    }
 
     /// What a join to a mesh's server says beside upstream's parameters (upstream already names the network's type,
     /// `network`):
@@ -268,6 +309,10 @@ enum Mesh {
         }
         if let device = deviceType() {
             items.append(URLQueryItem(name: "device_type", value: device))
+        }
+        // 1.0.10: the round trips to each region this network measured lately (MeshProbe), for the mesh's placement
+        if let rtt = MeshProbe.joinParam() {
+            items.append(URLQueryItem(name: "mesh_rtt", value: rtt))
         }
         if url.isMeshWait {
             items.append(URLQueryItem(name: "mesh_wait", value: "1"))

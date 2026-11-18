@@ -251,6 +251,96 @@ public class LocalParticipant: Participant, @unchecked Sendable {
         sender.raw._set(subscribedQualities: merged)
     }
 
+    /// WordPlus Mesh (1.0.10): holds every camera this participant publishes to the live caps its settings hold now
+    /// (`MeshCaps`), on its running sender: its encodings computed again from its options and dimensions under the
+    /// caps, then dynacast's last state on top, so a layer nobody watches stays paused and one the caps turned off stays
+    /// off. Caps lifted, the camera goes back to what its options compute.
+    func applyMeshCaps() async {
+        guard let room = _room else { return }
+        let caps = room.cameraCaps
+        for publication in localVideoTracks where publication.source == .camera {
+            guard let track = publication.track as? LocalVideoTrack else { continue }
+            let (qualities, backups, qualitiesForCodec) = track._state.read { ($0.subscribedQualities, $0.rtpSenderForCodec, $0.subscribedQualitiesForCodec) }
+            let publishOptions = (track.publishOptions as? VideoPublishOptions) ?? room._state.roomOptions.defaultVideoPublishOptions
+            await RTC.run {
+                publication.recomputeSenderParameters()
+                if !qualities.isEmpty, let sender = track._state.rtpSender {
+                    sender.raw._set(subscribedQualities: qualities)
+                }
+                // a backup codec's sender, for the viewers that decode none of the camera's codec, under the same caps
+                guard let dimensions = track.capturer.dimensions else { return }
+                for (codec, sender) in backups {
+                    let encodings = Utils.computeVideoEncodings(dimensions: dimensions, publishOptions: publishOptions, isScreenShare: false, overrideVideoCodec: codec)
+                    MeshCappedLayers.set(caps.apply(to: encodings, lines: Int(min(dimensions.width, dimensions.height))), for: sender.raw)
+                    let parameters = sender.raw.parameters
+                    for current in parameters.encodings {
+                        guard let updated = encodings.first(where: { $0.rid == current.rid }) else { continue }
+                        current.isActive = updated.isActive
+                        current.scaleResolutionDownBy = updated.scaleResolutionDownBy
+                        current.maxBitrateBps = updated.maxBitrateBps
+                        current.maxFramerate = updated.maxFramerate
+                    }
+                    sender.raw.parameters = parameters
+                    if let codecQualities = qualitiesForCodec[codec], !codecQualities.isEmpty {
+                        sender.raw._set(subscribedQualities: codecQualities)
+                    }
+                }
+            }
+        }
+    }
+
+    /// WordPlus Mesh (1.0.11): whether every camera this participant publishes in one SVC stream sends only the sizes
+    /// its viewers ask for (`camera.svcTrim`, MeshSvcTrim), on its running sender: dynacast's last state given again,
+    /// trimmed or whole.
+    func applyMeshSvcTrim() async {
+        guard let room = _room else { return }
+        let on = room.meshSettings.bool("camera.svcTrim") == true
+        for publication in localVideoTracks where publication.source == .camera {
+            guard let track = publication.track as? LocalVideoTrack else { continue }
+            let (qualities, sender) = track._state.read { ($0.subscribedQualities, $0.rtpSender) }
+            guard let sender else { continue }
+            await RTC.run {
+                MeshSvcTrim.set(on: on, for: sender.raw)
+                if !qualities.isEmpty {
+                    sender.raw._set(subscribedQualities: qualities)
+                }
+            }
+        }
+    }
+
+    /// WordPlus Mesh (1.0.10): what the encoder of a running camera gives up first, as the settings say it
+    /// (`camera.degradation`), on its sender and its backups' at once: the settings' word where they set one, what the
+    /// camera was published with where they don't (or say `default`).
+    func applyMeshDegradation() async {
+        guard let room = _room else { return }
+        let settings = room.meshSettings
+        let word = settings.isSet("camera.degradation") ? settings.word("camera.degradation") : nil
+        for publication in localVideoTracks where publication.source == .camera {
+            guard let track = publication.track as? LocalVideoTrack else { continue }
+            let publishOptions = (track.publishOptions as? VideoPublishOptions) ?? room._state.roomOptions.defaultVideoPublishOptions
+            let preference = MeshSettings.degradation(word) ?? publishOptions.degradationPreference
+            let resolved = preference.resolve(for: track.source)
+            let senders = track._state.read { state in [state.rtpSender].compactMap { $0 } + Array(state.rtpSenderForCodec.values) }
+            await RTC.run {
+                for sender in senders {
+                    sender.raw.set(degradationPreference: resolved)
+                }
+            }
+        }
+    }
+
+    /// WordPlus Mesh (1.0.10): the same video track out again with other publish options, the track kept running in
+    /// between: a settings revision with `applyNow` moves a shared screen to its new shape without the person starting
+    /// the broadcast again, which unpublishing (it stops the track) would take.
+    @discardableResult
+    public func republish(publication: LocalTrackPublication, options: VideoPublishOptions) async throws -> LocalTrackPublication {
+        guard let track = publication.track as? LocalVideoTrack else {
+            throw LiveKitError(.invalidState, message: "republish takes a published video track")
+        }
+        try await _unpublish(publication: publication, notify: true, stopTrack: false)
+        return try await publish(videoTrack: track, options: options)
+    }
+
     /// Re-applies the last known dynacast state to every local video sender.
     ///
     /// Applying a publisher answer re-enables every encoding, and the server only ever reports
@@ -880,11 +970,16 @@ extension LocalParticipant {
                 ? Transport.startBitrateKbps(for: sendEncodings, isScreenShare: track.source == .screenShareVideo)
                 : nil
 
+            // WordPlus Mesh (1.0.15): audio the server may ask again for what its upload lost (`AudioPublishOptions.resend`)
+            let resendAudio = (track is LocalAudioTrack)
+                && ((options as? AudioPublishOptions) ?? room._state.roomOptions.defaultAudioPublishOptions).resend
+
             let negotiateFunc: @Sendable () async throws -> Void = {
                 let sender = try await RTC.run {
                     let transceiver = try publisher.addTransceiver(with: track.mediaTrack.raw,
                                                                    transceiverInit: transInit,
-                                                                   startBitrateKbps: startBitrateKbps)
+                                                                   startBitrateKbps: startBitrateKbps,
+                                                                   resendAudio: resendAudio)
 
                     if track is LocalVideoTrack {
                         let publishOptions = (options as? VideoPublishOptions) ?? room._state.roomOptions.defaultVideoPublishOptions
@@ -962,6 +1057,23 @@ extension LocalParticipant {
             // WordPlus Mesh (1.0.3): a new video's encoders are told once they run, not at the next reading
             if track is LocalVideoTrack {
                 room._meshEncoders.reportSoon(room)
+            }
+
+            // WordPlus Mesh (1.0.10): a camera goes out under the live caps its settings hold now
+            if track.source == .camera, !room.cameraCaps.isEmpty {
+                await applyMeshCaps()
+            }
+            // and what its encoder gives up first, where the settings set it
+            if track.source == .camera, room.meshSettings.isSet("camera.degradation") {
+                await applyMeshDegradation()
+            }
+            // 1.0.11: and its SVC sizes trimmed to its viewers, where the settings say so
+            if track.source == .camera, room.meshSettings.bool("camera.svcTrim") == true {
+                await applyMeshSvcTrim()
+            }
+            // the hardware-drop watch, ended after a while without a camera, watches this one
+            if track.source == .camera {
+                room._meshHardwareDrops.start(room)
             }
 
             log("[publish] success \(publication)", .info)

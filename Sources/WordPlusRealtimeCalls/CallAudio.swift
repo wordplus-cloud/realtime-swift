@@ -4,8 +4,7 @@ import AVFoundation
 import LiveKit
 import LiveKitWebRTC
 
-/// The audio session, which belongs to CallKit once `SystemCalls` runs, rather than to us. The same rules as the
-/// Better Messages app's (`BmCallsAudio`), whose calls these are.
+/// The audio session, which belongs to CallKit once `SystemCalls` runs, rather than to us.
 ///
 /// The rule that shapes this file: **never call `setActive(true)` while CallKit owns the session**. CallKit activates
 /// the session when the call is really starting (after the person has answered on the lock screen, after a cellular
@@ -40,7 +39,7 @@ enum CallAudio {
         // `setActive(false)` when it does neither. A group call publishes nothing on the way in, so every remote
         // microphone going on or off moved the category, and the first one to arrive ran `setActive(false)` then
         // `setActive(true)` on a `.playback` session in the middle of a call: a group call was silent on a phone
-        // while the same call was fine in a browser (the Better Messages app, which found it). The session is
+        // while the same call was fine in a browser. The session is
         // configured in `configure(video:)` and handed over by CallKit, and that is the whole of it.
         AudioManager.shared.audioSession.isAutomaticConfigurationEnabled = false
 

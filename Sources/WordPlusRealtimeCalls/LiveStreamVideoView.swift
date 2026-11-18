@@ -65,6 +65,14 @@ public final class LiveStreamVideoView: UIView {
         let track = stream.videoTrack(of: shown)
         if video.track !== track { video.track = track }
         video.mirrorMode = shown?.local == true ? .mirror : .off
+        // A picture comes at the size its view asks: a viewer's choice of layer (`setQuality`) is that layer's size.
+        let density = stream.chosenLayer(of: shown).flatMap { LiveStreamPicture.density(for: $0, in: bounds.size, fills: fills) }
+        video.adaptiveStreamPixelDensity = density.map { .fixed($0) } ?? .auto
+    }
+
+    public override func layoutSubviews() {
+        super.layoutSubviews()
+        if let stream { draw(stream) }
     }
 }
 #endif

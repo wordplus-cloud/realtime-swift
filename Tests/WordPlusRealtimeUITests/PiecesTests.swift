@@ -14,9 +14,9 @@ final class PiecesTests: XCTestCase {
         super.tearDown()
     }
 
-    private func screen( phase: String ) -> BmCallsScreen {
+    private func screen( phase: String ) -> CallsScreen {
         _ = CallScreen.shared
-        let screen = BmCallsScreen()
+        let screen = CallsScreen()
         screen.loadViewIfNeeded()
         screen.view.frame = CGRect( x: 0, y: 0, width: 390, height: 844 )
         screen.apply( state: [ "phase": phase, "type": "video", "group": false, "local": [ "muted": false, "camera": false ] ] )
@@ -25,7 +25,7 @@ final class PiecesTests: XCTestCase {
     }
 
     /// The dock's buttons, in their order: by what VoiceOver says of them.
-    private func dock( _ screen: BmCallsScreen ) -> [ String ] {
+    private func dock( _ screen: CallsScreen ) -> [ String ] {
         func find( _ view: UIView ) -> UIStackView? {
             if let stack = view as? UIStackView, stack.arrangedSubviews.contains( where: { $0.accessibilityLabel == "End Call" } ) { return stack }
             return view.subviews.lazy.compactMap( find ).first
@@ -33,12 +33,30 @@ final class PiecesTests: XCTestCase {
         return find( screen.view )?.arrangedSubviews.map { $0.accessibilityLabel ?? "?" } ?? []
     }
 
-    private func label( _ screen: BmCallsScreen, _ text: String ) -> UILabel? {
+    private func label( _ screen: CallsScreen, _ text: String ) -> UILabel? {
         func find( _ view: UIView ) -> UILabel? {
             if let label = view as? UILabel, label.text == text { return label }
             return view.subviews.lazy.compactMap( find ).first
         }
         return find( screen.view )
+    }
+
+    /// A share needs the broadcast extension of the app (ScreenShare), so the dock asks before it shows the button.
+    func testTheDockSharesTheScreenOnlyWhereTheAppCan() {
+        func button( _ view: UIView ) -> UIView? {
+            if view.accessibilityLabel == "Share Screen" { return view }
+            return view.subviews.lazy.compactMap( button ).first
+        }
+        let without = screen( phase: "in_progress" )
+        XCTAssertEqual( button( without.view )?.isHidden, true, "by default it is hidden" )
+
+        let can = CallsScreen()
+        can.canShareScreen = true
+        can.loadViewIfNeeded()
+        can.view.frame = CGRect( x: 0, y: 0, width: 390, height: 844 )
+        can.apply( state: [ "phase": "in_progress", "type": "video", "group": false, "canShareScreen": true, "local": [ "muted": false, "camera": false ] ] )
+        can.view.layoutIfNeeded()
+        XCTAssertEqual( button( can.view )?.isHidden, false )
     }
 
     func testWithoutPiecesTheScreenIsOurs() {
@@ -72,9 +90,14 @@ final class PiecesTests: XCTestCase {
             if view.accessibilityIdentifier == "call-control-notes" { return view }
             return view.subviews.lazy.compactMap( find ).first
         }
+        func labelled( _ label: String, in view: UIView ) -> UIView? {
+            if view.accessibilityLabel == label { return view }
+            return view.subviews.lazy.compactMap { labelled( label, in: $0 ) }.first
+        }
         let notes = find( screen.view )
-        XCTAssertTrue( notes is BmCallsButton )
-        XCTAssertGreaterThan( notes?.bounds.width ?? 0, 30 )
+        XCTAssertTrue( notes is CallsButton )
+        XCTAssertGreaterThan( notes?.bounds.width ?? 0, 0 )
+        XCTAssertEqual( notes?.bounds.height ?? 0, labelled( "End Call", in: screen.view )?.bounds.height ?? -1, "the app's button is not the size of the rest" )
         XCTAssertTrue( notes?.accessibilityActivate() ?? false )
         XCTAssertEqual( pressed, 1 )
     }

@@ -223,6 +223,26 @@ enum CallCodecs {
     /// Every call now starts from what the hardware can do.
     private static var brokenCache: [String: Set<String>] = [:]
 
+    /// How long a codec whose hardware dropped a camera's frames stays out,
+    /// as the media server's settings say it (`tune.rememberDropsDays`,
+    /// `tune.forgetBefore`): the last group call's, set by `GroupCall`; the
+    /// room client's month where none came.
+    static var dropSettings: MeshSettings {
+        get {
+            dropLock.lock()
+            defer { dropLock.unlock() }
+            return _dropSettings
+        }
+        set {
+            dropLock.lock()
+            defer { dropLock.unlock() }
+            _dropSettings = newValue
+        }
+    }
+
+    private static let dropLock = NSLock()
+    private static var _dropSettings = MeshSettings.none
+
     private static func shortName(_ family: String) -> String {
         String(family.dropFirst("video/".count))
     }
@@ -258,8 +278,9 @@ enum CallCodecs {
         // (the room client's MeshHardwareDrops, as the web's
         // encoder-watch.ts) is not sent: a room's camera goes out in VP8
         // (roomPublishCodec), and a direct call's is not sent from that
-        // hardware at a few frames a second. Remembered for a month.
-        let dropped = Set(MeshHardwareDrops.codecs().map { "video/" + $0.uppercased() })
+        // hardware at a few frames a second. Remembered for a month, or as
+        // long as the media server's settings say (`dropSettings`).
+        let dropped = Set(MeshHardwareDrops.codecs(settings: dropSettings).map { "video/" + $0.uppercased() })
 
         guard !current.isEmpty || !dropped.isEmpty else { return caps }
 
@@ -352,8 +373,7 @@ enum CallCodecs {
     }
 
     /// Which codec a room's camera (or screen) goes out in, as the browser
-    /// picks it (the realtime client's calls/room-publish.ts, cameraCodecFor())
-    /// and Better Messages' app does.
+    /// picks it (the realtime client's calls/room-publish.ts, cameraCodecFor()).
     ///
     /// A room is not negotiated the way a direct call is: the media server
     /// forwards each publisher's codec to everyone subscribed, so the choice
@@ -558,5 +578,44 @@ enum CallCodecs {
         // nullable array imports as `error: ()`, so the call reads oddly and
         // has to be written this way.
         try? transceiver.setCodecPreferences(preferred + others + rest, error: ())
+    }
+
+    /// Redundant audio (RED, RFC 2198) on the microphone, as the web's
+    /// `applyRedPreferences`: each packet carries the one before it again, so
+    /// a packet lost on the way is played from the next instead of made up.
+    /// A room's microphone has had it from the start; a direct call's sent
+    /// plain Opus, and over the direct calls of 31 Oct 2026 a microphone broke
+    /// up in 31 of the moments something went wrong. RED is sent only when it
+    /// leads the negotiated codecs, so both sides put it first where they can:
+    /// a side without it leaves it out of its section and the call goes on
+    /// plain Opus that way. The shared screen's sound stays plain, as in a
+    /// room.
+    ///
+    /// The positions of `mimeTypes` with RED first, then Opus, then the rest
+    /// as they were; nil when RED is not among them.
+    static func redOrder(_ mimeTypes: [String]) -> [Int]? {
+        let lower = mimeTypes.map { $0.lowercased() }
+        let red = lower.indices.filter { lower[$0] == "audio/red" }
+
+        guard !red.isEmpty else { return nil }
+
+        let opus = lower.indices.filter { lower[$0] == "audio/opus" }
+
+        return red + opus + lower.indices.filter { !red.contains($0) && !opus.contains($0) }
+    }
+
+    /// Puts RED first on a microphone's transceiver; answers whether it did.
+    static func applyRed(to transceiver: LKRTCRtpTransceiver, factory: LKRTCPeerConnectionFactory) -> Bool {
+        let codecs = factory.rtpReceiverCapabilities(forKind: "audio").codecs
+
+        guard let order = redOrder(codecs.map { $0.mimeType }) else { return false }
+
+        do {
+            try transceiver.setCodecPreferences(order.map { codecs[$0] }, error: ())
+
+            return true
+        } catch {
+            return false
+        }
     }
 }

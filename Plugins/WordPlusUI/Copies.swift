@@ -72,7 +72,7 @@ struct Copies {
         Its tests, on the preview's states with no call: \( relative( tests ) )/. \( testsNote ?? "Run them after a change, on a simulator." )
         Every state of your copy, with no call: CallScreenPreview() (in a UINavigationController), or `#Preview { CallScreenPreview( .video ) }`.
 
-        In the target: take WordPlusRealtimeUI out of its dependencies (your copy is the screen now), and add LiveKit
+        In the target: take WordPlusRealtimeUI out of its dependencies (your copy is the screen now), and add WordPlusRTC
         (this package's room client) and LiveKitWebRTC (webrtc-xcframework), which the screen draws with. Then use it as before:
         CallScreen.shared.attach( rt.calls ). When the package updates: \( command ) diff.
         """ )

@@ -65,9 +65,11 @@ final class ProofTests: XCTestCase {
         try ask("answer")
         expect(app.staticTexts["call-state"], value: "connected", timeout: 30)
         try ask("wait", ["connected": true])
+        // Both sides tell the server how the call goes: what each sends and plays, on its pulse.
+        try ask("wait", ["readings": true])
 
         // The screen put away, the call goes on in the shop bar, and comes back from it.
-        app.buttons["Toggle Chat Screen"].tap()
+        app.buttons["Back to the shop"].tap()
         XCTAssertTrue(app.buttons["back-to-call"].waitForExistence(timeout: 5))
         expectHittable(app.buttons["back-to-call"])
         app.buttons["back-to-call"].tap()
@@ -100,16 +102,22 @@ final class ProofTests: XCTestCase {
         expect(app.staticTexts["order-live"], label: "Live")
         expect(any(app, "member-34"), value: "online")
 
-        // Ben calls Ann, then adds Cara from the shop bar: the call becomes a group call, and all three meet in its room.
+        // Ben calls Ann, then adds Cara from the screen's Add Person, the one person the shop server lists: her row says
+        // the ring, the call becomes a group call under it, and all three meet in its room.
         app.buttons["call-34"].tap()
         try ask("answer")
         expect(app.staticTexts["call-state"], value: "connected", timeout: 30)
-        app.buttons["Toggle Chat Screen"].tap()
-        XCTAssertTrue(app.buttons["add-43"].waitForExistence(timeout: 5))
-        app.buttons["add-43"].tap()
+        XCTAssertTrue(app.buttons["Add Person"].waitForExistence(timeout: 10))
+        app.buttons["Add Person"].tap()
+        XCTAssertTrue(app.buttons["Cara"].waitForExistence(timeout: 15))
+        app.buttons["Cara"].tap()
+        XCTAssertTrue(app.descendants(matching: .any)["Cara, Ringing…"].waitForExistence(timeout: 15))
         try ask("answer", ["as": "cara"])
         expect(app.staticTexts["group-people"], value: "2", timeout: 40)
-        // The screen is back for the group call, its hang-up a room Exit Chat, as on the web.
+        XCTAssertTrue(app.buttons["Cara, Answered"].waitForExistence(timeout: 15))
+        // Off the card closes it. The screen is the group call's, its hang-up a room Exit Chat, as on the web.
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.1)).tap()
+        expectGone(app.buttons["Cara, Answered"])
         expectHittable(app.buttons["Exit Chat"])
         app.buttons["Exit Chat"].tap()
         expectGone(app.buttons["Exit Chat"])
@@ -144,6 +152,8 @@ final class ProofTests: XCTestCase {
         // The screen drawn ready (LiveStreamScreen): Live over the picture, and the picture itself.
         expect(app.staticTexts["stream-live"], label: "LIVE", timeout: 20)
         expect(any(app, "stream-picture"), value: "picture", timeout: 30)
+        // The stream says how it plays: the picture that arrives, and how long it took to start.
+        expect(any(app, "stream-stats"), value: "playing", timeout: 15)
         // Counted among those watching: the page of Cara, and this app.
         try ask("wait", ["watching": "2"])
 

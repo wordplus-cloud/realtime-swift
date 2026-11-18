@@ -7,14 +7,14 @@ The SDK comes as three products of one Swift package, and an app takes only what
 | Product | What it gives | Needs |
 |---|---|---|
 | `WordPlusRealtime` | rooms, events with acks, presence, counts, history, who is online, what your server sends the user, the directory | iOS 15 or macOS 12. Nothing else |
-| `WordPlusRealtimeCalls` | calls between two people, group calls, ringing someone into a call | WebRTC and LiveKit, which it brings |
-| `WordPlusRealtimeUI` | The Better Messages call screen: the ring, the call, the group call grid and the controls | iOS |
+| `WordPlusRealtimeCalls` | calls between two people, group calls, ringing someone into a call, live streams | WebRTC and LiveKit, which it brings |
+| `WordPlusRealtimeUI` | The Better Messages call screen: the ring, the call, the group call grid and the controls. And the live stream screen | iOS |
 
-The names are those of the browser: `join`, `on`, `emit`, `emitWithAck`, `volatile`, `history`, `members`, `count`, `online`, `calls.start`, `calls.group`. The [example app](example.md) is the shop of every other guide, in SwiftUI.
+The names are those of the browser: `join`, `on`, `emit`, `emitWithAck`, `volatile`, `history`, `members`, `count`, `online`, `calls.start`, `calls.group`, `calls.stream`. The [example app](example.md) is the shop of every other guide, in SwiftUI.
 
 ## 1. Your app in WordPlus Cloud
 
-**Apps are in early access.** Ask for it on our [contact form](https://www.wordplus.cloud/contact), and we turn **Apps** on in your WordPlus Cloud account. Until then your account has no Apps page.
+**Apps come with a subscription.** [Choose your connections](https://www.wordplus.cloud/pricing#apps), starting from 1,000, and your WordPlus Cloud account gets its **Apps** page.
 
 Use the app you made for your website (**Apps** in your WordPlus Cloud account), so the app and the site share rooms and users. A native app has no address to list: it is let in by itself.
 
@@ -24,7 +24,7 @@ In Xcode, **File → Add Package Dependencies**, then `https://github.com/wordpl
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/wordplus-cloud/realtime-swift", from: "1.0.0"),
+    .package(url: "https://github.com/wordplus-cloud/realtime-swift", from: "1.1.0"),
 ],
 targets: [
     .target(name: "Shop", dependencies: [
@@ -95,6 +95,7 @@ order.on("error") { error, _ in print(error["code"]?.string ?? "") }   // forbid
 - **One `Realtime` an app**, kept while the user is signed in. `rt.close()` at sign-out.
 - **Handlers run on the main queue** (`callbackQueue` changes it), so they may update your views.
 - **The connection keeps itself:** through a drop, from one realtime server to another without one, and back after the app was in the background, every room joined again with what it missed from its history.
+- **Another namespace of the realtime server:** `namespace` and `auth` in `RealtimeOptions` open the connection on another product's namespace with its own handshake, such as Better Messages' `/` for its calls ([calls on your own signalling](calls.md#calls-on-your-own-signalling)). It reconnects, moves between servers and keeps the servers it knows there as on `/channels`, which it opens when you name none. Rooms, presence and calls by name are `/channels`' own.
 
 ## 5. Send
 
@@ -118,10 +119,32 @@ $realtime->to( 'order:1042' )->emit( 'updated', [ 'status' => 'shipped' ] );   /
 realtime.to("order:1042").emit("updated", {"status": "shipped"})
 ```
 
+## The connection
+
+The SDK connects, and keeps the connection, by itself. The app may show how it is, and hear what the realtime servers say of it:
+
+```swift
+rt.state                                    // .connecting, .connected, .disconnected or .closed
+rt.onState { state, reason in               // each change. reason: why it dropped, for your log
+    offlineBar.isHidden = state == .connected
+}
+rt.on("error") { error, _ in log(error["code"]?.string ?? "") }   // the connection refused, such as not_licensed
+rt.on("moved") { _, _ in }                  // now on another realtime server, with no drop
+rt.on("signed_out") { _, _ in showSignIn() }   // your server signed the user out
+```
+
+| State or event | When |
+|---|---|
+| `.disconnected` | the connection dropped. The SDK connects again by itself, after about 1, 2, 5 and 10 seconds, then every 20, and each room gets what it missed from its history |
+| `.closed` | after `rt.close()`: nothing connects again |
+| `error` | the realtime servers refused the connection, by its code, such as a wrong app key (`not_licensed`). The SDK tries again as after a drop ([errors](https://docs.wordplus.cloud/apps/errors/#the-connection)). A room that refuses the app says so on the room ([rooms](rooms.md#joining)) |
+| `moved` | the connection moved to another realtime server without a drop, every room with it. Nothing for the app to do |
+| `signed_out` | your server signed the user out of everything ([sending](sending.md#signed-out-by-your-server)) |
+
 ## Next
 
 - [Rooms](rooms.md), [presence and online status](presence.md), [sending from your server](sending.md) and [events from the app](events.md)
-- [Calls](calls.md), with the Better Messages call screen
+- [Calls](calls.md), with the Better Messages call screen, and [live streams](streams.md)
 - [Encryption and your users](encryption.md)
 - [Customizing the screens](customizing.md): the call screen look, a piece of your own, or its whole code
 - [Shipping](shipping.md), and [the example app](example.md)

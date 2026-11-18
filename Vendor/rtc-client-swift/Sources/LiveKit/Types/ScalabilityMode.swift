@@ -17,11 +17,15 @@
 import Foundation
 
 @objc
-public enum ScalabilityMode: Int {
+public enum ScalabilityMode: Int, Sendable {
     case L3T3 = 1
     case L3T3_KEY = 2
     case L3T3_KEY_SHIFT = 3
     case L1T3 = 4
+    // WordPlus Mesh (1.0.10): the modes the mesh's settings may name (`camera.svcMode`) beside upstream's
+    case L2T3_KEY = 5
+    case L2T2_KEY = 6
+    case L1T2 = 7
 }
 
 public extension ScalabilityMode {
@@ -31,6 +35,9 @@ public extension ScalabilityMode {
         case "L3T3": .L3T3
         case "L3T3_KEY": .L3T3_KEY
         case "L3T3_KEY_SHIFT": .L3T3_KEY_SHIFT
+        case "L2T3_KEY": .L2T3_KEY
+        case "L2T2_KEY": .L2T2_KEY
+        case "L1T2": .L1T2
         default: nil
         }
     }
@@ -41,17 +48,26 @@ public extension ScalabilityMode {
         case .L3T3: "L3T3"
         case .L3T3_KEY: "L3T3_KEY"
         case .L3T3_KEY_SHIFT: "L3T3_KEY_SHIFT"
+        case .L2T3_KEY: "L2T3_KEY"
+        case .L2T2_KEY: "L2T2_KEY"
+        case .L1T2: "L1T2"
         }
     }
 
     var spatial: Int {
         switch self {
-        case .L1T3: 1
+        case .L1T3, .L1T2: 1
+        case .L2T3_KEY, .L2T2_KEY: 2
         case .L3T3, .L3T3_KEY, .L3T3_KEY_SHIFT: 3
         }
     }
 
-    var temporal: Int { 3 }
+    var temporal: Int {
+        switch self {
+        case .L2T2_KEY, .L1T2: 2
+        default: 3
+        }
+    }
 }
 
 // MARK: - CustomStringConvertible

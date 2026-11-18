@@ -12,7 +12,7 @@ rt.calls.onIncoming { incoming in
         if case let .call(call) = try await incoming.accept() { show(call) }
     }
 }
-let call = try await rt.calls.start("support:34:42", to: "34", type: .video)
+let call = try await rt.startCall(token)       // a token from your server, after its own check
 call.onState { state in label.text = state.rawValue }
 ```
 
@@ -27,6 +27,11 @@ call.onState { state in label.text = state.rawValue }
 - ``CallState``
 - ``CallPath``
 - ``CallError``
+
+### Calls on your own signalling
+
+- ``CallTransport``
+- ``P2PCallTransport``
 
 ### Group calls
 

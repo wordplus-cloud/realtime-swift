@@ -113,4 +113,135 @@ final class LiveStreamScreenTests: XCTestCase {
         XCTAssertEqual(closed, 2)
         XCTAssertEqual(s.endReason, "left")
     }
+
+    private func settled(_ screen: LiveStreamScreen, until done: () -> Bool) async {
+        for _ in 0..<100 where !done() { try? await Task.sleep(nanoseconds: 10_000_000) }
+        screen.render()
+    }
+
+    func testASignedInViewerAsksToComeOnStageAndLowersTheirHand() async {
+        let s = stream()
+        s.apply("hello", hello(state: "live"))
+        let screen = screen(s)
+        var asked: [JSONValue] = []
+        s.asking = { event, payload in
+            XCTAssertEqual(event, "hand")
+            asked.append(payload["up"] ?? .null)
+            return JSONValue.parse(#"{"ok": true}"#)
+        }
+
+        XCTAssertFalse(screen.stageRow.isHidden)
+        XCTAssertFalse(screen.hand.isHidden)
+        XCTAssertEqual(screen.hand.configuration?.title, "Ask to join on stage")
+        XCTAssertTrue(screen.cameraButton.isHidden)
+        XCTAssertTrue(screen.leaveStage.isHidden)
+
+        screen.handPressed()
+        await settled(screen) { s.handRaised }
+        XCTAssertEqual(screen.hand.configuration?.title, "Lower hand")
+        XCTAssertEqual(screen.hand.accessibilityValue, "up")
+
+        screen.handPressed()
+        await settled(screen) { !s.handRaised }
+        XCTAssertEqual(screen.hand.configuration?.title, "Ask to join on stage")
+        XCTAssertEqual(asked, [.bool(true), .bool(false)])
+    }
+
+    func testNoAskingForOneTheStreamWouldNotTake() {
+        func hidden(_ change: (String) -> String) -> Bool {
+            let s = stream()
+            var text = #"{"stream": {"id": "show:1", "state": "live", "started_at": 1760000000000, "ended_at": null}, "#
+            text += #""you": {"identity": "u:34", "role": "viewer", "name": "Ben", "chat": "write", "mod": false}, "#
+            text += #""viewers": 1, "peak": 1, "slow": 0, "history": [], "hands": [], "pinned": null, "timeout": null, "reactions": true}"#
+            s.apply("hello", json(change(text)))
+            let shown = screen(s)
+            return shown.hand.isHidden && shown.stageRow.isHidden
+        }
+        XCTAssertFalse(hidden { $0 })
+        XCTAssertTrue(hidden { $0.replacingOccurrences(of: #""mod": false"#, with: #""mod": false, "stage": false"#) })
+        XCTAssertTrue(hidden { $0.replacingOccurrences(of: #""identity": "u:34""#, with: #""identity": "a:0123456789abcdef""#) }, "a visitor")
+        XCTAssertTrue(hidden { $0.replacingOccurrences(of: #""role": "viewer""#, with: #""role": "host""#) })
+        XCTAssertTrue(hidden { $0.replacingOccurrences(of: #""state": "live""#, with: #""state": "idle""#) })
+    }
+
+    func testTheInvitationAsksAndNotNowPutsItAway() {
+        let s = stream()
+        s.apply("hello", hello(state: "live"))
+        let screen = screen(s)
+        XCTAssertTrue(screen.invitation.isHidden)
+
+        s.apply("invited", json("{}"))
+        XCTAssertFalse(screen.invitation.isHidden)
+        XCTAssertEqual(screen.invitedTitle.text, "The host invites you on stage")
+        XCTAssertEqual(screen.invitedText.text, "Your camera and microphone will be live for everyone watching.")
+        XCTAssertTrue(screen.hand.isHidden, "invited, there is nothing left to ask")
+
+        screen.notNowPressed()
+        XCTAssertFalse(s.invited)
+        XCTAssertTrue(screen.invitation.isHidden)
+        XCTAssertFalse(screen.hand.isHidden)
+    }
+
+    func testAJoinThatFailsSaysWhyAndStaysAViewer() async {
+        let s = stream()
+        s.apply("hello", hello(state: "live"))
+        let screen = screen(s)
+        s.asking = { _, _ in JSONValue.parse(#"{"ok": false, "error": "not_invited"}"#) }
+        s.apply("invited", json("{}"))
+
+        screen.joinPressed()
+        await settled(screen) { !screen.failure.isHidden }
+        XCTAssertEqual(screen.failure.text, "You could not join the stage (not_invited)")
+        XCTAssertFalse(s.onStage)
+        XCTAssertFalse(s.invited, "refused, the invitation is gone, as on the web")
+        XCTAssertTrue(screen.invitation.isHidden)
+        XCTAssertFalse(screen.hand.isHidden)
+    }
+
+    func testOnStageItHasTheirDevicesAndAWayOff() async {
+        let s = stream()
+        s.apply("hello", hello(state: "live"))
+        let screen = screen(s)
+        var asked: [String] = []
+        s.asking = { event, _ in asked.append(event); return JSONValue.parse(#"{"ok": true}"#) }
+
+        s.onStage = true
+        screen.render()
+        XCTAssertTrue(screen.hand.isHidden)
+        XCTAssertFalse(screen.cameraButton.isHidden)
+        XCTAssertFalse(screen.microphoneButton.isHidden)
+        XCTAssertFalse(screen.leaveStage.isHidden)
+        XCTAssertEqual(screen.leaveStage.configuration?.title, "Leave stage")
+        XCTAssertEqual(screen.cameraButton.accessibilityLabel, "Camera")
+        XCTAssertEqual(screen.cameraButton.accessibilityValue, "off")
+        XCTAssertEqual(screen.microphoneButton.accessibilityLabel, "Microphone")
+        XCTAssertTrue(screen.own.isHidden, "no camera on, nothing of their own to show")
+
+        screen.leaveStagePressed()
+        await settled(screen) { asked == ["unstage"] }
+        XCTAssertFalse(s.onStage)
+        XCTAssertEqual(asked, ["unstage"])
+        XCTAssertFalse(screen.hand.isHidden)
+        XCTAssertTrue(screen.leaveStage.isHidden)
+    }
+
+    func testAnEndedStreamOffersNothingAboutTheStage() {
+        let s = stream()
+        s.apply("hello", hello(state: "live"))
+        s.onStage = true
+        let screen = screen(s)
+        XCTAssertFalse(screen.stageRow.isHidden)
+        s.apply("hello", hello(state: "ended"))
+        screen.render()
+        XCTAssertTrue(screen.stageRow.isHidden)
+        XCTAssertTrue(screen.invitation.isHidden)
+    }
+
+    func testItsStageWordsInTheUserLanguage() {
+        let s = stream()
+        s.apply("hello", hello(state: "live"))
+        let screen = screen(s, strings: ["ask_stage": "Auf die Bühne", "join_stage": "Beitreten"])
+        XCTAssertEqual(screen.hand.configuration?.title, "Auf die Bühne")
+        XCTAssertEqual(screen.joinStage.configuration?.title, "Beitreten")
+    }
 }

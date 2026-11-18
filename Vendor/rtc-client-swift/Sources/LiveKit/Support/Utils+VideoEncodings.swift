@@ -32,8 +32,9 @@ extension Utils {
         if let videoCodec, videoCodec.isSVC {
             // SVC mode
             log("Using SVC mode")
-            // VP9/AV1 with screen sharing requires single spatial layer
-            return [RTC.createRtpEncodingParameters(encoding: encoding, scalabilityMode: isScreenShare ? .L1T3 : .L3T3_KEY)]
+            // VP9/AV1 with screen sharing requires single spatial layer; a camera's as its options say (WordPlus Mesh
+            // 1.0.10, the settings' `camera.svcMode`), L3T3_KEY where they say none
+            return [RTC.createRtpEncodingParameters(encoding: encoding, scalabilityMode: isScreenShare ? .L1T3 : (publishOptions.scalabilityMode ?? .L3T3_KEY))]
         } else if !publishOptions.simulcast {
             // Not-simulcast mode
             log("Simulcast not enabled")

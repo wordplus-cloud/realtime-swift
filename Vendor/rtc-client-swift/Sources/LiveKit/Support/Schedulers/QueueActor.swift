@@ -55,6 +55,9 @@ actor QueueActor<T: Sendable>: Loggable {
             await onProcess(value)
         } else if elseEnqueue {
             queue.append(value)
+        } else {
+            // WordPlus Mesh (1.0.14): a dropped request explains a failure seen long after.
+            log("Dropped while suspended: \(type(of: value))", .warning)
         }
     }
 

@@ -1,10 +1,29 @@
 import Foundation
 
+/// What rooms and modules need of a socket: `SocketIO`, or a test's stand-in. On the connection's queue, as its acks are.
+protocol RoomSocket: AnyObject {
+    var isConnected: Bool { get }
+    func send(_ event: String, _ data: JSONValue, timeout: TimeInterval, ack: ((JSONValue?) -> Void)?)
+}
+
+extension RoomSocket {
+    /// An event to the namespace; with `ack`, its answer (nil when the connection ended first, or after `timeout`).
+    func emit(_ event: String, _ data: JSONValue, timeout: TimeInterval = 8, ack: ((JSONValue?) -> Void)? = nil) {
+        send(event, data, timeout: timeout, ack: ack)
+    }
+
+    func emit(_ event: String, _ data: JSONValue, timeout: TimeInterval = 8) async -> JSONValue? {
+        await withCheckedContinuation { continuation in
+            send(event, data, timeout: timeout) { continuation.resume(returning: $0) }
+        }
+    }
+}
+
 /// One Socket.IO namespace on one Engine.IO connection, over the system's WebSocket (URLSessionWebSocketTask), as the
 /// realtime servers speak it: Engine.IO 4's open, ping and pong, and Socket.IO 5's connect, events, acks and binary
 /// attachments. Only the WebSocket transport, as every WordPlus client connects. Moves between nodes are the
 /// connection's (Connection.swift): this socket goes to one address and stays there.
-final class SocketIO: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
+final class SocketIO: NSObject, URLSessionWebSocketDelegate, RoomSocket, @unchecked Sendable {
     enum Event {
         case connected
         case refused(String)
@@ -93,6 +112,10 @@ final class SocketIO: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable
         await withCheckedContinuation { continuation in
             emit(event, data, timeout: timeout) { continuation.resume(returning: $0) }
         }
+    }
+
+    func send(_ event: String, _ data: JSONValue, timeout: TimeInterval, ack: ((JSONValue?) -> Void)?) {
+        emit(event, data, timeout: timeout, ack: ack)
     }
 
     func close() {

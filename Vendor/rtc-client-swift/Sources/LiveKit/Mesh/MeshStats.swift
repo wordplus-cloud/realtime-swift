@@ -97,11 +97,20 @@ final class MeshStatsHub: @unchecked Sendable {
         var readings: [ObjectIdentifier: Reading] = [:]
         /// gatherings made, for tests and the lab
         var reads = 0
+        /// 1.0.10: how old a reading may be, the settings' `stats.everyMs` (`MeshStats.readEvery` where they say none)
+        var every = MeshStats.readEvery
     }
 
     private let _state = StateSync(State())
 
     var reads: Int { _state.read { $0.reads } }
+
+    var every: TimeInterval { _state.read { $0.every } }
+
+    /// 1.0.10: the settings' pace for the readings, from their next one.
+    func setEvery(_ every: TimeInterval) {
+        _state.mutate { $0.every = max(0.5, every) }
+    }
 
     /// The connection's stats as entries, read at most once every `MeshStats.readEvery`.
     func read(_ transport: Transport, now: Date = Date()) async -> [MeshEncoders.Stat] {
@@ -112,11 +121,12 @@ final class MeshStatsHub: @unchecked Sendable {
     /// else `gather`'s.
     func read(key: ObjectIdentifier, now: Date = Date(), gather: @escaping @Sendable () async -> [MeshEncoders.Stat]) async -> [MeshEncoders.Stat] {
         let task: Task<[MeshEncoders.Stat], Never> = _state.mutate {
-            if let last = $0.readings[key], now.timeIntervalSince(last.at) < MeshStats.readEvery {
+            let every = $0.every
+            if let last = $0.readings[key], now.timeIntervalSince(last.at) < every {
                 return last.task
             }
             // a connection gone (a full reconnect makes new ones) is forgotten with its reading
-            $0.readings = $0.readings.filter { now.timeIntervalSince($0.value.at) < MeshStats.readEvery }
+            $0.readings = $0.readings.filter { now.timeIntervalSince($0.value.at) < every }
             let task = Task { await gather() }
             $0.readings[key] = Reading(at: now, task: task)
             $0.reads += 1

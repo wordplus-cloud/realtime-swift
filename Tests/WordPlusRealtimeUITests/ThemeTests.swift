@@ -27,23 +27,40 @@ final class ThemeTests: XCTestCase {
             "--bm-call-dock": "255, 255, 255",
         ] ) )
 
-        XCTAssertEqual( rgb( BmCallsTheme.stage ), [ 248, 250, 252 ] )
-        XCTAssertEqual( rgb( BmCallsTheme.tile ), [ 226, 232, 240 ] )
-        XCTAssertEqual( rgb( BmCallsTheme.control ), [ 37, 99, 235 ] )
-        XCTAssertEqual( rgb( BmCallsTheme.dockGlass ), [ 255, 255, 255 ] )
+        XCTAssertEqual( rgb( CallsTheme.stage ), [ 248, 250, 252 ] )
+        XCTAssertEqual( rgb( CallsTheme.tile ), [ 226, 232, 240 ] )
+        XCTAssertEqual( rgb( CallsTheme.control ), [ 37, 99, 235 ] )
+        XCTAssertEqual( rgb( CallsTheme.dockGlass ), [ 255, 255, 255 ] )
 
         // On the real screen: its ground is the app's stage.
         let preview = CallScreenPreview( .video )
         preview.loadViewIfNeeded()
-        let screen = preview.children.compactMap { $0 as? BmCallsScreen }.first
+        let screen = preview.children.compactMap { $0 as? CallsScreen }.first
         XCTAssertEqual( screen.flatMap { $0.view.backgroundColor }.map( rgb ), [ 248, 250, 252 ] )
+    }
+
+    func testTheNamesOfTheWebCountAndTheOldOnesStill() {
+        // @wordplus/realtime-ui 1.0.6 named its tokens `--wplus-…`, and the guides call these the web's names.
+        CallScreen.shared.configure( .init( tokens: [
+            "--wplus-color-accent": "37, 99, 235",
+            "--wplus-call-canvas": "248, 250, 252",
+            "--bm-call-tile": "226, 232, 240",
+        ] ) )
+
+        XCTAssertEqual( rgb( CallsTheme.accent ), [ 37, 99, 235 ] )
+        XCTAssertEqual( rgb( CallsTheme.stage ), [ 248, 250, 252 ] )
+        XCTAssertEqual( rgb( CallsTheme.tile ), [ 226, 232, 240 ] )
+
+        // Both given, the new name wins.
+        CallScreen.shared.configure( .init( tokens: [ "--wplus-color-accent": "37, 99, 235", "--bm-color-accent": "1, 2, 3" ] ) )
+        XCTAssertEqual( rgb( CallsTheme.accent ), [ 37, 99, 235 ] )
     }
 
     func testWithoutThemTheStageStaysNearBlack() {
         CallScreen.shared.configure( .init( tokens: [ "--bm-color-accent": "37, 99, 235" ] ) )
 
-        XCTAssertEqual( rgb( BmCallsTheme.stage ), [ 13, 15, 20 ] )
-        XCTAssertEqual( rgb( BmCallsTheme.accent ), [ 37, 99, 235 ] )
+        XCTAssertEqual( rgb( CallsTheme.stage ), [ 13, 15, 20 ] )
+        XCTAssertEqual( rgb( CallsTheme.accent ), [ 37, 99, 235 ] )
     }
 }
 #endif
